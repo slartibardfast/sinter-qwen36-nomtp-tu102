@@ -1,0 +1,6 @@
+build/
+/oracle-data/
+*.o
+*.so
+*.bin
+__pycache__/
