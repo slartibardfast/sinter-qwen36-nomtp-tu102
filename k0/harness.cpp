@@ -648,7 +648,9 @@ struct PackedProgram {
 static PackedProgram pack_program(const Jv &pj, const Resolver &R) {
     PackedProgram out;
     out.epoch_stride = pj.get("epoch_stride") ? (uint32_t) pj.at("epoch_stride").as_i() : 0;
-    const Jv &instrs = pj.at("instrs");
+    // compile_schedule.py emits the array under "instructions"; accept the
+    // older "instrs" too.
+    const Jv &instrs = pj.get("instructions") ? pj.at("instructions") : pj.at("instrs");
     out.instrs.reserve(instrs.arr.size());
     for (size_t i = 0; i < instrs.arr.size(); i++) {
         const Jv &ij = instrs.arr[i];
