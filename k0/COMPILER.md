@@ -37,6 +37,16 @@ sets are already tracked per instruction — `reads=`/`writes=`). Target
 ~320–380 boundaries. This is the next single-GPU-milestone task, tracked in
 `plan/0135 mtp-off-build.md`.
 
+## Constraint: FATTN KV chunks must be 32-aligned
+
+The `OP_FATTN_DECODE` mask read (`attn.cuh`) loads two f16 mask entries as
+one 32-bit word, so a chunk's KV start must be even (32-aligned in
+production). The parity test confirmed an odd chunk start faults with
+`misaligned address`. When the compiler splits KV across the participating
+blocks for `OP_FATTN_DECODE`, every chunk boundary MUST be a multiple of 32
+— this is a hard scheduling obligation, not a soft preference. (Attn NOTES,
+`k0/ops/NOTES-attn.md`.)
+
 ## Runtime symbols
 
 `n_kv` (padded mask width and KV window) and the per-pass row indices are

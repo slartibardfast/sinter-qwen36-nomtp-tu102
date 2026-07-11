@@ -6,11 +6,12 @@ re-measured on the rig, both GPUs idle-ish, clocks locked 1455 MHz).
 
 ## G11 residency — CLOSES
 
-The full interpreter (`mk_interp`, dispatching all 27 op kinds via
-`k0/ops/registry.cuh`) compiles at:
+The full interpreter (`mk_interp`, `__launch_bounds__(384)`, dispatching all
+27 op kinds via `k0/ops/registry.cuh`), whole-program compiled into
+`mk-core` (`nvcc -c`, the way it actually ships):
 
 ```
-_Z9mk_interp... : 104 regs, 0 B static smem, 1 barriers, spills 0/0
+_Z9mk_interp... : 77 registers, 1 barriers, 0 spills, 32 B stack
 ```
 
 The 60 KiB slab is DYNAMIC shared memory (opt-in via
@@ -19,17 +20,19 @@ static ptxas smem figure. calx-mill residency at the recorded flags
 (`--block-threads 384 --block-smem 61440 --grid-blocks 72`):
 
 ```
-104 regs, occupancy 19/32 warps (59%) at 384 threads/block,
-1 blocks/instance, cooperative grid 72 on 72 instances: fits    (exit 0)
+77 regs, occupancy 25/32 warps (78%), 1 blocks/instance,
+cooperative grid 72 on 72 instances: fits                        (exit 0)
 ```
 
 The G11 derivation projected ≤168 regs at the 12-warp floor; the real
-kernel clears it with headroom (104 regs admits 19 warps). This is the
+kernel clears it with wide headroom (77 regs admits 25 warps). This is the
 measured half of the projected-vs-measured pair — G11 is closed for the
-k=0 interpreter. (Re-check when the schedule packer inlines heavier ops
-into the dispatch; the register count is a property of the compiled switch,
-and adding ops or growing an op's live set can move it — the gate re-runs
-every build.)
+k=0 interpreter. Two cautions: (1) measure from the `-c` whole-program
+object, NOT a `-dc` relocatable compile — separate device compilation
+disables cross-function inlining and inflates the count to 104, an
+artifact, not the shipped kernel; (2) the binding op is `fattn_decode`
+(67 regs, 45 KiB dynamic slab); the dispatch switch stays at 77. The gate
+re-runs every build, so a heavier future op that grows the switch is caught.
 
 ## G15 interpreter overhead — OPEN (finding)
 
