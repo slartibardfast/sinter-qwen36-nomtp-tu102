@@ -21,6 +21,11 @@ add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>")
 # Rig precheck: device props, cooperative-launch support, SM clock lock.
 add_executable(mk-devinfo tests/devinfo.cu)
 
+# The interpreter spine: persistent kernel + host upload/run library.
+find_package(CUDAToolkit REQUIRED)
+add_library(mk-core STATIC core/interp.cu core/host.cpp)
+target_link_libraries(mk-core PUBLIC CUDA::cudart)
+
 # Every tests/test_*.cu is a standalone test executable (op unit tests add
 # a file, not a CMake edit).
 file(GLOB MK_TEST_SOURCES CONFIGURE_DEPENDS tests/test_*.cu)
@@ -28,6 +33,7 @@ foreach(src ${MK_TEST_SOURCES})
     get_filename_component(name ${src} NAME_WE)
     string(REPLACE "_" "-" tgt "mk-${name}")
     add_executable(${tgt} ${src})
+    target_link_libraries(${tgt} PRIVATE mk-core)
 endforeach()
 
 # G14 litmus family: positive + the two negatives (which must be CAUGHT).
@@ -46,3 +52,10 @@ add_executable(mk-litmus-mp tests/litmus_boundary.cu)
 target_compile_definitions(mk-litmus-mp PRIVATE LITMUS_MP)
 add_executable(mk-litmus-mp-cg tests/litmus_boundary.cu)
 target_compile_definitions(mk-litmus-mp-cg PRIVATE LITMUS_MP LITMUS_MP_CG)
+
+# mk-harness: the standalone parity/bench harness (k0/harness.cpp + the
+# GGUF mmap reader k0/gguf.h). Pure C++ against the CUDA runtime; the
+# interpreter kernel (core/host.cpp, when it lands) is not linked yet.
+find_package(CUDAToolkit REQUIRED)
+add_executable(mk-harness k0/harness.cpp)
+target_link_libraries(mk-harness PRIVATE CUDA::cudart)

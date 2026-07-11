@@ -82,3 +82,29 @@ listed because shape+type alone could not distinguish them:
 17. **NOTES.md "16 of 63" attention layers**: the graph measures 16 of 64
     blocks (48 DeltaNet + 16 attention). The 63 in NOTES appears to be a typo;
     recorded here so the discrepancy is not silently propagated.
+
+## RESOLVED
+
+18. **RESOLVED (attn op family): `ncols2=8` in `flash_attn_ext_f16<256,256,1,8,0,0>`
+    is a tile-shape bucket, not the GQA ratio.** This closes the FA half of
+    discrepancy 1 (measured 24 q-heads vs the briefed 32). The dossier
+    (SEMANTICS.md §8) glossed `ncols2=8` as "the GQA ratio (32/4)"; the graph
+    has 24 q-heads, ratio 24/4 = **6**. Fork source (all cites into
+    `software/llama.cpp/autoround`): the dispatch selects `ncols2` by *bucket*,
+    not equality — `ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2` picks 8 for
+    any `use_gqa_opt && gqa_ratio > 4` (`ggml/src/ggml-cuda/fattn.cu:92-95`;
+    `gqa_ratio = Q->ne[2]/K->ne[2]`, `fattn.cu:64-65`). `ncols2` is the number
+    of Q-head *slots* packed per MMA tile so the KV stream is read once per KV
+    head; the runtime `gqa_ratio` is passed into the kernel separately
+    (`ggml/src/ggml-cuda/fattn-mma-f16.cuh:1772`), which runs
+    `iter_z_gqa = ceil(gqa_ratio/ncols2)` = ceil(6/8) = 1 tile per KV head
+    (`fattn-mma-f16.cuh:1783`) and pads the dead slots: Q loads for slots with
+    `zt_gqa*ncols2 + c >= gqa_ratio` are zero-filled
+    (`fattn-mma-f16.cuh:1224,1232-1239`), their outputs suppressed at store
+    (`fattn-mma-f16.cuh:1657`), and the stream-k fixup skips them
+    (`fattn-common.cuh:715`). So the census template runs one 8-wide tile per
+    KV head with 6 live + 2 zero-padded Q slots (25% padded MMA work; KV read
+    once either way). **Math for our kernel:** the true ratio is 6; per GPU
+    (KV split by heads) 12 q-heads over 2 kv-heads, 6 q per kv group; no 8
+    appears anywhere. `k0/ops/attn.cuh` derives `gqa = n_q / n_kv_heads` from
+    the instruction args and packs no pad slots.
