@@ -1,0 +1,991 @@
+leaf_idx,type,ne,classification,first_referencing_node,reasoning
+0,f16,5120x248320x1x1,weight:token_embd.weight,n0,f16 5120x248320 read by the embedding GET_ROWS (n0)
+1,i32,1x1x1x1,input_tokens,n0,i32[1] row index of the embedding GET_ROWS (n0)
+2,f32,5120x1x1x1,other:embd_trunk_input,n1,f32[5120] copy of the embedding GET_ROWS output (n0) re-entering across a scheduler split; the residual trunk root
+3,f32,5120x1x1x1,weight:blk.0.attn_norm.weight,n2,f32[5120] MUL paired with pre-mixer RMS_NORM
+4,f32,30720x1x1x1,state:conv_state(blk.0),n3,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+5,i32,1x1x1x1,other:rs_copy_indices_buf,n6,"i32 buffer viewed by n6 (main,1 elem) and n8 (clear,0 elems at +4B); outputs unreferenced, presumed source of l6/l7 across splits"
+6,i32,1x1x1x1,other:rs_main_index,n7,"i32[1] row id selecting the sequence's conv/ssm state (GET_ROWS src1, all 48 DN blocks)"
+7,i32,0x1x1x1,other:rs_clear_index,n9,i32[0] empty clear-row list; makes the paired GET_ROWS/CPY no-ops at decode
+8,q4_0,5120x10240x1x1,weight:blk.0.attn_qkv.weight,n13,unique q4_0 5120x10240 in block
+9,f32,786432x1x1x1,state:ssm_state(blk.0),n20,f32[786432]=128x128x48 GDN recurrent state
+10,f32,4x10240x1x1,weight:blk.0.ssm_conv1d.weight,n27,f32 4x10240 SSM_CONV kernel
+11,f16,5120x48x1x1,weight:blk.0.ssm_alpha.weight,n34,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+12,f32,48x1x1x1,weight:blk.0.ssm_dt.bias,n36,f32[48] ADD operand on the alpha path
+13,f32,48x1x1x1,weight:blk.0.ssm_a,n38,f32[48] MUL operand after softplus (-exp(A_log) factor)
+14,f16,5120x48x1x1,weight:blk.0.ssm_beta.weight,n40,f16 5120x48 GEMV feeding sigmoid (mixing path)
+15,f32,128x1x1x1,weight:blk.0.ssm_norm.weight,n51,f32[128] MUL after the per-head RMS_NORM of the GDN output
+16,q4_0,5120x6144x1x1,weight:blk.0.attn_gate.weight,n52,unique q4_0 5120x6144 in block (z-gate GEMV)
+17,q4_0_ar16,6144x5120x1x1,weight:blk.0.ssm_out.weight,n57,unique Q4_0_AR16 6144x5120 in block
+18,f32,5120x1x1x1,weight:blk.0.post_attention_norm.weight,n61,f32[5120] MUL paired with pre-FFN RMS_NORM
+19,q4_0,5120x17408x1x1,weight:blk.0.ffn_gate.weight,n62,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+20,q4_0,5120x17408x1x1,weight:blk.0.ffn_up.weight,n63,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+21,q4_0,17408x5120x1x1,weight:blk.0.ffn_down.weight,n65,unique q4_0 17408x5120 in block
+22,f32,5120x1x1x1,weight:blk.1.attn_norm.weight,n68,f32[5120] MUL paired with pre-mixer RMS_NORM
+23,f32,30720x1x1x1,state:conv_state(blk.1),n69,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+24,q4_0,5120x10240x1x1,weight:blk.1.attn_qkv.weight,n77,unique q4_0 5120x10240 in block
+25,f32,786432x1x1x1,state:ssm_state(blk.1),n84,f32[786432]=128x128x48 GDN recurrent state
+26,f32,4x10240x1x1,weight:blk.1.ssm_conv1d.weight,n91,f32 4x10240 SSM_CONV kernel
+27,f16,5120x48x1x1,weight:blk.1.ssm_alpha.weight,n98,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+28,f32,48x1x1x1,weight:blk.1.ssm_dt.bias,n100,f32[48] ADD operand on the alpha path
+29,f32,48x1x1x1,weight:blk.1.ssm_a,n102,f32[48] MUL operand after softplus (-exp(A_log) factor)
+30,f16,5120x48x1x1,weight:blk.1.ssm_beta.weight,n104,f16 5120x48 GEMV feeding sigmoid (mixing path)
+31,f32,128x1x1x1,weight:blk.1.ssm_norm.weight,n115,f32[128] MUL after the per-head RMS_NORM of the GDN output
+32,q4_0,5120x6144x1x1,weight:blk.1.attn_gate.weight,n116,unique q4_0 5120x6144 in block (z-gate GEMV)
+33,q4_0_ar16,6144x5120x1x1,weight:blk.1.ssm_out.weight,n121,unique Q4_0_AR16 6144x5120 in block
+34,f32,5120x1x1x1,weight:blk.1.post_attention_norm.weight,n125,f32[5120] MUL paired with pre-FFN RMS_NORM
+35,q4_0,5120x17408x1x1,weight:blk.1.ffn_gate.weight,n126,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+36,q4_0,5120x17408x1x1,weight:blk.1.ffn_up.weight,n127,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+37,q4_0,17408x5120x1x1,weight:blk.1.ffn_down.weight,n129,unique q4_0 17408x5120 in block
+38,f32,5120x1x1x1,weight:blk.2.attn_norm.weight,n132,f32[5120] MUL paired with pre-mixer RMS_NORM
+39,f32,30720x1x1x1,state:conv_state(blk.2),n133,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+40,q4_0,5120x10240x1x1,weight:blk.2.attn_qkv.weight,n141,unique q4_0 5120x10240 in block
+41,f32,786432x1x1x1,state:ssm_state(blk.2),n148,f32[786432]=128x128x48 GDN recurrent state
+42,f32,4x10240x1x1,weight:blk.2.ssm_conv1d.weight,n155,f32 4x10240 SSM_CONV kernel
+43,f16,5120x48x1x1,weight:blk.2.ssm_alpha.weight,n162,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+44,f32,48x1x1x1,weight:blk.2.ssm_dt.bias,n164,f32[48] ADD operand on the alpha path
+45,f32,48x1x1x1,weight:blk.2.ssm_a,n166,f32[48] MUL operand after softplus (-exp(A_log) factor)
+46,f16,5120x48x1x1,weight:blk.2.ssm_beta.weight,n168,f16 5120x48 GEMV feeding sigmoid (mixing path)
+47,f32,128x1x1x1,weight:blk.2.ssm_norm.weight,n179,f32[128] MUL after the per-head RMS_NORM of the GDN output
+48,q4_0,5120x6144x1x1,weight:blk.2.attn_gate.weight,n180,unique q4_0 5120x6144 in block (z-gate GEMV)
+49,q4_0_ar16,6144x5120x1x1,weight:blk.2.ssm_out.weight,n185,unique Q4_0_AR16 6144x5120 in block
+50,f32,5120x1x1x1,weight:blk.2.post_attention_norm.weight,n189,f32[5120] MUL paired with pre-FFN RMS_NORM
+51,q4_0,5120x17408x1x1,weight:blk.2.ffn_gate.weight,n190,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+52,q4_0,5120x17408x1x1,weight:blk.2.ffn_up.weight,n191,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+53,q4_0,17408x5120x1x1,weight:blk.2.ffn_down.weight,n193,unique q4_0 17408x5120 in block
+54,f32,5120x1x1x1,weight:blk.3.attn_norm.weight,n196,f32[5120] MUL paired with pre-mixer RMS_NORM
+55,q4_0,5120x12288x1x1,weight:blk.3.attn_q.weight,n197,unique q4_0 5120x12288 in block (q+gate interleaved)
+56,f32,256x1x1x1,weight:blk.3.attn_q_norm.weight,n200,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+57,i32,4x1x1x1,positions,n201,"i32[4] = 4 M-RoPE position ids per token (ROPE src1, all 16 attn blocks)"
+58,q4_0,5120x1024x1x1,weight:blk.3.attn_v.weight,n202,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+59,q4_0,5120x1024x1x1,weight:blk.3.attn_k.weight,n204,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+60,f32,256x1x1x1,weight:blk.3.attn_k_norm.weight,n207,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+61,i64,1x1x1x1,other:k_idxs,n210,i64[1] destination row index of the k-cache SET_ROWS (shared by all 16 attn blocks)
+62,f16,1024x262144x1x1,cache_k(blk.3),n210,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+63,i64,1x1x1x1,other:v_idxs,n212,i64[1] destination row index of the v-cache SET_ROWS (shared by all 16 attn blocks)
+64,f16,1024x262144x1x1,cache_v(blk.3),n212,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+65,f32,33024x1x1x1,mask,n219,"f32[n_kv=33024] KQ mask, CPY src (input)"
+66,f16,33024x1x1x1,mask,n219,"f16[n_kv=33024] KQ mask, CPY dst (converted buffer, FLASH_ATTN_EXT src3)"
+67,q4_0,6144x5120x1x1,weight:blk.3.attn_output.weight,n226,unique q4_0 6144x5120 in block
+68,f32,5120x1x1x1,weight:blk.3.post_attention_norm.weight,n229,f32[5120] MUL paired with pre-FFN RMS_NORM
+69,q4_0,5120x17408x1x1,weight:blk.3.ffn_gate.weight,n230,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+70,q4_0,5120x17408x1x1,weight:blk.3.ffn_up.weight,n231,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+71,q4_0,17408x5120x1x1,weight:blk.3.ffn_down.weight,n233,unique q4_0 17408x5120 in block
+72,f32,5120x1x1x1,weight:blk.4.attn_norm.weight,n236,f32[5120] MUL paired with pre-mixer RMS_NORM
+73,f32,30720x1x1x1,state:conv_state(blk.4),n237,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+74,q4_0,5120x10240x1x1,weight:blk.4.attn_qkv.weight,n245,unique q4_0 5120x10240 in block
+75,f32,786432x1x1x1,state:ssm_state(blk.4),n252,f32[786432]=128x128x48 GDN recurrent state
+76,f32,4x10240x1x1,weight:blk.4.ssm_conv1d.weight,n259,f32 4x10240 SSM_CONV kernel
+77,f16,5120x48x1x1,weight:blk.4.ssm_alpha.weight,n266,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+78,f32,48x1x1x1,weight:blk.4.ssm_dt.bias,n268,f32[48] ADD operand on the alpha path
+79,f32,48x1x1x1,weight:blk.4.ssm_a,n270,f32[48] MUL operand after softplus (-exp(A_log) factor)
+80,f16,5120x48x1x1,weight:blk.4.ssm_beta.weight,n272,f16 5120x48 GEMV feeding sigmoid (mixing path)
+81,f32,128x1x1x1,weight:blk.4.ssm_norm.weight,n283,f32[128] MUL after the per-head RMS_NORM of the GDN output
+82,q4_0,5120x6144x1x1,weight:blk.4.attn_gate.weight,n284,unique q4_0 5120x6144 in block (z-gate GEMV)
+83,q4_0_ar16,6144x5120x1x1,weight:blk.4.ssm_out.weight,n289,unique Q4_0_AR16 6144x5120 in block
+84,f32,5120x1x1x1,weight:blk.4.post_attention_norm.weight,n293,f32[5120] MUL paired with pre-FFN RMS_NORM
+85,q4_0,5120x17408x1x1,weight:blk.4.ffn_gate.weight,n294,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+86,q4_0,5120x17408x1x1,weight:blk.4.ffn_up.weight,n295,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+87,q4_0,17408x5120x1x1,weight:blk.4.ffn_down.weight,n297,unique q4_0 17408x5120 in block
+88,f32,5120x1x1x1,weight:blk.5.attn_norm.weight,n300,f32[5120] MUL paired with pre-mixer RMS_NORM
+89,f32,30720x1x1x1,state:conv_state(blk.5),n301,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+90,q4_0,5120x10240x1x1,weight:blk.5.attn_qkv.weight,n309,unique q4_0 5120x10240 in block
+91,f32,786432x1x1x1,state:ssm_state(blk.5),n316,f32[786432]=128x128x48 GDN recurrent state
+92,f32,4x10240x1x1,weight:blk.5.ssm_conv1d.weight,n323,f32 4x10240 SSM_CONV kernel
+93,f16,5120x48x1x1,weight:blk.5.ssm_alpha.weight,n330,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+94,f32,48x1x1x1,weight:blk.5.ssm_dt.bias,n332,f32[48] ADD operand on the alpha path
+95,f32,48x1x1x1,weight:blk.5.ssm_a,n334,f32[48] MUL operand after softplus (-exp(A_log) factor)
+96,f16,5120x48x1x1,weight:blk.5.ssm_beta.weight,n336,f16 5120x48 GEMV feeding sigmoid (mixing path)
+97,f32,128x1x1x1,weight:blk.5.ssm_norm.weight,n347,f32[128] MUL after the per-head RMS_NORM of the GDN output
+98,q4_0,5120x6144x1x1,weight:blk.5.attn_gate.weight,n348,unique q4_0 5120x6144 in block (z-gate GEMV)
+99,q4_0_ar16,6144x5120x1x1,weight:blk.5.ssm_out.weight,n353,unique Q4_0_AR16 6144x5120 in block
+100,f32,5120x1x1x1,weight:blk.5.post_attention_norm.weight,n357,f32[5120] MUL paired with pre-FFN RMS_NORM
+101,q4_0,5120x17408x1x1,weight:blk.5.ffn_gate.weight,n358,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+102,q4_0,5120x17408x1x1,weight:blk.5.ffn_up.weight,n359,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+103,q4_0,17408x5120x1x1,weight:blk.5.ffn_down.weight,n361,unique q4_0 17408x5120 in block
+104,f32,5120x1x1x1,weight:blk.6.attn_norm.weight,n364,f32[5120] MUL paired with pre-mixer RMS_NORM
+105,f32,30720x1x1x1,state:conv_state(blk.6),n365,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+106,q4_0,5120x10240x1x1,weight:blk.6.attn_qkv.weight,n373,unique q4_0 5120x10240 in block
+107,f32,786432x1x1x1,state:ssm_state(blk.6),n380,f32[786432]=128x128x48 GDN recurrent state
+108,f32,4x10240x1x1,weight:blk.6.ssm_conv1d.weight,n387,f32 4x10240 SSM_CONV kernel
+109,f16,5120x48x1x1,weight:blk.6.ssm_alpha.weight,n394,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+110,f32,48x1x1x1,weight:blk.6.ssm_dt.bias,n396,f32[48] ADD operand on the alpha path
+111,f32,48x1x1x1,weight:blk.6.ssm_a,n398,f32[48] MUL operand after softplus (-exp(A_log) factor)
+112,f16,5120x48x1x1,weight:blk.6.ssm_beta.weight,n400,f16 5120x48 GEMV feeding sigmoid (mixing path)
+113,f32,128x1x1x1,weight:blk.6.ssm_norm.weight,n411,f32[128] MUL after the per-head RMS_NORM of the GDN output
+114,q4_0,5120x6144x1x1,weight:blk.6.attn_gate.weight,n412,unique q4_0 5120x6144 in block (z-gate GEMV)
+115,q4_0_ar16,6144x5120x1x1,weight:blk.6.ssm_out.weight,n417,unique Q4_0_AR16 6144x5120 in block
+116,f32,5120x1x1x1,weight:blk.6.post_attention_norm.weight,n421,f32[5120] MUL paired with pre-FFN RMS_NORM
+117,q4_0,5120x17408x1x1,weight:blk.6.ffn_gate.weight,n422,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+118,q4_0,5120x17408x1x1,weight:blk.6.ffn_up.weight,n423,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+119,q4_0,17408x5120x1x1,weight:blk.6.ffn_down.weight,n425,unique q4_0 17408x5120 in block
+120,f32,5120x1x1x1,weight:blk.7.attn_norm.weight,n428,f32[5120] MUL paired with pre-mixer RMS_NORM
+121,q4_0,5120x12288x1x1,weight:blk.7.attn_q.weight,n429,unique q4_0 5120x12288 in block (q+gate interleaved)
+122,f32,256x1x1x1,weight:blk.7.attn_q_norm.weight,n432,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+123,q4_0,5120x1024x1x1,weight:blk.7.attn_v.weight,n434,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+124,q4_0,5120x1024x1x1,weight:blk.7.attn_k.weight,n436,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+125,f32,256x1x1x1,weight:blk.7.attn_k_norm.weight,n439,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+126,f16,1024x262144x1x1,cache_k(blk.7),n442,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+127,f16,1024x262144x1x1,cache_v(blk.7),n444,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+128,q4_0,6144x5120x1x1,weight:blk.7.attn_output.weight,n457,unique q4_0 6144x5120 in block
+129,f32,5120x1x1x1,weight:blk.7.post_attention_norm.weight,n460,f32[5120] MUL paired with pre-FFN RMS_NORM
+130,q4_0,5120x17408x1x1,weight:blk.7.ffn_gate.weight,n461,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+131,q4_0,5120x17408x1x1,weight:blk.7.ffn_up.weight,n462,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+132,q4_0,17408x5120x1x1,weight:blk.7.ffn_down.weight,n464,unique q4_0 17408x5120 in block
+133,f32,5120x1x1x1,weight:blk.8.attn_norm.weight,n467,f32[5120] MUL paired with pre-mixer RMS_NORM
+134,f32,30720x1x1x1,state:conv_state(blk.8),n468,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+135,q4_0,5120x10240x1x1,weight:blk.8.attn_qkv.weight,n476,unique q4_0 5120x10240 in block
+136,f32,786432x1x1x1,state:ssm_state(blk.8),n483,f32[786432]=128x128x48 GDN recurrent state
+137,f32,4x10240x1x1,weight:blk.8.ssm_conv1d.weight,n490,f32 4x10240 SSM_CONV kernel
+138,f16,5120x48x1x1,weight:blk.8.ssm_alpha.weight,n497,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+139,f32,48x1x1x1,weight:blk.8.ssm_dt.bias,n499,f32[48] ADD operand on the alpha path
+140,f32,48x1x1x1,weight:blk.8.ssm_a,n501,f32[48] MUL operand after softplus (-exp(A_log) factor)
+141,f16,5120x48x1x1,weight:blk.8.ssm_beta.weight,n503,f16 5120x48 GEMV feeding sigmoid (mixing path)
+142,f32,128x1x1x1,weight:blk.8.ssm_norm.weight,n514,f32[128] MUL after the per-head RMS_NORM of the GDN output
+143,q4_0,5120x6144x1x1,weight:blk.8.attn_gate.weight,n515,unique q4_0 5120x6144 in block (z-gate GEMV)
+144,q4_0_ar16,6144x5120x1x1,weight:blk.8.ssm_out.weight,n520,unique Q4_0_AR16 6144x5120 in block
+145,f32,5120x1x1x1,weight:blk.8.post_attention_norm.weight,n524,f32[5120] MUL paired with pre-FFN RMS_NORM
+146,q4_0,5120x17408x1x1,weight:blk.8.ffn_gate.weight,n525,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+147,q4_0,5120x17408x1x1,weight:blk.8.ffn_up.weight,n526,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+148,q4_0,17408x5120x1x1,weight:blk.8.ffn_down.weight,n528,unique q4_0 17408x5120 in block
+149,f32,5120x1x1x1,weight:blk.9.attn_norm.weight,n531,f32[5120] MUL paired with pre-mixer RMS_NORM
+150,f32,30720x1x1x1,state:conv_state(blk.9),n532,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+151,q4_0,5120x10240x1x1,weight:blk.9.attn_qkv.weight,n540,unique q4_0 5120x10240 in block
+152,f32,786432x1x1x1,state:ssm_state(blk.9),n547,f32[786432]=128x128x48 GDN recurrent state
+153,f32,4x10240x1x1,weight:blk.9.ssm_conv1d.weight,n554,f32 4x10240 SSM_CONV kernel
+154,f16,5120x48x1x1,weight:blk.9.ssm_alpha.weight,n561,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+155,f32,48x1x1x1,weight:blk.9.ssm_dt.bias,n563,f32[48] ADD operand on the alpha path
+156,f32,48x1x1x1,weight:blk.9.ssm_a,n565,f32[48] MUL operand after softplus (-exp(A_log) factor)
+157,f16,5120x48x1x1,weight:blk.9.ssm_beta.weight,n567,f16 5120x48 GEMV feeding sigmoid (mixing path)
+158,f32,128x1x1x1,weight:blk.9.ssm_norm.weight,n578,f32[128] MUL after the per-head RMS_NORM of the GDN output
+159,q4_0,5120x6144x1x1,weight:blk.9.attn_gate.weight,n579,unique q4_0 5120x6144 in block (z-gate GEMV)
+160,q4_0_ar16,6144x5120x1x1,weight:blk.9.ssm_out.weight,n584,unique Q4_0_AR16 6144x5120 in block
+161,f32,5120x1x1x1,weight:blk.9.post_attention_norm.weight,n588,f32[5120] MUL paired with pre-FFN RMS_NORM
+162,q4_0,5120x17408x1x1,weight:blk.9.ffn_gate.weight,n589,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+163,q4_0,5120x17408x1x1,weight:blk.9.ffn_up.weight,n590,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+164,q4_0,17408x5120x1x1,weight:blk.9.ffn_down.weight,n592,unique q4_0 17408x5120 in block
+165,f32,5120x1x1x1,weight:blk.10.attn_norm.weight,n595,f32[5120] MUL paired with pre-mixer RMS_NORM
+166,f32,30720x1x1x1,state:conv_state(blk.10),n596,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+167,q4_0,5120x10240x1x1,weight:blk.10.attn_qkv.weight,n604,unique q4_0 5120x10240 in block
+168,f32,786432x1x1x1,state:ssm_state(blk.10),n611,f32[786432]=128x128x48 GDN recurrent state
+169,f32,4x10240x1x1,weight:blk.10.ssm_conv1d.weight,n618,f32 4x10240 SSM_CONV kernel
+170,f16,5120x48x1x1,weight:blk.10.ssm_alpha.weight,n625,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+171,f32,48x1x1x1,weight:blk.10.ssm_dt.bias,n627,f32[48] ADD operand on the alpha path
+172,f32,48x1x1x1,weight:blk.10.ssm_a,n629,f32[48] MUL operand after softplus (-exp(A_log) factor)
+173,f16,5120x48x1x1,weight:blk.10.ssm_beta.weight,n631,f16 5120x48 GEMV feeding sigmoid (mixing path)
+174,f32,128x1x1x1,weight:blk.10.ssm_norm.weight,n642,f32[128] MUL after the per-head RMS_NORM of the GDN output
+175,q4_0,5120x6144x1x1,weight:blk.10.attn_gate.weight,n643,unique q4_0 5120x6144 in block (z-gate GEMV)
+176,q4_0_ar16,6144x5120x1x1,weight:blk.10.ssm_out.weight,n648,unique Q4_0_AR16 6144x5120 in block
+177,f32,5120x1x1x1,weight:blk.10.post_attention_norm.weight,n652,f32[5120] MUL paired with pre-FFN RMS_NORM
+178,q4_0,5120x17408x1x1,weight:blk.10.ffn_gate.weight,n653,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+179,q4_0,5120x17408x1x1,weight:blk.10.ffn_up.weight,n654,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+180,q4_0,17408x5120x1x1,weight:blk.10.ffn_down.weight,n656,unique q4_0 17408x5120 in block
+181,f32,5120x1x1x1,weight:blk.11.attn_norm.weight,n659,f32[5120] MUL paired with pre-mixer RMS_NORM
+182,q4_0,5120x12288x1x1,weight:blk.11.attn_q.weight,n660,unique q4_0 5120x12288 in block (q+gate interleaved)
+183,f32,256x1x1x1,weight:blk.11.attn_q_norm.weight,n663,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+184,q4_0,5120x1024x1x1,weight:blk.11.attn_v.weight,n665,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+185,q4_0,5120x1024x1x1,weight:blk.11.attn_k.weight,n667,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+186,f32,256x1x1x1,weight:blk.11.attn_k_norm.weight,n670,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+187,f16,1024x262144x1x1,cache_k(blk.11),n673,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+188,f16,1024x262144x1x1,cache_v(blk.11),n675,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+189,q4_0,6144x5120x1x1,weight:blk.11.attn_output.weight,n688,unique q4_0 6144x5120 in block
+190,f32,5120x1x1x1,weight:blk.11.post_attention_norm.weight,n691,f32[5120] MUL paired with pre-FFN RMS_NORM
+191,q4_0,5120x17408x1x1,weight:blk.11.ffn_gate.weight,n692,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+192,q4_0,5120x17408x1x1,weight:blk.11.ffn_up.weight,n693,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+193,q4_0,17408x5120x1x1,weight:blk.11.ffn_down.weight,n695,unique q4_0 17408x5120 in block
+194,f32,5120x1x1x1,weight:blk.12.attn_norm.weight,n698,f32[5120] MUL paired with pre-mixer RMS_NORM
+195,f32,30720x1x1x1,state:conv_state(blk.12),n699,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+196,q4_0,5120x10240x1x1,weight:blk.12.attn_qkv.weight,n707,unique q4_0 5120x10240 in block
+197,f32,786432x1x1x1,state:ssm_state(blk.12),n714,f32[786432]=128x128x48 GDN recurrent state
+198,f32,4x10240x1x1,weight:blk.12.ssm_conv1d.weight,n721,f32 4x10240 SSM_CONV kernel
+199,f16,5120x48x1x1,weight:blk.12.ssm_alpha.weight,n728,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+200,f32,48x1x1x1,weight:blk.12.ssm_dt.bias,n730,f32[48] ADD operand on the alpha path
+201,f32,48x1x1x1,weight:blk.12.ssm_a,n732,f32[48] MUL operand after softplus (-exp(A_log) factor)
+202,f16,5120x48x1x1,weight:blk.12.ssm_beta.weight,n734,f16 5120x48 GEMV feeding sigmoid (mixing path)
+203,f32,128x1x1x1,weight:blk.12.ssm_norm.weight,n745,f32[128] MUL after the per-head RMS_NORM of the GDN output
+204,q4_0,5120x6144x1x1,weight:blk.12.attn_gate.weight,n746,unique q4_0 5120x6144 in block (z-gate GEMV)
+205,q4_0_ar16,6144x5120x1x1,weight:blk.12.ssm_out.weight,n751,unique Q4_0_AR16 6144x5120 in block
+206,f32,5120x1x1x1,weight:blk.12.post_attention_norm.weight,n755,f32[5120] MUL paired with pre-FFN RMS_NORM
+207,q4_0,5120x17408x1x1,weight:blk.12.ffn_gate.weight,n756,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+208,q4_0,5120x17408x1x1,weight:blk.12.ffn_up.weight,n757,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+209,q4_0,17408x5120x1x1,weight:blk.12.ffn_down.weight,n759,unique q4_0 17408x5120 in block
+210,f32,5120x1x1x1,weight:blk.13.attn_norm.weight,n762,f32[5120] MUL paired with pre-mixer RMS_NORM
+211,f32,30720x1x1x1,state:conv_state(blk.13),n763,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+212,q4_0,5120x10240x1x1,weight:blk.13.attn_qkv.weight,n771,unique q4_0 5120x10240 in block
+213,f32,786432x1x1x1,state:ssm_state(blk.13),n778,f32[786432]=128x128x48 GDN recurrent state
+214,f32,4x10240x1x1,weight:blk.13.ssm_conv1d.weight,n785,f32 4x10240 SSM_CONV kernel
+215,f16,5120x48x1x1,weight:blk.13.ssm_alpha.weight,n792,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+216,f32,48x1x1x1,weight:blk.13.ssm_dt.bias,n794,f32[48] ADD operand on the alpha path
+217,f32,48x1x1x1,weight:blk.13.ssm_a,n796,f32[48] MUL operand after softplus (-exp(A_log) factor)
+218,f16,5120x48x1x1,weight:blk.13.ssm_beta.weight,n798,f16 5120x48 GEMV feeding sigmoid (mixing path)
+219,f32,128x1x1x1,weight:blk.13.ssm_norm.weight,n809,f32[128] MUL after the per-head RMS_NORM of the GDN output
+220,q4_0,5120x6144x1x1,weight:blk.13.attn_gate.weight,n810,unique q4_0 5120x6144 in block (z-gate GEMV)
+221,q4_0_ar16,6144x5120x1x1,weight:blk.13.ssm_out.weight,n815,unique Q4_0_AR16 6144x5120 in block
+222,f32,5120x1x1x1,weight:blk.13.post_attention_norm.weight,n819,f32[5120] MUL paired with pre-FFN RMS_NORM
+223,q4_0,5120x17408x1x1,weight:blk.13.ffn_gate.weight,n820,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+224,q4_0,5120x17408x1x1,weight:blk.13.ffn_up.weight,n821,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+225,q4_0,17408x5120x1x1,weight:blk.13.ffn_down.weight,n823,unique q4_0 17408x5120 in block
+226,f32,5120x1x1x1,weight:blk.14.attn_norm.weight,n826,f32[5120] MUL paired with pre-mixer RMS_NORM
+227,f32,30720x1x1x1,state:conv_state(blk.14),n827,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+228,q4_0,5120x10240x1x1,weight:blk.14.attn_qkv.weight,n835,unique q4_0 5120x10240 in block
+229,f32,786432x1x1x1,state:ssm_state(blk.14),n842,f32[786432]=128x128x48 GDN recurrent state
+230,f32,4x10240x1x1,weight:blk.14.ssm_conv1d.weight,n849,f32 4x10240 SSM_CONV kernel
+231,f16,5120x48x1x1,weight:blk.14.ssm_alpha.weight,n856,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+232,f32,48x1x1x1,weight:blk.14.ssm_dt.bias,n858,f32[48] ADD operand on the alpha path
+233,f32,48x1x1x1,weight:blk.14.ssm_a,n860,f32[48] MUL operand after softplus (-exp(A_log) factor)
+234,f16,5120x48x1x1,weight:blk.14.ssm_beta.weight,n862,f16 5120x48 GEMV feeding sigmoid (mixing path)
+235,f32,128x1x1x1,weight:blk.14.ssm_norm.weight,n873,f32[128] MUL after the per-head RMS_NORM of the GDN output
+236,q4_0,5120x6144x1x1,weight:blk.14.attn_gate.weight,n874,unique q4_0 5120x6144 in block (z-gate GEMV)
+237,q4_0_ar16,6144x5120x1x1,weight:blk.14.ssm_out.weight,n879,unique Q4_0_AR16 6144x5120 in block
+238,f32,5120x1x1x1,weight:blk.14.post_attention_norm.weight,n883,f32[5120] MUL paired with pre-FFN RMS_NORM
+239,q4_0,5120x17408x1x1,weight:blk.14.ffn_gate.weight,n884,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+240,q4_0,5120x17408x1x1,weight:blk.14.ffn_up.weight,n885,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+241,q4_0,17408x5120x1x1,weight:blk.14.ffn_down.weight,n887,unique q4_0 17408x5120 in block
+242,f32,5120x1x1x1,weight:blk.15.attn_norm.weight,n890,f32[5120] MUL paired with pre-mixer RMS_NORM
+243,q4_0,5120x12288x1x1,weight:blk.15.attn_q.weight,n891,unique q4_0 5120x12288 in block (q+gate interleaved)
+244,f32,256x1x1x1,weight:blk.15.attn_q_norm.weight,n894,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+245,q4_0,5120x1024x1x1,weight:blk.15.attn_v.weight,n896,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+246,q4_0,5120x1024x1x1,weight:blk.15.attn_k.weight,n898,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+247,f32,256x1x1x1,weight:blk.15.attn_k_norm.weight,n901,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+248,f16,1024x262144x1x1,cache_k(blk.15),n904,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+249,f16,1024x262144x1x1,cache_v(blk.15),n906,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+250,q4_0,6144x5120x1x1,weight:blk.15.attn_output.weight,n919,unique q4_0 6144x5120 in block
+251,f32,5120x1x1x1,weight:blk.15.post_attention_norm.weight,n922,f32[5120] MUL paired with pre-FFN RMS_NORM
+252,q4_0,5120x17408x1x1,weight:blk.15.ffn_gate.weight,n923,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+253,q4_0,5120x17408x1x1,weight:blk.15.ffn_up.weight,n924,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+254,q4_0,17408x5120x1x1,weight:blk.15.ffn_down.weight,n926,unique q4_0 17408x5120 in block
+255,f32,5120x1x1x1,weight:blk.16.attn_norm.weight,n929,f32[5120] MUL paired with pre-mixer RMS_NORM
+256,f32,30720x1x1x1,state:conv_state(blk.16),n930,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+257,q4_0,5120x10240x1x1,weight:blk.16.attn_qkv.weight,n938,unique q4_0 5120x10240 in block
+258,f32,786432x1x1x1,state:ssm_state(blk.16),n945,f32[786432]=128x128x48 GDN recurrent state
+259,f32,4x10240x1x1,weight:blk.16.ssm_conv1d.weight,n952,f32 4x10240 SSM_CONV kernel
+260,f16,5120x48x1x1,weight:blk.16.ssm_alpha.weight,n959,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+261,f32,48x1x1x1,weight:blk.16.ssm_dt.bias,n961,f32[48] ADD operand on the alpha path
+262,f32,48x1x1x1,weight:blk.16.ssm_a,n963,f32[48] MUL operand after softplus (-exp(A_log) factor)
+263,f16,5120x48x1x1,weight:blk.16.ssm_beta.weight,n965,f16 5120x48 GEMV feeding sigmoid (mixing path)
+264,f32,128x1x1x1,weight:blk.16.ssm_norm.weight,n976,f32[128] MUL after the per-head RMS_NORM of the GDN output
+265,q4_0,5120x6144x1x1,weight:blk.16.attn_gate.weight,n977,unique q4_0 5120x6144 in block (z-gate GEMV)
+266,q4_0_ar16,6144x5120x1x1,weight:blk.16.ssm_out.weight,n982,unique Q4_0_AR16 6144x5120 in block
+267,f32,5120x1x1x1,weight:blk.16.post_attention_norm.weight,n986,f32[5120] MUL paired with pre-FFN RMS_NORM
+268,q4_0,5120x17408x1x1,weight:blk.16.ffn_gate.weight,n987,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+269,q4_0,5120x17408x1x1,weight:blk.16.ffn_up.weight,n988,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+270,q4_0,17408x5120x1x1,weight:blk.16.ffn_down.weight,n990,unique q4_0 17408x5120 in block
+271,f32,5120x1x1x1,weight:blk.17.attn_norm.weight,n993,f32[5120] MUL paired with pre-mixer RMS_NORM
+272,f32,30720x1x1x1,state:conv_state(blk.17),n994,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+273,q4_0,5120x10240x1x1,weight:blk.17.attn_qkv.weight,n1002,unique q4_0 5120x10240 in block
+274,f32,786432x1x1x1,state:ssm_state(blk.17),n1009,f32[786432]=128x128x48 GDN recurrent state
+275,f32,4x10240x1x1,weight:blk.17.ssm_conv1d.weight,n1016,f32 4x10240 SSM_CONV kernel
+276,f16,5120x48x1x1,weight:blk.17.ssm_alpha.weight,n1023,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+277,f32,48x1x1x1,weight:blk.17.ssm_dt.bias,n1025,f32[48] ADD operand on the alpha path
+278,f32,48x1x1x1,weight:blk.17.ssm_a,n1027,f32[48] MUL operand after softplus (-exp(A_log) factor)
+279,f16,5120x48x1x1,weight:blk.17.ssm_beta.weight,n1029,f16 5120x48 GEMV feeding sigmoid (mixing path)
+280,f32,128x1x1x1,weight:blk.17.ssm_norm.weight,n1040,f32[128] MUL after the per-head RMS_NORM of the GDN output
+281,q4_0,5120x6144x1x1,weight:blk.17.attn_gate.weight,n1041,unique q4_0 5120x6144 in block (z-gate GEMV)
+282,q4_0_ar16,6144x5120x1x1,weight:blk.17.ssm_out.weight,n1046,unique Q4_0_AR16 6144x5120 in block
+283,f32,5120x1x1x1,weight:blk.17.post_attention_norm.weight,n1050,f32[5120] MUL paired with pre-FFN RMS_NORM
+284,q4_0,5120x17408x1x1,weight:blk.17.ffn_gate.weight,n1051,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+285,q4_0,5120x17408x1x1,weight:blk.17.ffn_up.weight,n1052,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+286,q4_0,17408x5120x1x1,weight:blk.17.ffn_down.weight,n1054,unique q4_0 17408x5120 in block
+287,f32,5120x1x1x1,weight:blk.18.attn_norm.weight,n1057,f32[5120] MUL paired with pre-mixer RMS_NORM
+288,f32,30720x1x1x1,state:conv_state(blk.18),n1058,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+289,q4_0,5120x10240x1x1,weight:blk.18.attn_qkv.weight,n1066,unique q4_0 5120x10240 in block
+290,f32,786432x1x1x1,state:ssm_state(blk.18),n1073,f32[786432]=128x128x48 GDN recurrent state
+291,f32,4x10240x1x1,weight:blk.18.ssm_conv1d.weight,n1080,f32 4x10240 SSM_CONV kernel
+292,f16,5120x48x1x1,weight:blk.18.ssm_alpha.weight,n1087,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+293,f32,48x1x1x1,weight:blk.18.ssm_dt.bias,n1089,f32[48] ADD operand on the alpha path
+294,f32,48x1x1x1,weight:blk.18.ssm_a,n1091,f32[48] MUL operand after softplus (-exp(A_log) factor)
+295,f16,5120x48x1x1,weight:blk.18.ssm_beta.weight,n1093,f16 5120x48 GEMV feeding sigmoid (mixing path)
+296,f32,128x1x1x1,weight:blk.18.ssm_norm.weight,n1104,f32[128] MUL after the per-head RMS_NORM of the GDN output
+297,q4_0,5120x6144x1x1,weight:blk.18.attn_gate.weight,n1105,unique q4_0 5120x6144 in block (z-gate GEMV)
+298,q4_0_ar16,6144x5120x1x1,weight:blk.18.ssm_out.weight,n1110,unique Q4_0_AR16 6144x5120 in block
+299,f32,5120x1x1x1,weight:blk.18.post_attention_norm.weight,n1114,f32[5120] MUL paired with pre-FFN RMS_NORM
+300,q4_0,5120x17408x1x1,weight:blk.18.ffn_gate.weight,n1115,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+301,q4_0,5120x17408x1x1,weight:blk.18.ffn_up.weight,n1116,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+302,q4_0,17408x5120x1x1,weight:blk.18.ffn_down.weight,n1118,unique q4_0 17408x5120 in block
+303,f32,5120x1x1x1,weight:blk.19.attn_norm.weight,n1121,f32[5120] MUL paired with pre-mixer RMS_NORM
+304,q4_0,5120x12288x1x1,weight:blk.19.attn_q.weight,n1122,unique q4_0 5120x12288 in block (q+gate interleaved)
+305,f32,256x1x1x1,weight:blk.19.attn_q_norm.weight,n1125,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+306,q4_0,5120x1024x1x1,weight:blk.19.attn_v.weight,n1127,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+307,q4_0,5120x1024x1x1,weight:blk.19.attn_k.weight,n1129,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+308,f32,256x1x1x1,weight:blk.19.attn_k_norm.weight,n1132,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+309,f16,1024x262144x1x1,cache_k(blk.19),n1135,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+310,f16,1024x262144x1x1,cache_v(blk.19),n1137,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+311,q4_0,6144x5120x1x1,weight:blk.19.attn_output.weight,n1150,unique q4_0 6144x5120 in block
+312,f32,5120x1x1x1,weight:blk.19.post_attention_norm.weight,n1153,f32[5120] MUL paired with pre-FFN RMS_NORM
+313,q4_0,5120x17408x1x1,weight:blk.19.ffn_gate.weight,n1154,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+314,q4_0,5120x17408x1x1,weight:blk.19.ffn_up.weight,n1155,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+315,q4_0,17408x5120x1x1,weight:blk.19.ffn_down.weight,n1157,unique q4_0 17408x5120 in block
+316,f32,5120x1x1x1,weight:blk.20.attn_norm.weight,n1160,f32[5120] MUL paired with pre-mixer RMS_NORM
+317,f32,30720x1x1x1,state:conv_state(blk.20),n1161,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+318,q4_0,5120x10240x1x1,weight:blk.20.attn_qkv.weight,n1169,unique q4_0 5120x10240 in block
+319,f32,786432x1x1x1,state:ssm_state(blk.20),n1176,f32[786432]=128x128x48 GDN recurrent state
+320,f32,4x10240x1x1,weight:blk.20.ssm_conv1d.weight,n1183,f32 4x10240 SSM_CONV kernel
+321,f16,5120x48x1x1,weight:blk.20.ssm_alpha.weight,n1190,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+322,f32,48x1x1x1,weight:blk.20.ssm_dt.bias,n1192,f32[48] ADD operand on the alpha path
+323,f32,48x1x1x1,weight:blk.20.ssm_a,n1194,f32[48] MUL operand after softplus (-exp(A_log) factor)
+324,f16,5120x48x1x1,weight:blk.20.ssm_beta.weight,n1196,f16 5120x48 GEMV feeding sigmoid (mixing path)
+325,f32,128x1x1x1,weight:blk.20.ssm_norm.weight,n1207,f32[128] MUL after the per-head RMS_NORM of the GDN output
+326,q4_0,5120x6144x1x1,weight:blk.20.attn_gate.weight,n1208,unique q4_0 5120x6144 in block (z-gate GEMV)
+327,q4_0_ar16,6144x5120x1x1,weight:blk.20.ssm_out.weight,n1213,unique Q4_0_AR16 6144x5120 in block
+328,f32,5120x1x1x1,weight:blk.20.post_attention_norm.weight,n1217,f32[5120] MUL paired with pre-FFN RMS_NORM
+329,q4_0,5120x17408x1x1,weight:blk.20.ffn_gate.weight,n1218,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+330,q4_0,5120x17408x1x1,weight:blk.20.ffn_up.weight,n1219,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+331,q4_0,17408x5120x1x1,weight:blk.20.ffn_down.weight,n1221,unique q4_0 17408x5120 in block
+332,f32,5120x1x1x1,weight:blk.21.attn_norm.weight,n1224,f32[5120] MUL paired with pre-mixer RMS_NORM
+333,f32,30720x1x1x1,state:conv_state(blk.21),n1225,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+334,q4_0,5120x10240x1x1,weight:blk.21.attn_qkv.weight,n1233,unique q4_0 5120x10240 in block
+335,f32,786432x1x1x1,state:ssm_state(blk.21),n1240,f32[786432]=128x128x48 GDN recurrent state
+336,f32,4x10240x1x1,weight:blk.21.ssm_conv1d.weight,n1247,f32 4x10240 SSM_CONV kernel
+337,f16,5120x48x1x1,weight:blk.21.ssm_alpha.weight,n1254,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+338,f32,48x1x1x1,weight:blk.21.ssm_dt.bias,n1256,f32[48] ADD operand on the alpha path
+339,f32,48x1x1x1,weight:blk.21.ssm_a,n1258,f32[48] MUL operand after softplus (-exp(A_log) factor)
+340,f16,5120x48x1x1,weight:blk.21.ssm_beta.weight,n1260,f16 5120x48 GEMV feeding sigmoid (mixing path)
+341,f32,128x1x1x1,weight:blk.21.ssm_norm.weight,n1271,f32[128] MUL after the per-head RMS_NORM of the GDN output
+342,q4_0,5120x6144x1x1,weight:blk.21.attn_gate.weight,n1272,unique q4_0 5120x6144 in block (z-gate GEMV)
+343,q4_0_ar16,6144x5120x1x1,weight:blk.21.ssm_out.weight,n1277,unique Q4_0_AR16 6144x5120 in block
+344,f32,5120x1x1x1,weight:blk.21.post_attention_norm.weight,n1281,f32[5120] MUL paired with pre-FFN RMS_NORM
+345,q4_0,5120x17408x1x1,weight:blk.21.ffn_gate.weight,n1282,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+346,q4_0,5120x17408x1x1,weight:blk.21.ffn_up.weight,n1283,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+347,q4_0,17408x5120x1x1,weight:blk.21.ffn_down.weight,n1285,unique q4_0 17408x5120 in block
+348,f32,5120x1x1x1,weight:blk.22.attn_norm.weight,n1288,f32[5120] MUL paired with pre-mixer RMS_NORM
+349,f32,30720x1x1x1,state:conv_state(blk.22),n1289,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+350,q4_0,5120x10240x1x1,weight:blk.22.attn_qkv.weight,n1297,unique q4_0 5120x10240 in block
+351,f32,786432x1x1x1,state:ssm_state(blk.22),n1304,f32[786432]=128x128x48 GDN recurrent state
+352,f32,4x10240x1x1,weight:blk.22.ssm_conv1d.weight,n1311,f32 4x10240 SSM_CONV kernel
+353,f16,5120x48x1x1,weight:blk.22.ssm_alpha.weight,n1318,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+354,f32,48x1x1x1,weight:blk.22.ssm_dt.bias,n1320,f32[48] ADD operand on the alpha path
+355,f32,48x1x1x1,weight:blk.22.ssm_a,n1322,f32[48] MUL operand after softplus (-exp(A_log) factor)
+356,f16,5120x48x1x1,weight:blk.22.ssm_beta.weight,n1324,f16 5120x48 GEMV feeding sigmoid (mixing path)
+357,f32,128x1x1x1,weight:blk.22.ssm_norm.weight,n1335,f32[128] MUL after the per-head RMS_NORM of the GDN output
+358,q4_0,5120x6144x1x1,weight:blk.22.attn_gate.weight,n1336,unique q4_0 5120x6144 in block (z-gate GEMV)
+359,q4_0_ar16,6144x5120x1x1,weight:blk.22.ssm_out.weight,n1341,unique Q4_0_AR16 6144x5120 in block
+360,f32,5120x1x1x1,weight:blk.22.post_attention_norm.weight,n1345,f32[5120] MUL paired with pre-FFN RMS_NORM
+361,q4_0,5120x17408x1x1,weight:blk.22.ffn_gate.weight,n1346,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+362,q4_0,5120x17408x1x1,weight:blk.22.ffn_up.weight,n1347,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+363,q4_0,17408x5120x1x1,weight:blk.22.ffn_down.weight,n1349,unique q4_0 17408x5120 in block
+364,f32,5120x1x1x1,weight:blk.23.attn_norm.weight,n1352,f32[5120] MUL paired with pre-mixer RMS_NORM
+365,q4_0,5120x12288x1x1,weight:blk.23.attn_q.weight,n1353,unique q4_0 5120x12288 in block (q+gate interleaved)
+366,f32,256x1x1x1,weight:blk.23.attn_q_norm.weight,n1356,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+367,q4_0,5120x1024x1x1,weight:blk.23.attn_v.weight,n1358,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+368,q4_0,5120x1024x1x1,weight:blk.23.attn_k.weight,n1360,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+369,f32,256x1x1x1,weight:blk.23.attn_k_norm.weight,n1363,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+370,f16,1024x262144x1x1,cache_k(blk.23),n1366,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+371,f16,1024x262144x1x1,cache_v(blk.23),n1368,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+372,q4_0,6144x5120x1x1,weight:blk.23.attn_output.weight,n1381,unique q4_0 6144x5120 in block
+373,f32,5120x1x1x1,weight:blk.23.post_attention_norm.weight,n1384,f32[5120] MUL paired with pre-FFN RMS_NORM
+374,q4_0,5120x17408x1x1,weight:blk.23.ffn_gate.weight,n1385,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+375,q4_0,5120x17408x1x1,weight:blk.23.ffn_up.weight,n1386,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+376,q4_0,17408x5120x1x1,weight:blk.23.ffn_down.weight,n1388,unique q4_0 17408x5120 in block
+377,f32,5120x1x1x1,weight:blk.24.attn_norm.weight,n1391,f32[5120] MUL paired with pre-mixer RMS_NORM
+378,f32,30720x1x1x1,state:conv_state(blk.24),n1392,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+379,q4_0,5120x10240x1x1,weight:blk.24.attn_qkv.weight,n1400,unique q4_0 5120x10240 in block
+380,f32,786432x1x1x1,state:ssm_state(blk.24),n1407,f32[786432]=128x128x48 GDN recurrent state
+381,f32,4x10240x1x1,weight:blk.24.ssm_conv1d.weight,n1414,f32 4x10240 SSM_CONV kernel
+382,f16,5120x48x1x1,weight:blk.24.ssm_alpha.weight,n1421,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+383,f32,48x1x1x1,weight:blk.24.ssm_dt.bias,n1423,f32[48] ADD operand on the alpha path
+384,f32,48x1x1x1,weight:blk.24.ssm_a,n1425,f32[48] MUL operand after softplus (-exp(A_log) factor)
+385,f16,5120x48x1x1,weight:blk.24.ssm_beta.weight,n1427,f16 5120x48 GEMV feeding sigmoid (mixing path)
+386,f32,128x1x1x1,weight:blk.24.ssm_norm.weight,n1438,f32[128] MUL after the per-head RMS_NORM of the GDN output
+387,q4_0,5120x6144x1x1,weight:blk.24.attn_gate.weight,n1439,unique q4_0 5120x6144 in block (z-gate GEMV)
+388,q4_0_ar16,6144x5120x1x1,weight:blk.24.ssm_out.weight,n1444,unique Q4_0_AR16 6144x5120 in block
+389,f32,5120x1x1x1,weight:blk.24.post_attention_norm.weight,n1448,f32[5120] MUL paired with pre-FFN RMS_NORM
+390,q4_0,5120x17408x1x1,weight:blk.24.ffn_gate.weight,n1449,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+391,q4_0,5120x17408x1x1,weight:blk.24.ffn_up.weight,n1450,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+392,q4_0,17408x5120x1x1,weight:blk.24.ffn_down.weight,n1452,unique q4_0 17408x5120 in block
+393,f32,5120x1x1x1,weight:blk.25.attn_norm.weight,n1455,f32[5120] MUL paired with pre-mixer RMS_NORM
+394,f32,30720x1x1x1,state:conv_state(blk.25),n1456,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+395,q4_0,5120x10240x1x1,weight:blk.25.attn_qkv.weight,n1464,unique q4_0 5120x10240 in block
+396,f32,786432x1x1x1,state:ssm_state(blk.25),n1471,f32[786432]=128x128x48 GDN recurrent state
+397,f32,4x10240x1x1,weight:blk.25.ssm_conv1d.weight,n1478,f32 4x10240 SSM_CONV kernel
+398,f16,5120x48x1x1,weight:blk.25.ssm_alpha.weight,n1485,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+399,f32,48x1x1x1,weight:blk.25.ssm_dt.bias,n1487,f32[48] ADD operand on the alpha path
+400,f32,48x1x1x1,weight:blk.25.ssm_a,n1489,f32[48] MUL operand after softplus (-exp(A_log) factor)
+401,f16,5120x48x1x1,weight:blk.25.ssm_beta.weight,n1491,f16 5120x48 GEMV feeding sigmoid (mixing path)
+402,f32,128x1x1x1,weight:blk.25.ssm_norm.weight,n1502,f32[128] MUL after the per-head RMS_NORM of the GDN output
+403,q4_0,5120x6144x1x1,weight:blk.25.attn_gate.weight,n1503,unique q4_0 5120x6144 in block (z-gate GEMV)
+404,q4_0_ar16,6144x5120x1x1,weight:blk.25.ssm_out.weight,n1508,unique Q4_0_AR16 6144x5120 in block
+405,f32,5120x1x1x1,weight:blk.25.post_attention_norm.weight,n1512,f32[5120] MUL paired with pre-FFN RMS_NORM
+406,q4_0,5120x17408x1x1,weight:blk.25.ffn_gate.weight,n1513,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+407,q4_0,5120x17408x1x1,weight:blk.25.ffn_up.weight,n1514,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+408,q4_0,17408x5120x1x1,weight:blk.25.ffn_down.weight,n1516,unique q4_0 17408x5120 in block
+409,f32,5120x1x1x1,weight:blk.26.attn_norm.weight,n1519,f32[5120] MUL paired with pre-mixer RMS_NORM
+410,f32,30720x1x1x1,state:conv_state(blk.26),n1520,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+411,q4_0,5120x10240x1x1,weight:blk.26.attn_qkv.weight,n1528,unique q4_0 5120x10240 in block
+412,f32,786432x1x1x1,state:ssm_state(blk.26),n1535,f32[786432]=128x128x48 GDN recurrent state
+413,f32,4x10240x1x1,weight:blk.26.ssm_conv1d.weight,n1542,f32 4x10240 SSM_CONV kernel
+414,f16,5120x48x1x1,weight:blk.26.ssm_alpha.weight,n1549,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+415,f32,48x1x1x1,weight:blk.26.ssm_dt.bias,n1551,f32[48] ADD operand on the alpha path
+416,f32,48x1x1x1,weight:blk.26.ssm_a,n1553,f32[48] MUL operand after softplus (-exp(A_log) factor)
+417,f16,5120x48x1x1,weight:blk.26.ssm_beta.weight,n1555,f16 5120x48 GEMV feeding sigmoid (mixing path)
+418,f32,128x1x1x1,weight:blk.26.ssm_norm.weight,n1566,f32[128] MUL after the per-head RMS_NORM of the GDN output
+419,q4_0,5120x6144x1x1,weight:blk.26.attn_gate.weight,n1567,unique q4_0 5120x6144 in block (z-gate GEMV)
+420,q4_0_ar16,6144x5120x1x1,weight:blk.26.ssm_out.weight,n1572,unique Q4_0_AR16 6144x5120 in block
+421,f32,5120x1x1x1,weight:blk.26.post_attention_norm.weight,n1576,f32[5120] MUL paired with pre-FFN RMS_NORM
+422,q4_0,5120x17408x1x1,weight:blk.26.ffn_gate.weight,n1577,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+423,q4_0,5120x17408x1x1,weight:blk.26.ffn_up.weight,n1578,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+424,q4_0,17408x5120x1x1,weight:blk.26.ffn_down.weight,n1580,unique q4_0 17408x5120 in block
+425,f32,5120x1x1x1,weight:blk.27.attn_norm.weight,n1583,f32[5120] MUL paired with pre-mixer RMS_NORM
+426,q4_0,5120x12288x1x1,weight:blk.27.attn_q.weight,n1584,unique q4_0 5120x12288 in block (q+gate interleaved)
+427,f32,256x1x1x1,weight:blk.27.attn_q_norm.weight,n1587,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+428,q4_0,5120x1024x1x1,weight:blk.27.attn_v.weight,n1589,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+429,q4_0,5120x1024x1x1,weight:blk.27.attn_k.weight,n1591,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+430,f32,256x1x1x1,weight:blk.27.attn_k_norm.weight,n1594,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+431,f16,1024x262144x1x1,cache_k(blk.27),n1597,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+432,f16,1024x262144x1x1,cache_v(blk.27),n1599,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+433,q4_0,6144x5120x1x1,weight:blk.27.attn_output.weight,n1612,unique q4_0 6144x5120 in block
+434,f32,5120x1x1x1,weight:blk.27.post_attention_norm.weight,n1615,f32[5120] MUL paired with pre-FFN RMS_NORM
+435,q4_0,5120x17408x1x1,weight:blk.27.ffn_gate.weight,n1616,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+436,q4_0,5120x17408x1x1,weight:blk.27.ffn_up.weight,n1617,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+437,q4_0,17408x5120x1x1,weight:blk.27.ffn_down.weight,n1619,unique q4_0 17408x5120 in block
+438,f32,5120x1x1x1,weight:blk.28.attn_norm.weight,n1622,f32[5120] MUL paired with pre-mixer RMS_NORM
+439,f32,30720x1x1x1,state:conv_state(blk.28),n1623,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+440,q4_0,5120x10240x1x1,weight:blk.28.attn_qkv.weight,n1631,unique q4_0 5120x10240 in block
+441,f32,786432x1x1x1,state:ssm_state(blk.28),n1638,f32[786432]=128x128x48 GDN recurrent state
+442,f32,4x10240x1x1,weight:blk.28.ssm_conv1d.weight,n1645,f32 4x10240 SSM_CONV kernel
+443,f16,5120x48x1x1,weight:blk.28.ssm_alpha.weight,n1652,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+444,f32,48x1x1x1,weight:blk.28.ssm_dt.bias,n1654,f32[48] ADD operand on the alpha path
+445,f32,48x1x1x1,weight:blk.28.ssm_a,n1656,f32[48] MUL operand after softplus (-exp(A_log) factor)
+446,f16,5120x48x1x1,weight:blk.28.ssm_beta.weight,n1658,f16 5120x48 GEMV feeding sigmoid (mixing path)
+447,f32,128x1x1x1,weight:blk.28.ssm_norm.weight,n1669,f32[128] MUL after the per-head RMS_NORM of the GDN output
+448,q4_0,5120x6144x1x1,weight:blk.28.attn_gate.weight,n1670,unique q4_0 5120x6144 in block (z-gate GEMV)
+449,q4_0_ar16,6144x5120x1x1,weight:blk.28.ssm_out.weight,n1675,unique Q4_0_AR16 6144x5120 in block
+450,f32,5120x1x1x1,weight:blk.28.post_attention_norm.weight,n1679,f32[5120] MUL paired with pre-FFN RMS_NORM
+451,q4_0,5120x17408x1x1,weight:blk.28.ffn_gate.weight,n1680,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+452,q4_0,5120x17408x1x1,weight:blk.28.ffn_up.weight,n1681,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+453,q4_0,17408x5120x1x1,weight:blk.28.ffn_down.weight,n1683,unique q4_0 17408x5120 in block
+454,f32,5120x1x1x1,weight:blk.29.attn_norm.weight,n1686,f32[5120] MUL paired with pre-mixer RMS_NORM
+455,f32,30720x1x1x1,state:conv_state(blk.29),n1687,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+456,q4_0,5120x10240x1x1,weight:blk.29.attn_qkv.weight,n1695,unique q4_0 5120x10240 in block
+457,f32,786432x1x1x1,state:ssm_state(blk.29),n1702,f32[786432]=128x128x48 GDN recurrent state
+458,f32,4x10240x1x1,weight:blk.29.ssm_conv1d.weight,n1709,f32 4x10240 SSM_CONV kernel
+459,f16,5120x48x1x1,weight:blk.29.ssm_alpha.weight,n1716,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+460,f32,48x1x1x1,weight:blk.29.ssm_dt.bias,n1718,f32[48] ADD operand on the alpha path
+461,f32,48x1x1x1,weight:blk.29.ssm_a,n1720,f32[48] MUL operand after softplus (-exp(A_log) factor)
+462,f16,5120x48x1x1,weight:blk.29.ssm_beta.weight,n1722,f16 5120x48 GEMV feeding sigmoid (mixing path)
+463,f32,128x1x1x1,weight:blk.29.ssm_norm.weight,n1733,f32[128] MUL after the per-head RMS_NORM of the GDN output
+464,q4_0,5120x6144x1x1,weight:blk.29.attn_gate.weight,n1734,unique q4_0 5120x6144 in block (z-gate GEMV)
+465,q4_0_ar16,6144x5120x1x1,weight:blk.29.ssm_out.weight,n1739,unique Q4_0_AR16 6144x5120 in block
+466,f32,5120x1x1x1,weight:blk.29.post_attention_norm.weight,n1743,f32[5120] MUL paired with pre-FFN RMS_NORM
+467,q4_0,5120x17408x1x1,weight:blk.29.ffn_gate.weight,n1744,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+468,q4_0,5120x17408x1x1,weight:blk.29.ffn_up.weight,n1745,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+469,q4_0,17408x5120x1x1,weight:blk.29.ffn_down.weight,n1747,unique q4_0 17408x5120 in block
+470,f32,5120x1x1x1,weight:blk.30.attn_norm.weight,n1750,f32[5120] MUL paired with pre-mixer RMS_NORM
+471,f32,30720x1x1x1,state:conv_state(blk.30),n1751,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+472,q4_0,5120x10240x1x1,weight:blk.30.attn_qkv.weight,n1759,unique q4_0 5120x10240 in block
+473,f32,786432x1x1x1,state:ssm_state(blk.30),n1766,f32[786432]=128x128x48 GDN recurrent state
+474,f32,4x10240x1x1,weight:blk.30.ssm_conv1d.weight,n1773,f32 4x10240 SSM_CONV kernel
+475,f16,5120x48x1x1,weight:blk.30.ssm_alpha.weight,n1780,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+476,f32,48x1x1x1,weight:blk.30.ssm_dt.bias,n1782,f32[48] ADD operand on the alpha path
+477,f32,48x1x1x1,weight:blk.30.ssm_a,n1784,f32[48] MUL operand after softplus (-exp(A_log) factor)
+478,f16,5120x48x1x1,weight:blk.30.ssm_beta.weight,n1786,f16 5120x48 GEMV feeding sigmoid (mixing path)
+479,f32,128x1x1x1,weight:blk.30.ssm_norm.weight,n1797,f32[128] MUL after the per-head RMS_NORM of the GDN output
+480,q4_0,5120x6144x1x1,weight:blk.30.attn_gate.weight,n1798,unique q4_0 5120x6144 in block (z-gate GEMV)
+481,q4_0_ar16,6144x5120x1x1,weight:blk.30.ssm_out.weight,n1803,unique Q4_0_AR16 6144x5120 in block
+482,f32,5120x1x1x1,weight:blk.30.post_attention_norm.weight,n1807,f32[5120] MUL paired with pre-FFN RMS_NORM
+483,q4_0,5120x17408x1x1,weight:blk.30.ffn_gate.weight,n1808,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+484,q4_0,5120x17408x1x1,weight:blk.30.ffn_up.weight,n1809,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+485,q4_0,17408x5120x1x1,weight:blk.30.ffn_down.weight,n1811,unique q4_0 17408x5120 in block
+486,f32,5120x1x1x1,weight:blk.31.attn_norm.weight,n1814,f32[5120] MUL paired with pre-mixer RMS_NORM
+487,q4_0,5120x12288x1x1,weight:blk.31.attn_q.weight,n1815,unique q4_0 5120x12288 in block (q+gate interleaved)
+488,f32,256x1x1x1,weight:blk.31.attn_q_norm.weight,n1818,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+489,q4_0,5120x1024x1x1,weight:blk.31.attn_v.weight,n1820,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+490,q4_0,5120x1024x1x1,weight:blk.31.attn_k.weight,n1822,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+491,f32,256x1x1x1,weight:blk.31.attn_k_norm.weight,n1825,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+492,f16,1024x262144x1x1,cache_k(blk.31),n1828,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+493,f16,1024x262144x1x1,cache_v(blk.31),n1830,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+494,q4_0,6144x5120x1x1,weight:blk.31.attn_output.weight,n1843,unique q4_0 6144x5120 in block
+495,f32,5120x1x1x1,weight:blk.31.post_attention_norm.weight,n1846,f32[5120] MUL paired with pre-FFN RMS_NORM
+496,q4_0,5120x17408x1x1,weight:blk.31.ffn_gate.weight,n1847,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+497,q4_0,5120x17408x1x1,weight:blk.31.ffn_up.weight,n1848,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+498,q4_0,17408x5120x1x1,weight:blk.31.ffn_down.weight,n1850,unique q4_0 17408x5120 in block
+499,f32,5120x1x1x1,weight:blk.32.attn_norm.weight,n1853,f32[5120] MUL paired with pre-mixer RMS_NORM
+500,f32,30720x1x1x1,state:conv_state(blk.32),n1854,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+501,q4_0,5120x10240x1x1,weight:blk.32.attn_qkv.weight,n1862,unique q4_0 5120x10240 in block
+502,f32,786432x1x1x1,state:ssm_state(blk.32),n1869,f32[786432]=128x128x48 GDN recurrent state
+503,f32,4x10240x1x1,weight:blk.32.ssm_conv1d.weight,n1876,f32 4x10240 SSM_CONV kernel
+504,f16,5120x48x1x1,weight:blk.32.ssm_alpha.weight,n1883,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+505,f32,48x1x1x1,weight:blk.32.ssm_dt.bias,n1885,f32[48] ADD operand on the alpha path
+506,f32,48x1x1x1,weight:blk.32.ssm_a,n1887,f32[48] MUL operand after softplus (-exp(A_log) factor)
+507,f16,5120x48x1x1,weight:blk.32.ssm_beta.weight,n1889,f16 5120x48 GEMV feeding sigmoid (mixing path)
+508,f32,128x1x1x1,weight:blk.32.ssm_norm.weight,n1900,f32[128] MUL after the per-head RMS_NORM of the GDN output
+509,q4_0,5120x6144x1x1,weight:blk.32.attn_gate.weight,n1901,unique q4_0 5120x6144 in block (z-gate GEMV)
+510,q4_0_ar16,6144x5120x1x1,weight:blk.32.ssm_out.weight,n1906,unique Q4_0_AR16 6144x5120 in block
+511,f32,5120x1x1x1,weight:blk.32.post_attention_norm.weight,n1910,f32[5120] MUL paired with pre-FFN RMS_NORM
+512,q4_0,5120x17408x1x1,weight:blk.32.ffn_gate.weight,n1911,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+513,q4_0,5120x17408x1x1,weight:blk.32.ffn_up.weight,n1912,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+514,q4_0,17408x5120x1x1,weight:blk.32.ffn_down.weight,n1914,unique q4_0 17408x5120 in block
+515,f32,5120x1x1x1,weight:blk.33.attn_norm.weight,n1917,f32[5120] MUL paired with pre-mixer RMS_NORM
+516,f32,30720x1x1x1,state:conv_state(blk.33),n1918,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+517,q4_0,5120x10240x1x1,weight:blk.33.attn_qkv.weight,n1926,unique q4_0 5120x10240 in block
+518,f32,786432x1x1x1,state:ssm_state(blk.33),n1933,f32[786432]=128x128x48 GDN recurrent state
+519,f32,4x10240x1x1,weight:blk.33.ssm_conv1d.weight,n1940,f32 4x10240 SSM_CONV kernel
+520,f16,5120x48x1x1,weight:blk.33.ssm_alpha.weight,n1947,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+521,f32,48x1x1x1,weight:blk.33.ssm_dt.bias,n1949,f32[48] ADD operand on the alpha path
+522,f32,48x1x1x1,weight:blk.33.ssm_a,n1951,f32[48] MUL operand after softplus (-exp(A_log) factor)
+523,f16,5120x48x1x1,weight:blk.33.ssm_beta.weight,n1953,f16 5120x48 GEMV feeding sigmoid (mixing path)
+524,f32,128x1x1x1,weight:blk.33.ssm_norm.weight,n1964,f32[128] MUL after the per-head RMS_NORM of the GDN output
+525,q4_0,5120x6144x1x1,weight:blk.33.attn_gate.weight,n1965,unique q4_0 5120x6144 in block (z-gate GEMV)
+526,q4_0_ar16,6144x5120x1x1,weight:blk.33.ssm_out.weight,n1970,unique Q4_0_AR16 6144x5120 in block
+527,f32,5120x1x1x1,weight:blk.33.post_attention_norm.weight,n1974,f32[5120] MUL paired with pre-FFN RMS_NORM
+528,q4_0,5120x17408x1x1,weight:blk.33.ffn_gate.weight,n1975,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+529,q4_0,5120x17408x1x1,weight:blk.33.ffn_up.weight,n1976,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+530,q4_0,17408x5120x1x1,weight:blk.33.ffn_down.weight,n1978,unique q4_0 17408x5120 in block
+531,f32,5120x1x1x1,weight:blk.34.attn_norm.weight,n1981,f32[5120] MUL paired with pre-mixer RMS_NORM
+532,f32,30720x1x1x1,state:conv_state(blk.34),n1982,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+533,q4_0,5120x10240x1x1,weight:blk.34.attn_qkv.weight,n1990,unique q4_0 5120x10240 in block
+534,f32,786432x1x1x1,state:ssm_state(blk.34),n1997,f32[786432]=128x128x48 GDN recurrent state
+535,f32,4x10240x1x1,weight:blk.34.ssm_conv1d.weight,n2004,f32 4x10240 SSM_CONV kernel
+536,f16,5120x48x1x1,weight:blk.34.ssm_alpha.weight,n2011,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+537,f32,48x1x1x1,weight:blk.34.ssm_dt.bias,n2013,f32[48] ADD operand on the alpha path
+538,f32,48x1x1x1,weight:blk.34.ssm_a,n2015,f32[48] MUL operand after softplus (-exp(A_log) factor)
+539,f16,5120x48x1x1,weight:blk.34.ssm_beta.weight,n2017,f16 5120x48 GEMV feeding sigmoid (mixing path)
+540,f32,128x1x1x1,weight:blk.34.ssm_norm.weight,n2028,f32[128] MUL after the per-head RMS_NORM of the GDN output
+541,q4_0,5120x6144x1x1,weight:blk.34.attn_gate.weight,n2029,unique q4_0 5120x6144 in block (z-gate GEMV)
+542,q4_0_ar16,6144x5120x1x1,weight:blk.34.ssm_out.weight,n2034,unique Q4_0_AR16 6144x5120 in block
+543,f32,5120x1x1x1,weight:blk.34.post_attention_norm.weight,n2038,f32[5120] MUL paired with pre-FFN RMS_NORM
+544,q4_0,5120x17408x1x1,weight:blk.34.ffn_gate.weight,n2039,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+545,q4_0,5120x17408x1x1,weight:blk.34.ffn_up.weight,n2040,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+546,q4_0,17408x5120x1x1,weight:blk.34.ffn_down.weight,n2042,unique q4_0 17408x5120 in block
+547,f32,5120x1x1x1,weight:blk.35.attn_norm.weight,n2045,f32[5120] MUL paired with pre-mixer RMS_NORM
+548,q4_0,5120x12288x1x1,weight:blk.35.attn_q.weight,n2046,unique q4_0 5120x12288 in block (q+gate interleaved)
+549,f32,256x1x1x1,weight:blk.35.attn_q_norm.weight,n2049,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+550,q4_0,5120x1024x1x1,weight:blk.35.attn_v.weight,n2051,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+551,q4_0,5120x1024x1x1,weight:blk.35.attn_k.weight,n2053,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+552,f32,256x1x1x1,weight:blk.35.attn_k_norm.weight,n2056,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+553,f16,1024x262144x1x1,cache_k(blk.35),n2059,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+554,f16,1024x262144x1x1,cache_v(blk.35),n2061,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+555,q4_0,6144x5120x1x1,weight:blk.35.attn_output.weight,n2074,unique q4_0 6144x5120 in block
+556,f32,5120x1x1x1,weight:blk.35.post_attention_norm.weight,n2077,f32[5120] MUL paired with pre-FFN RMS_NORM
+557,q4_0,5120x17408x1x1,weight:blk.35.ffn_gate.weight,n2078,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+558,q4_0,5120x17408x1x1,weight:blk.35.ffn_up.weight,n2079,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+559,q4_0,17408x5120x1x1,weight:blk.35.ffn_down.weight,n2081,unique q4_0 17408x5120 in block
+560,f32,5120x1x1x1,weight:blk.36.attn_norm.weight,n2084,f32[5120] MUL paired with pre-mixer RMS_NORM
+561,f32,30720x1x1x1,state:conv_state(blk.36),n2085,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+562,q4_0,5120x10240x1x1,weight:blk.36.attn_qkv.weight,n2093,unique q4_0 5120x10240 in block
+563,f32,786432x1x1x1,state:ssm_state(blk.36),n2100,f32[786432]=128x128x48 GDN recurrent state
+564,f32,4x10240x1x1,weight:blk.36.ssm_conv1d.weight,n2107,f32 4x10240 SSM_CONV kernel
+565,f16,5120x48x1x1,weight:blk.36.ssm_alpha.weight,n2114,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+566,f32,48x1x1x1,weight:blk.36.ssm_dt.bias,n2116,f32[48] ADD operand on the alpha path
+567,f32,48x1x1x1,weight:blk.36.ssm_a,n2118,f32[48] MUL operand after softplus (-exp(A_log) factor)
+568,f16,5120x48x1x1,weight:blk.36.ssm_beta.weight,n2120,f16 5120x48 GEMV feeding sigmoid (mixing path)
+569,f32,128x1x1x1,weight:blk.36.ssm_norm.weight,n2131,f32[128] MUL after the per-head RMS_NORM of the GDN output
+570,q4_0,5120x6144x1x1,weight:blk.36.attn_gate.weight,n2132,unique q4_0 5120x6144 in block (z-gate GEMV)
+571,q4_0_ar16,6144x5120x1x1,weight:blk.36.ssm_out.weight,n2137,unique Q4_0_AR16 6144x5120 in block
+572,f32,5120x1x1x1,weight:blk.36.post_attention_norm.weight,n2141,f32[5120] MUL paired with pre-FFN RMS_NORM
+573,q4_0,5120x17408x1x1,weight:blk.36.ffn_gate.weight,n2142,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+574,q4_0,5120x17408x1x1,weight:blk.36.ffn_up.weight,n2143,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+575,q4_0,17408x5120x1x1,weight:blk.36.ffn_down.weight,n2145,unique q4_0 17408x5120 in block
+576,f32,5120x1x1x1,weight:blk.37.attn_norm.weight,n2148,f32[5120] MUL paired with pre-mixer RMS_NORM
+577,f32,30720x1x1x1,state:conv_state(blk.37),n2149,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+578,q4_0,5120x10240x1x1,weight:blk.37.attn_qkv.weight,n2157,unique q4_0 5120x10240 in block
+579,f32,786432x1x1x1,state:ssm_state(blk.37),n2164,f32[786432]=128x128x48 GDN recurrent state
+580,f32,4x10240x1x1,weight:blk.37.ssm_conv1d.weight,n2171,f32 4x10240 SSM_CONV kernel
+581,f16,5120x48x1x1,weight:blk.37.ssm_alpha.weight,n2178,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+582,f32,48x1x1x1,weight:blk.37.ssm_dt.bias,n2180,f32[48] ADD operand on the alpha path
+583,f32,48x1x1x1,weight:blk.37.ssm_a,n2182,f32[48] MUL operand after softplus (-exp(A_log) factor)
+584,f16,5120x48x1x1,weight:blk.37.ssm_beta.weight,n2184,f16 5120x48 GEMV feeding sigmoid (mixing path)
+585,f32,128x1x1x1,weight:blk.37.ssm_norm.weight,n2195,f32[128] MUL after the per-head RMS_NORM of the GDN output
+586,q4_0,5120x6144x1x1,weight:blk.37.attn_gate.weight,n2196,unique q4_0 5120x6144 in block (z-gate GEMV)
+587,q4_0_ar16,6144x5120x1x1,weight:blk.37.ssm_out.weight,n2201,unique Q4_0_AR16 6144x5120 in block
+588,f32,5120x1x1x1,weight:blk.37.post_attention_norm.weight,n2205,f32[5120] MUL paired with pre-FFN RMS_NORM
+589,q4_0,5120x17408x1x1,weight:blk.37.ffn_gate.weight,n2206,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+590,q4_0,5120x17408x1x1,weight:blk.37.ffn_up.weight,n2207,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+591,q4_0,17408x5120x1x1,weight:blk.37.ffn_down.weight,n2209,unique q4_0 17408x5120 in block
+592,f32,5120x1x1x1,weight:blk.38.attn_norm.weight,n2212,f32[5120] MUL paired with pre-mixer RMS_NORM
+593,f32,30720x1x1x1,state:conv_state(blk.38),n2213,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+594,q4_0,5120x10240x1x1,weight:blk.38.attn_qkv.weight,n2221,unique q4_0 5120x10240 in block
+595,f32,786432x1x1x1,state:ssm_state(blk.38),n2228,f32[786432]=128x128x48 GDN recurrent state
+596,f32,4x10240x1x1,weight:blk.38.ssm_conv1d.weight,n2235,f32 4x10240 SSM_CONV kernel
+597,f16,5120x48x1x1,weight:blk.38.ssm_alpha.weight,n2242,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+598,f32,48x1x1x1,weight:blk.38.ssm_dt.bias,n2244,f32[48] ADD operand on the alpha path
+599,f32,48x1x1x1,weight:blk.38.ssm_a,n2246,f32[48] MUL operand after softplus (-exp(A_log) factor)
+600,f16,5120x48x1x1,weight:blk.38.ssm_beta.weight,n2248,f16 5120x48 GEMV feeding sigmoid (mixing path)
+601,f32,128x1x1x1,weight:blk.38.ssm_norm.weight,n2259,f32[128] MUL after the per-head RMS_NORM of the GDN output
+602,q4_0,5120x6144x1x1,weight:blk.38.attn_gate.weight,n2260,unique q4_0 5120x6144 in block (z-gate GEMV)
+603,q4_0_ar16,6144x5120x1x1,weight:blk.38.ssm_out.weight,n2265,unique Q4_0_AR16 6144x5120 in block
+604,f32,5120x1x1x1,weight:blk.38.post_attention_norm.weight,n2269,f32[5120] MUL paired with pre-FFN RMS_NORM
+605,q4_0,5120x17408x1x1,weight:blk.38.ffn_gate.weight,n2270,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+606,q4_0,5120x17408x1x1,weight:blk.38.ffn_up.weight,n2271,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+607,q4_0,17408x5120x1x1,weight:blk.38.ffn_down.weight,n2273,unique q4_0 17408x5120 in block
+608,f32,5120x1x1x1,weight:blk.39.attn_norm.weight,n2276,f32[5120] MUL paired with pre-mixer RMS_NORM
+609,q4_0,5120x12288x1x1,weight:blk.39.attn_q.weight,n2277,unique q4_0 5120x12288 in block (q+gate interleaved)
+610,f32,256x1x1x1,weight:blk.39.attn_q_norm.weight,n2280,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+611,q4_0,5120x1024x1x1,weight:blk.39.attn_v.weight,n2282,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+612,q4_0,5120x1024x1x1,weight:blk.39.attn_k.weight,n2284,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+613,f32,256x1x1x1,weight:blk.39.attn_k_norm.weight,n2287,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+614,f16,1024x262144x1x1,cache_k(blk.39),n2290,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+615,f16,1024x262144x1x1,cache_v(blk.39),n2292,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+616,q4_0,6144x5120x1x1,weight:blk.39.attn_output.weight,n2305,unique q4_0 6144x5120 in block
+617,f32,5120x1x1x1,weight:blk.39.post_attention_norm.weight,n2308,f32[5120] MUL paired with pre-FFN RMS_NORM
+618,q4_0,5120x17408x1x1,weight:blk.39.ffn_gate.weight,n2309,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+619,q4_0,5120x17408x1x1,weight:blk.39.ffn_up.weight,n2310,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+620,q4_0,17408x5120x1x1,weight:blk.39.ffn_down.weight,n2312,unique q4_0 17408x5120 in block
+621,f32,5120x1x1x1,weight:blk.40.attn_norm.weight,n2315,f32[5120] MUL paired with pre-mixer RMS_NORM
+622,f32,30720x1x1x1,state:conv_state(blk.40),n2316,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+623,q4_0,5120x10240x1x1,weight:blk.40.attn_qkv.weight,n2324,unique q4_0 5120x10240 in block
+624,f32,786432x1x1x1,state:ssm_state(blk.40),n2331,f32[786432]=128x128x48 GDN recurrent state
+625,f32,4x10240x1x1,weight:blk.40.ssm_conv1d.weight,n2338,f32 4x10240 SSM_CONV kernel
+626,f16,5120x48x1x1,weight:blk.40.ssm_alpha.weight,n2345,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+627,f32,48x1x1x1,weight:blk.40.ssm_dt.bias,n2347,f32[48] ADD operand on the alpha path
+628,f32,48x1x1x1,weight:blk.40.ssm_a,n2349,f32[48] MUL operand after softplus (-exp(A_log) factor)
+629,f16,5120x48x1x1,weight:blk.40.ssm_beta.weight,n2351,f16 5120x48 GEMV feeding sigmoid (mixing path)
+630,f32,128x1x1x1,weight:blk.40.ssm_norm.weight,n2362,f32[128] MUL after the per-head RMS_NORM of the GDN output
+631,q4_0,5120x6144x1x1,weight:blk.40.attn_gate.weight,n2363,unique q4_0 5120x6144 in block (z-gate GEMV)
+632,q4_0_ar16,6144x5120x1x1,weight:blk.40.ssm_out.weight,n2368,unique Q4_0_AR16 6144x5120 in block
+633,f32,5120x1x1x1,weight:blk.40.post_attention_norm.weight,n2372,f32[5120] MUL paired with pre-FFN RMS_NORM
+634,q4_0,5120x17408x1x1,weight:blk.40.ffn_gate.weight,n2373,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+635,q4_0,5120x17408x1x1,weight:blk.40.ffn_up.weight,n2374,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+636,q4_0,17408x5120x1x1,weight:blk.40.ffn_down.weight,n2376,unique q4_0 17408x5120 in block
+637,f32,5120x1x1x1,weight:blk.41.attn_norm.weight,n2379,f32[5120] MUL paired with pre-mixer RMS_NORM
+638,f32,30720x1x1x1,state:conv_state(blk.41),n2380,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+639,q4_0,5120x10240x1x1,weight:blk.41.attn_qkv.weight,n2388,unique q4_0 5120x10240 in block
+640,f32,786432x1x1x1,state:ssm_state(blk.41),n2395,f32[786432]=128x128x48 GDN recurrent state
+641,f32,4x10240x1x1,weight:blk.41.ssm_conv1d.weight,n2402,f32 4x10240 SSM_CONV kernel
+642,f16,5120x48x1x1,weight:blk.41.ssm_alpha.weight,n2409,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+643,f32,48x1x1x1,weight:blk.41.ssm_dt.bias,n2411,f32[48] ADD operand on the alpha path
+644,f32,48x1x1x1,weight:blk.41.ssm_a,n2413,f32[48] MUL operand after softplus (-exp(A_log) factor)
+645,f16,5120x48x1x1,weight:blk.41.ssm_beta.weight,n2415,f16 5120x48 GEMV feeding sigmoid (mixing path)
+646,f32,128x1x1x1,weight:blk.41.ssm_norm.weight,n2426,f32[128] MUL after the per-head RMS_NORM of the GDN output
+647,q4_0,5120x6144x1x1,weight:blk.41.attn_gate.weight,n2427,unique q4_0 5120x6144 in block (z-gate GEMV)
+648,q4_0_ar16,6144x5120x1x1,weight:blk.41.ssm_out.weight,n2432,unique Q4_0_AR16 6144x5120 in block
+649,f32,5120x1x1x1,weight:blk.41.post_attention_norm.weight,n2436,f32[5120] MUL paired with pre-FFN RMS_NORM
+650,q4_0,5120x17408x1x1,weight:blk.41.ffn_gate.weight,n2437,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+651,q4_0,5120x17408x1x1,weight:blk.41.ffn_up.weight,n2438,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+652,q4_0,17408x5120x1x1,weight:blk.41.ffn_down.weight,n2440,unique q4_0 17408x5120 in block
+653,f32,5120x1x1x1,weight:blk.42.attn_norm.weight,n2443,f32[5120] MUL paired with pre-mixer RMS_NORM
+654,f32,30720x1x1x1,state:conv_state(blk.42),n2444,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+655,q4_0,5120x10240x1x1,weight:blk.42.attn_qkv.weight,n2452,unique q4_0 5120x10240 in block
+656,f32,786432x1x1x1,state:ssm_state(blk.42),n2459,f32[786432]=128x128x48 GDN recurrent state
+657,f32,4x10240x1x1,weight:blk.42.ssm_conv1d.weight,n2466,f32 4x10240 SSM_CONV kernel
+658,f16,5120x48x1x1,weight:blk.42.ssm_alpha.weight,n2473,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+659,f32,48x1x1x1,weight:blk.42.ssm_dt.bias,n2475,f32[48] ADD operand on the alpha path
+660,f32,48x1x1x1,weight:blk.42.ssm_a,n2477,f32[48] MUL operand after softplus (-exp(A_log) factor)
+661,f16,5120x48x1x1,weight:blk.42.ssm_beta.weight,n2479,f16 5120x48 GEMV feeding sigmoid (mixing path)
+662,f32,128x1x1x1,weight:blk.42.ssm_norm.weight,n2490,f32[128] MUL after the per-head RMS_NORM of the GDN output
+663,q4_0,5120x6144x1x1,weight:blk.42.attn_gate.weight,n2491,unique q4_0 5120x6144 in block (z-gate GEMV)
+664,q4_0_ar16,6144x5120x1x1,weight:blk.42.ssm_out.weight,n2496,unique Q4_0_AR16 6144x5120 in block
+665,f32,5120x1x1x1,weight:blk.42.post_attention_norm.weight,n2500,f32[5120] MUL paired with pre-FFN RMS_NORM
+666,q4_0,5120x17408x1x1,weight:blk.42.ffn_gate.weight,n2501,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+667,q4_0,5120x17408x1x1,weight:blk.42.ffn_up.weight,n2502,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+668,q4_0,17408x5120x1x1,weight:blk.42.ffn_down.weight,n2504,unique q4_0 17408x5120 in block
+669,f32,5120x1x1x1,weight:blk.43.attn_norm.weight,n2507,f32[5120] MUL paired with pre-mixer RMS_NORM
+670,q4_0,5120x12288x1x1,weight:blk.43.attn_q.weight,n2508,unique q4_0 5120x12288 in block (q+gate interleaved)
+671,f32,256x1x1x1,weight:blk.43.attn_q_norm.weight,n2511,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+672,q4_0,5120x1024x1x1,weight:blk.43.attn_v.weight,n2513,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+673,q4_0,5120x1024x1x1,weight:blk.43.attn_k.weight,n2515,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+674,f32,256x1x1x1,weight:blk.43.attn_k_norm.weight,n2518,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+675,f16,1024x262144x1x1,cache_k(blk.43),n2521,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+676,f16,1024x262144x1x1,cache_v(blk.43),n2523,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+677,q4_0,6144x5120x1x1,weight:blk.43.attn_output.weight,n2536,unique q4_0 6144x5120 in block
+678,f32,5120x1x1x1,weight:blk.43.post_attention_norm.weight,n2539,f32[5120] MUL paired with pre-FFN RMS_NORM
+679,q4_0,5120x17408x1x1,weight:blk.43.ffn_gate.weight,n2540,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+680,q4_0,5120x17408x1x1,weight:blk.43.ffn_up.weight,n2541,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+681,q4_0,17408x5120x1x1,weight:blk.43.ffn_down.weight,n2543,unique q4_0 17408x5120 in block
+682,f32,5120x1x1x1,weight:blk.44.attn_norm.weight,n2546,f32[5120] MUL paired with pre-mixer RMS_NORM
+683,f32,30720x1x1x1,state:conv_state(blk.44),n2547,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+684,q4_0,5120x10240x1x1,weight:blk.44.attn_qkv.weight,n2555,unique q4_0 5120x10240 in block
+685,f32,786432x1x1x1,state:ssm_state(blk.44),n2562,f32[786432]=128x128x48 GDN recurrent state
+686,f32,4x10240x1x1,weight:blk.44.ssm_conv1d.weight,n2569,f32 4x10240 SSM_CONV kernel
+687,f16,5120x48x1x1,weight:blk.44.ssm_alpha.weight,n2576,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+688,f32,48x1x1x1,weight:blk.44.ssm_dt.bias,n2578,f32[48] ADD operand on the alpha path
+689,f32,48x1x1x1,weight:blk.44.ssm_a,n2580,f32[48] MUL operand after softplus (-exp(A_log) factor)
+690,f16,5120x48x1x1,weight:blk.44.ssm_beta.weight,n2582,f16 5120x48 GEMV feeding sigmoid (mixing path)
+691,f32,128x1x1x1,weight:blk.44.ssm_norm.weight,n2593,f32[128] MUL after the per-head RMS_NORM of the GDN output
+692,q4_0,5120x6144x1x1,weight:blk.44.attn_gate.weight,n2594,unique q4_0 5120x6144 in block (z-gate GEMV)
+693,q4_0_ar16,6144x5120x1x1,weight:blk.44.ssm_out.weight,n2599,unique Q4_0_AR16 6144x5120 in block
+694,f32,5120x1x1x1,weight:blk.44.post_attention_norm.weight,n2603,f32[5120] MUL paired with pre-FFN RMS_NORM
+695,q4_0,5120x17408x1x1,weight:blk.44.ffn_gate.weight,n2604,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+696,q4_0,5120x17408x1x1,weight:blk.44.ffn_up.weight,n2605,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+697,q4_0,17408x5120x1x1,weight:blk.44.ffn_down.weight,n2607,unique q4_0 17408x5120 in block
+698,f32,5120x1x1x1,weight:blk.45.attn_norm.weight,n2610,f32[5120] MUL paired with pre-mixer RMS_NORM
+699,f32,30720x1x1x1,state:conv_state(blk.45),n2611,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+700,q4_0,5120x10240x1x1,weight:blk.45.attn_qkv.weight,n2619,unique q4_0 5120x10240 in block
+701,f32,786432x1x1x1,state:ssm_state(blk.45),n2626,f32[786432]=128x128x48 GDN recurrent state
+702,f32,4x10240x1x1,weight:blk.45.ssm_conv1d.weight,n2633,f32 4x10240 SSM_CONV kernel
+703,f16,5120x48x1x1,weight:blk.45.ssm_alpha.weight,n2640,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+704,f32,48x1x1x1,weight:blk.45.ssm_dt.bias,n2642,f32[48] ADD operand on the alpha path
+705,f32,48x1x1x1,weight:blk.45.ssm_a,n2644,f32[48] MUL operand after softplus (-exp(A_log) factor)
+706,f16,5120x48x1x1,weight:blk.45.ssm_beta.weight,n2646,f16 5120x48 GEMV feeding sigmoid (mixing path)
+707,f32,128x1x1x1,weight:blk.45.ssm_norm.weight,n2657,f32[128] MUL after the per-head RMS_NORM of the GDN output
+708,q4_0,5120x6144x1x1,weight:blk.45.attn_gate.weight,n2658,unique q4_0 5120x6144 in block (z-gate GEMV)
+709,q4_0_ar16,6144x5120x1x1,weight:blk.45.ssm_out.weight,n2663,unique Q4_0_AR16 6144x5120 in block
+710,f32,5120x1x1x1,weight:blk.45.post_attention_norm.weight,n2667,f32[5120] MUL paired with pre-FFN RMS_NORM
+711,q4_0,5120x17408x1x1,weight:blk.45.ffn_gate.weight,n2668,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+712,q4_0,5120x17408x1x1,weight:blk.45.ffn_up.weight,n2669,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+713,q4_0,17408x5120x1x1,weight:blk.45.ffn_down.weight,n2671,unique q4_0 17408x5120 in block
+714,f32,5120x1x1x1,weight:blk.46.attn_norm.weight,n2674,f32[5120] MUL paired with pre-mixer RMS_NORM
+715,f32,30720x1x1x1,state:conv_state(blk.46),n2675,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+716,q4_0,5120x10240x1x1,weight:blk.46.attn_qkv.weight,n2683,unique q4_0 5120x10240 in block
+717,f32,786432x1x1x1,state:ssm_state(blk.46),n2690,f32[786432]=128x128x48 GDN recurrent state
+718,f32,4x10240x1x1,weight:blk.46.ssm_conv1d.weight,n2697,f32 4x10240 SSM_CONV kernel
+719,f16,5120x48x1x1,weight:blk.46.ssm_alpha.weight,n2704,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+720,f32,48x1x1x1,weight:blk.46.ssm_dt.bias,n2706,f32[48] ADD operand on the alpha path
+721,f32,48x1x1x1,weight:blk.46.ssm_a,n2708,f32[48] MUL operand after softplus (-exp(A_log) factor)
+722,f16,5120x48x1x1,weight:blk.46.ssm_beta.weight,n2710,f16 5120x48 GEMV feeding sigmoid (mixing path)
+723,f32,128x1x1x1,weight:blk.46.ssm_norm.weight,n2721,f32[128] MUL after the per-head RMS_NORM of the GDN output
+724,q4_0,5120x6144x1x1,weight:blk.46.attn_gate.weight,n2722,unique q4_0 5120x6144 in block (z-gate GEMV)
+725,q4_0_ar16,6144x5120x1x1,weight:blk.46.ssm_out.weight,n2727,unique Q4_0_AR16 6144x5120 in block
+726,f32,5120x1x1x1,weight:blk.46.post_attention_norm.weight,n2731,f32[5120] MUL paired with pre-FFN RMS_NORM
+727,q4_0,5120x17408x1x1,weight:blk.46.ffn_gate.weight,n2732,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+728,q4_0,5120x17408x1x1,weight:blk.46.ffn_up.weight,n2733,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+729,q4_0,17408x5120x1x1,weight:blk.46.ffn_down.weight,n2735,unique q4_0 17408x5120 in block
+730,f32,5120x1x1x1,weight:blk.47.attn_norm.weight,n2738,f32[5120] MUL paired with pre-mixer RMS_NORM
+731,q4_0,5120x12288x1x1,weight:blk.47.attn_q.weight,n2739,unique q4_0 5120x12288 in block (q+gate interleaved)
+732,f32,256x1x1x1,weight:blk.47.attn_q_norm.weight,n2742,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+733,q4_0,5120x1024x1x1,weight:blk.47.attn_v.weight,n2744,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+734,q4_0,5120x1024x1x1,weight:blk.47.attn_k.weight,n2746,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+735,f32,256x1x1x1,weight:blk.47.attn_k_norm.weight,n2749,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+736,f16,1024x262144x1x1,cache_k(blk.47),n2752,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+737,f16,1024x262144x1x1,cache_v(blk.47),n2754,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+738,q4_0,6144x5120x1x1,weight:blk.47.attn_output.weight,n2767,unique q4_0 6144x5120 in block
+739,f32,5120x1x1x1,weight:blk.47.post_attention_norm.weight,n2770,f32[5120] MUL paired with pre-FFN RMS_NORM
+740,q4_0,5120x17408x1x1,weight:blk.47.ffn_gate.weight,n2771,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+741,q4_0,5120x17408x1x1,weight:blk.47.ffn_up.weight,n2772,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+742,q4_0,17408x5120x1x1,weight:blk.47.ffn_down.weight,n2774,unique q4_0 17408x5120 in block
+743,f32,5120x1x1x1,weight:blk.48.attn_norm.weight,n2777,f32[5120] MUL paired with pre-mixer RMS_NORM
+744,f32,30720x1x1x1,state:conv_state(blk.48),n2778,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+745,q4_0,5120x10240x1x1,weight:blk.48.attn_qkv.weight,n2786,unique q4_0 5120x10240 in block
+746,f32,786432x1x1x1,state:ssm_state(blk.48),n2793,f32[786432]=128x128x48 GDN recurrent state
+747,f32,4x10240x1x1,weight:blk.48.ssm_conv1d.weight,n2800,f32 4x10240 SSM_CONV kernel
+748,f16,5120x48x1x1,weight:blk.48.ssm_alpha.weight,n2807,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+749,f32,48x1x1x1,weight:blk.48.ssm_dt.bias,n2809,f32[48] ADD operand on the alpha path
+750,f32,48x1x1x1,weight:blk.48.ssm_a,n2811,f32[48] MUL operand after softplus (-exp(A_log) factor)
+751,f16,5120x48x1x1,weight:blk.48.ssm_beta.weight,n2813,f16 5120x48 GEMV feeding sigmoid (mixing path)
+752,f32,128x1x1x1,weight:blk.48.ssm_norm.weight,n2824,f32[128] MUL after the per-head RMS_NORM of the GDN output
+753,q4_0,5120x6144x1x1,weight:blk.48.attn_gate.weight,n2825,unique q4_0 5120x6144 in block (z-gate GEMV)
+754,q4_0_ar16,6144x5120x1x1,weight:blk.48.ssm_out.weight,n2830,unique Q4_0_AR16 6144x5120 in block
+755,f32,5120x1x1x1,weight:blk.48.post_attention_norm.weight,n2834,f32[5120] MUL paired with pre-FFN RMS_NORM
+756,q4_0,5120x17408x1x1,weight:blk.48.ffn_gate.weight,n2835,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+757,q4_0,5120x17408x1x1,weight:blk.48.ffn_up.weight,n2836,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+758,q4_0,17408x5120x1x1,weight:blk.48.ffn_down.weight,n2838,unique q4_0 17408x5120 in block
+759,f32,5120x1x1x1,weight:blk.49.attn_norm.weight,n2841,f32[5120] MUL paired with pre-mixer RMS_NORM
+760,f32,30720x1x1x1,state:conv_state(blk.49),n2842,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+761,q4_0,5120x10240x1x1,weight:blk.49.attn_qkv.weight,n2850,unique q4_0 5120x10240 in block
+762,f32,786432x1x1x1,state:ssm_state(blk.49),n2857,f32[786432]=128x128x48 GDN recurrent state
+763,f32,4x10240x1x1,weight:blk.49.ssm_conv1d.weight,n2864,f32 4x10240 SSM_CONV kernel
+764,f16,5120x48x1x1,weight:blk.49.ssm_alpha.weight,n2871,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+765,f32,48x1x1x1,weight:blk.49.ssm_dt.bias,n2873,f32[48] ADD operand on the alpha path
+766,f32,48x1x1x1,weight:blk.49.ssm_a,n2875,f32[48] MUL operand after softplus (-exp(A_log) factor)
+767,f16,5120x48x1x1,weight:blk.49.ssm_beta.weight,n2877,f16 5120x48 GEMV feeding sigmoid (mixing path)
+768,f32,128x1x1x1,weight:blk.49.ssm_norm.weight,n2888,f32[128] MUL after the per-head RMS_NORM of the GDN output
+769,q4_0,5120x6144x1x1,weight:blk.49.attn_gate.weight,n2889,unique q4_0 5120x6144 in block (z-gate GEMV)
+770,q4_0_ar16,6144x5120x1x1,weight:blk.49.ssm_out.weight,n2894,unique Q4_0_AR16 6144x5120 in block
+771,f32,5120x1x1x1,weight:blk.49.post_attention_norm.weight,n2898,f32[5120] MUL paired with pre-FFN RMS_NORM
+772,q4_0,5120x17408x1x1,weight:blk.49.ffn_gate.weight,n2899,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+773,q4_0,5120x17408x1x1,weight:blk.49.ffn_up.weight,n2900,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+774,q4_0,17408x5120x1x1,weight:blk.49.ffn_down.weight,n2902,unique q4_0 17408x5120 in block
+775,f32,5120x1x1x1,weight:blk.50.attn_norm.weight,n2905,f32[5120] MUL paired with pre-mixer RMS_NORM
+776,f32,30720x1x1x1,state:conv_state(blk.50),n2906,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+777,q4_0,5120x10240x1x1,weight:blk.50.attn_qkv.weight,n2914,unique q4_0 5120x10240 in block
+778,f32,786432x1x1x1,state:ssm_state(blk.50),n2921,f32[786432]=128x128x48 GDN recurrent state
+779,f32,4x10240x1x1,weight:blk.50.ssm_conv1d.weight,n2928,f32 4x10240 SSM_CONV kernel
+780,f16,5120x48x1x1,weight:blk.50.ssm_alpha.weight,n2935,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+781,f32,48x1x1x1,weight:blk.50.ssm_dt.bias,n2937,f32[48] ADD operand on the alpha path
+782,f32,48x1x1x1,weight:blk.50.ssm_a,n2939,f32[48] MUL operand after softplus (-exp(A_log) factor)
+783,f16,5120x48x1x1,weight:blk.50.ssm_beta.weight,n2941,f16 5120x48 GEMV feeding sigmoid (mixing path)
+784,f32,128x1x1x1,weight:blk.50.ssm_norm.weight,n2952,f32[128] MUL after the per-head RMS_NORM of the GDN output
+785,q4_0,5120x6144x1x1,weight:blk.50.attn_gate.weight,n2953,unique q4_0 5120x6144 in block (z-gate GEMV)
+786,q4_0_ar16,6144x5120x1x1,weight:blk.50.ssm_out.weight,n2958,unique Q4_0_AR16 6144x5120 in block
+787,f32,5120x1x1x1,weight:blk.50.post_attention_norm.weight,n2962,f32[5120] MUL paired with pre-FFN RMS_NORM
+788,q4_0,5120x17408x1x1,weight:blk.50.ffn_gate.weight,n2963,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+789,q4_0,5120x17408x1x1,weight:blk.50.ffn_up.weight,n2964,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+790,q4_0,17408x5120x1x1,weight:blk.50.ffn_down.weight,n2966,unique q4_0 17408x5120 in block
+791,f32,5120x1x1x1,weight:blk.51.attn_norm.weight,n2969,f32[5120] MUL paired with pre-mixer RMS_NORM
+792,q4_0,5120x12288x1x1,weight:blk.51.attn_q.weight,n2970,unique q4_0 5120x12288 in block (q+gate interleaved)
+793,f32,256x1x1x1,weight:blk.51.attn_q_norm.weight,n2973,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+794,q4_0,5120x1024x1x1,weight:blk.51.attn_v.weight,n2975,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+795,q4_0,5120x1024x1x1,weight:blk.51.attn_k.weight,n2977,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+796,f32,256x1x1x1,weight:blk.51.attn_k_norm.weight,n2980,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+797,f16,1024x262144x1x1,cache_k(blk.51),n2983,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+798,f16,1024x262144x1x1,cache_v(blk.51),n2985,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+799,q4_0,6144x5120x1x1,weight:blk.51.attn_output.weight,n2998,unique q4_0 6144x5120 in block
+800,f32,5120x1x1x1,weight:blk.51.post_attention_norm.weight,n3001,f32[5120] MUL paired with pre-FFN RMS_NORM
+801,q4_0,5120x17408x1x1,weight:blk.51.ffn_gate.weight,n3002,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+802,q4_0,5120x17408x1x1,weight:blk.51.ffn_up.weight,n3003,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+803,q4_0,17408x5120x1x1,weight:blk.51.ffn_down.weight,n3005,unique q4_0 17408x5120 in block
+804,f32,5120x1x1x1,weight:blk.52.attn_norm.weight,n3008,f32[5120] MUL paired with pre-mixer RMS_NORM
+805,f32,30720x1x1x1,state:conv_state(blk.52),n3009,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+806,q4_0,5120x10240x1x1,weight:blk.52.attn_qkv.weight,n3017,unique q4_0 5120x10240 in block
+807,f32,786432x1x1x1,state:ssm_state(blk.52),n3024,f32[786432]=128x128x48 GDN recurrent state
+808,f32,4x10240x1x1,weight:blk.52.ssm_conv1d.weight,n3031,f32 4x10240 SSM_CONV kernel
+809,f16,5120x48x1x1,weight:blk.52.ssm_alpha.weight,n3038,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+810,f32,48x1x1x1,weight:blk.52.ssm_dt.bias,n3040,f32[48] ADD operand on the alpha path
+811,f32,48x1x1x1,weight:blk.52.ssm_a,n3042,f32[48] MUL operand after softplus (-exp(A_log) factor)
+812,f16,5120x48x1x1,weight:blk.52.ssm_beta.weight,n3044,f16 5120x48 GEMV feeding sigmoid (mixing path)
+813,f32,128x1x1x1,weight:blk.52.ssm_norm.weight,n3055,f32[128] MUL after the per-head RMS_NORM of the GDN output
+814,q4_0,5120x6144x1x1,weight:blk.52.attn_gate.weight,n3056,unique q4_0 5120x6144 in block (z-gate GEMV)
+815,q4_0_ar16,6144x5120x1x1,weight:blk.52.ssm_out.weight,n3061,unique Q4_0_AR16 6144x5120 in block
+816,f32,5120x1x1x1,weight:blk.52.post_attention_norm.weight,n3065,f32[5120] MUL paired with pre-FFN RMS_NORM
+817,q4_0,5120x17408x1x1,weight:blk.52.ffn_gate.weight,n3066,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+818,q4_0,5120x17408x1x1,weight:blk.52.ffn_up.weight,n3067,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+819,q4_0,17408x5120x1x1,weight:blk.52.ffn_down.weight,n3069,unique q4_0 17408x5120 in block
+820,f32,5120x1x1x1,weight:blk.53.attn_norm.weight,n3072,f32[5120] MUL paired with pre-mixer RMS_NORM
+821,f32,30720x1x1x1,state:conv_state(blk.53),n3073,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+822,q4_0,5120x10240x1x1,weight:blk.53.attn_qkv.weight,n3081,unique q4_0 5120x10240 in block
+823,f32,786432x1x1x1,state:ssm_state(blk.53),n3088,f32[786432]=128x128x48 GDN recurrent state
+824,f32,4x10240x1x1,weight:blk.53.ssm_conv1d.weight,n3095,f32 4x10240 SSM_CONV kernel
+825,f16,5120x48x1x1,weight:blk.53.ssm_alpha.weight,n3102,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+826,f32,48x1x1x1,weight:blk.53.ssm_dt.bias,n3104,f32[48] ADD operand on the alpha path
+827,f32,48x1x1x1,weight:blk.53.ssm_a,n3106,f32[48] MUL operand after softplus (-exp(A_log) factor)
+828,f16,5120x48x1x1,weight:blk.53.ssm_beta.weight,n3108,f16 5120x48 GEMV feeding sigmoid (mixing path)
+829,f32,128x1x1x1,weight:blk.53.ssm_norm.weight,n3119,f32[128] MUL after the per-head RMS_NORM of the GDN output
+830,q4_0,5120x6144x1x1,weight:blk.53.attn_gate.weight,n3120,unique q4_0 5120x6144 in block (z-gate GEMV)
+831,q4_0_ar16,6144x5120x1x1,weight:blk.53.ssm_out.weight,n3125,unique Q4_0_AR16 6144x5120 in block
+832,f32,5120x1x1x1,weight:blk.53.post_attention_norm.weight,n3129,f32[5120] MUL paired with pre-FFN RMS_NORM
+833,q4_0,5120x17408x1x1,weight:blk.53.ffn_gate.weight,n3130,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+834,q4_0,5120x17408x1x1,weight:blk.53.ffn_up.weight,n3131,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+835,q4_0,17408x5120x1x1,weight:blk.53.ffn_down.weight,n3133,unique q4_0 17408x5120 in block
+836,f32,5120x1x1x1,weight:blk.54.attn_norm.weight,n3136,f32[5120] MUL paired with pre-mixer RMS_NORM
+837,f32,30720x1x1x1,state:conv_state(blk.54),n3137,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+838,q4_0,5120x10240x1x1,weight:blk.54.attn_qkv.weight,n3145,unique q4_0 5120x10240 in block
+839,f32,786432x1x1x1,state:ssm_state(blk.54),n3152,f32[786432]=128x128x48 GDN recurrent state
+840,f32,4x10240x1x1,weight:blk.54.ssm_conv1d.weight,n3159,f32 4x10240 SSM_CONV kernel
+841,f16,5120x48x1x1,weight:blk.54.ssm_alpha.weight,n3166,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+842,f32,48x1x1x1,weight:blk.54.ssm_dt.bias,n3168,f32[48] ADD operand on the alpha path
+843,f32,48x1x1x1,weight:blk.54.ssm_a,n3170,f32[48] MUL operand after softplus (-exp(A_log) factor)
+844,f16,5120x48x1x1,weight:blk.54.ssm_beta.weight,n3172,f16 5120x48 GEMV feeding sigmoid (mixing path)
+845,f32,128x1x1x1,weight:blk.54.ssm_norm.weight,n3183,f32[128] MUL after the per-head RMS_NORM of the GDN output
+846,q4_0,5120x6144x1x1,weight:blk.54.attn_gate.weight,n3184,unique q4_0 5120x6144 in block (z-gate GEMV)
+847,q4_0_ar16,6144x5120x1x1,weight:blk.54.ssm_out.weight,n3189,unique Q4_0_AR16 6144x5120 in block
+848,f32,5120x1x1x1,weight:blk.54.post_attention_norm.weight,n3193,f32[5120] MUL paired with pre-FFN RMS_NORM
+849,q4_0,5120x17408x1x1,weight:blk.54.ffn_gate.weight,n3194,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+850,q4_0,5120x17408x1x1,weight:blk.54.ffn_up.weight,n3195,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+851,q4_0,17408x5120x1x1,weight:blk.54.ffn_down.weight,n3197,unique q4_0 17408x5120 in block
+852,f32,5120x1x1x1,weight:blk.55.attn_norm.weight,n3200,f32[5120] MUL paired with pre-mixer RMS_NORM
+853,q4_0,5120x12288x1x1,weight:blk.55.attn_q.weight,n3201,unique q4_0 5120x12288 in block (q+gate interleaved)
+854,f32,256x1x1x1,weight:blk.55.attn_q_norm.weight,n3204,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+855,q4_0,5120x1024x1x1,weight:blk.55.attn_v.weight,n3206,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+856,q4_0,5120x1024x1x1,weight:blk.55.attn_k.weight,n3208,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+857,f32,256x1x1x1,weight:blk.55.attn_k_norm.weight,n3211,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+858,f16,1024x262144x1x1,cache_k(blk.55),n3214,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+859,f16,1024x262144x1x1,cache_v(blk.55),n3216,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+860,q4_0,6144x5120x1x1,weight:blk.55.attn_output.weight,n3229,unique q4_0 6144x5120 in block
+861,f32,5120x1x1x1,weight:blk.55.post_attention_norm.weight,n3232,f32[5120] MUL paired with pre-FFN RMS_NORM
+862,q4_0,5120x17408x1x1,weight:blk.55.ffn_gate.weight,n3233,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+863,q4_0,5120x17408x1x1,weight:blk.55.ffn_up.weight,n3234,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+864,q4_0,17408x5120x1x1,weight:blk.55.ffn_down.weight,n3236,unique q4_0 17408x5120 in block
+865,f32,5120x1x1x1,weight:blk.56.attn_norm.weight,n3239,f32[5120] MUL paired with pre-mixer RMS_NORM
+866,f32,30720x1x1x1,state:conv_state(blk.56),n3240,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+867,q4_0,5120x10240x1x1,weight:blk.56.attn_qkv.weight,n3248,unique q4_0 5120x10240 in block
+868,f32,786432x1x1x1,state:ssm_state(blk.56),n3255,f32[786432]=128x128x48 GDN recurrent state
+869,f32,4x10240x1x1,weight:blk.56.ssm_conv1d.weight,n3262,f32 4x10240 SSM_CONV kernel
+870,f16,5120x48x1x1,weight:blk.56.ssm_alpha.weight,n3269,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+871,f32,48x1x1x1,weight:blk.56.ssm_dt.bias,n3271,f32[48] ADD operand on the alpha path
+872,f32,48x1x1x1,weight:blk.56.ssm_a,n3273,f32[48] MUL operand after softplus (-exp(A_log) factor)
+873,f16,5120x48x1x1,weight:blk.56.ssm_beta.weight,n3275,f16 5120x48 GEMV feeding sigmoid (mixing path)
+874,f32,128x1x1x1,weight:blk.56.ssm_norm.weight,n3286,f32[128] MUL after the per-head RMS_NORM of the GDN output
+875,q4_0,5120x6144x1x1,weight:blk.56.attn_gate.weight,n3287,unique q4_0 5120x6144 in block (z-gate GEMV)
+876,q4_0_ar16,6144x5120x1x1,weight:blk.56.ssm_out.weight,n3292,unique Q4_0_AR16 6144x5120 in block
+877,f32,5120x1x1x1,weight:blk.56.post_attention_norm.weight,n3296,f32[5120] MUL paired with pre-FFN RMS_NORM
+878,q4_0,5120x17408x1x1,weight:blk.56.ffn_gate.weight,n3297,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+879,q4_0,5120x17408x1x1,weight:blk.56.ffn_up.weight,n3298,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+880,q4_0,17408x5120x1x1,weight:blk.56.ffn_down.weight,n3300,unique q4_0 17408x5120 in block
+881,f32,5120x1x1x1,weight:blk.57.attn_norm.weight,n3303,f32[5120] MUL paired with pre-mixer RMS_NORM
+882,f32,30720x1x1x1,state:conv_state(blk.57),n3304,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+883,q4_0,5120x10240x1x1,weight:blk.57.attn_qkv.weight,n3312,unique q4_0 5120x10240 in block
+884,f32,786432x1x1x1,state:ssm_state(blk.57),n3319,f32[786432]=128x128x48 GDN recurrent state
+885,f32,4x10240x1x1,weight:blk.57.ssm_conv1d.weight,n3326,f32 4x10240 SSM_CONV kernel
+886,f16,5120x48x1x1,weight:blk.57.ssm_alpha.weight,n3333,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+887,f32,48x1x1x1,weight:blk.57.ssm_dt.bias,n3335,f32[48] ADD operand on the alpha path
+888,f32,48x1x1x1,weight:blk.57.ssm_a,n3337,f32[48] MUL operand after softplus (-exp(A_log) factor)
+889,f16,5120x48x1x1,weight:blk.57.ssm_beta.weight,n3339,f16 5120x48 GEMV feeding sigmoid (mixing path)
+890,f32,128x1x1x1,weight:blk.57.ssm_norm.weight,n3350,f32[128] MUL after the per-head RMS_NORM of the GDN output
+891,q4_0,5120x6144x1x1,weight:blk.57.attn_gate.weight,n3351,unique q4_0 5120x6144 in block (z-gate GEMV)
+892,q4_0_ar16,6144x5120x1x1,weight:blk.57.ssm_out.weight,n3356,unique Q4_0_AR16 6144x5120 in block
+893,f32,5120x1x1x1,weight:blk.57.post_attention_norm.weight,n3360,f32[5120] MUL paired with pre-FFN RMS_NORM
+894,q4_0,5120x17408x1x1,weight:blk.57.ffn_gate.weight,n3361,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+895,q4_0,5120x17408x1x1,weight:blk.57.ffn_up.weight,n3362,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+896,q4_0,17408x5120x1x1,weight:blk.57.ffn_down.weight,n3364,unique q4_0 17408x5120 in block
+897,f32,5120x1x1x1,weight:blk.58.attn_norm.weight,n3367,f32[5120] MUL paired with pre-mixer RMS_NORM
+898,f32,30720x1x1x1,state:conv_state(blk.58),n3368,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+899,q4_0,5120x10240x1x1,weight:blk.58.attn_qkv.weight,n3376,unique q4_0 5120x10240 in block
+900,f32,786432x1x1x1,state:ssm_state(blk.58),n3383,f32[786432]=128x128x48 GDN recurrent state
+901,f32,4x10240x1x1,weight:blk.58.ssm_conv1d.weight,n3390,f32 4x10240 SSM_CONV kernel
+902,f16,5120x48x1x1,weight:blk.58.ssm_alpha.weight,n3397,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+903,f32,48x1x1x1,weight:blk.58.ssm_dt.bias,n3399,f32[48] ADD operand on the alpha path
+904,f32,48x1x1x1,weight:blk.58.ssm_a,n3401,f32[48] MUL operand after softplus (-exp(A_log) factor)
+905,f16,5120x48x1x1,weight:blk.58.ssm_beta.weight,n3403,f16 5120x48 GEMV feeding sigmoid (mixing path)
+906,f32,128x1x1x1,weight:blk.58.ssm_norm.weight,n3414,f32[128] MUL after the per-head RMS_NORM of the GDN output
+907,q4_0,5120x6144x1x1,weight:blk.58.attn_gate.weight,n3415,unique q4_0 5120x6144 in block (z-gate GEMV)
+908,q4_0_ar16,6144x5120x1x1,weight:blk.58.ssm_out.weight,n3420,unique Q4_0_AR16 6144x5120 in block
+909,f32,5120x1x1x1,weight:blk.58.post_attention_norm.weight,n3424,f32[5120] MUL paired with pre-FFN RMS_NORM
+910,q4_0,5120x17408x1x1,weight:blk.58.ffn_gate.weight,n3425,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+911,q4_0,5120x17408x1x1,weight:blk.58.ffn_up.weight,n3426,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+912,q4_0,17408x5120x1x1,weight:blk.58.ffn_down.weight,n3428,unique q4_0 17408x5120 in block
+913,f32,5120x1x1x1,weight:blk.59.attn_norm.weight,n3431,f32[5120] MUL paired with pre-mixer RMS_NORM
+914,q4_0,5120x12288x1x1,weight:blk.59.attn_q.weight,n3432,unique q4_0 5120x12288 in block (q+gate interleaved)
+915,f32,256x1x1x1,weight:blk.59.attn_q_norm.weight,n3435,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+916,q4_0,5120x1024x1x1,weight:blk.59.attn_v.weight,n3437,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+917,q4_0,5120x1024x1x1,weight:blk.59.attn_k.weight,n3439,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+918,f32,256x1x1x1,weight:blk.59.attn_k_norm.weight,n3442,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+919,f16,1024x262144x1x1,cache_k(blk.59),n3445,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+920,f16,1024x262144x1x1,cache_v(blk.59),n3447,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+921,q4_0,6144x5120x1x1,weight:blk.59.attn_output.weight,n3460,unique q4_0 6144x5120 in block
+922,f32,5120x1x1x1,weight:blk.59.post_attention_norm.weight,n3463,f32[5120] MUL paired with pre-FFN RMS_NORM
+923,q4_0,5120x17408x1x1,weight:blk.59.ffn_gate.weight,n3464,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+924,q4_0,5120x17408x1x1,weight:blk.59.ffn_up.weight,n3465,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+925,q4_0,17408x5120x1x1,weight:blk.59.ffn_down.weight,n3467,unique q4_0 17408x5120 in block
+926,f32,5120x1x1x1,weight:blk.60.attn_norm.weight,n3470,f32[5120] MUL paired with pre-mixer RMS_NORM
+927,f32,30720x1x1x1,state:conv_state(blk.60),n3471,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+928,q4_0,5120x10240x1x1,weight:blk.60.attn_qkv.weight,n3479,unique q4_0 5120x10240 in block
+929,f32,786432x1x1x1,state:ssm_state(blk.60),n3486,f32[786432]=128x128x48 GDN recurrent state
+930,f32,4x10240x1x1,weight:blk.60.ssm_conv1d.weight,n3493,f32 4x10240 SSM_CONV kernel
+931,f16,5120x48x1x1,weight:blk.60.ssm_alpha.weight,n3500,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+932,f32,48x1x1x1,weight:blk.60.ssm_dt.bias,n3502,f32[48] ADD operand on the alpha path
+933,f32,48x1x1x1,weight:blk.60.ssm_a,n3504,f32[48] MUL operand after softplus (-exp(A_log) factor)
+934,f16,5120x48x1x1,weight:blk.60.ssm_beta.weight,n3506,f16 5120x48 GEMV feeding sigmoid (mixing path)
+935,f32,128x1x1x1,weight:blk.60.ssm_norm.weight,n3517,f32[128] MUL after the per-head RMS_NORM of the GDN output
+936,q4_0,5120x6144x1x1,weight:blk.60.attn_gate.weight,n3518,unique q4_0 5120x6144 in block (z-gate GEMV)
+937,q4_0_ar16,6144x5120x1x1,weight:blk.60.ssm_out.weight,n3523,unique Q4_0_AR16 6144x5120 in block
+938,f32,5120x1x1x1,weight:blk.60.post_attention_norm.weight,n3527,f32[5120] MUL paired with pre-FFN RMS_NORM
+939,q4_0,5120x17408x1x1,weight:blk.60.ffn_gate.weight,n3528,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+940,q4_0,5120x17408x1x1,weight:blk.60.ffn_up.weight,n3529,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+941,q4_0,17408x5120x1x1,weight:blk.60.ffn_down.weight,n3531,unique q4_0 17408x5120 in block
+942,f32,5120x1x1x1,weight:blk.61.attn_norm.weight,n3534,f32[5120] MUL paired with pre-mixer RMS_NORM
+943,f32,30720x1x1x1,state:conv_state(blk.61),n3535,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+944,q4_0,5120x10240x1x1,weight:blk.61.attn_qkv.weight,n3543,unique q4_0 5120x10240 in block
+945,f32,786432x1x1x1,state:ssm_state(blk.61),n3550,f32[786432]=128x128x48 GDN recurrent state
+946,f32,4x10240x1x1,weight:blk.61.ssm_conv1d.weight,n3557,f32 4x10240 SSM_CONV kernel
+947,f16,5120x48x1x1,weight:blk.61.ssm_alpha.weight,n3564,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+948,f32,48x1x1x1,weight:blk.61.ssm_dt.bias,n3566,f32[48] ADD operand on the alpha path
+949,f32,48x1x1x1,weight:blk.61.ssm_a,n3568,f32[48] MUL operand after softplus (-exp(A_log) factor)
+950,f16,5120x48x1x1,weight:blk.61.ssm_beta.weight,n3570,f16 5120x48 GEMV feeding sigmoid (mixing path)
+951,f32,128x1x1x1,weight:blk.61.ssm_norm.weight,n3581,f32[128] MUL after the per-head RMS_NORM of the GDN output
+952,q4_0,5120x6144x1x1,weight:blk.61.attn_gate.weight,n3582,unique q4_0 5120x6144 in block (z-gate GEMV)
+953,q4_0_ar16,6144x5120x1x1,weight:blk.61.ssm_out.weight,n3587,unique Q4_0_AR16 6144x5120 in block
+954,f32,5120x1x1x1,weight:blk.61.post_attention_norm.weight,n3591,f32[5120] MUL paired with pre-FFN RMS_NORM
+955,q4_0,5120x17408x1x1,weight:blk.61.ffn_gate.weight,n3592,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+956,q4_0,5120x17408x1x1,weight:blk.61.ffn_up.weight,n3593,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+957,q4_0,17408x5120x1x1,weight:blk.61.ffn_down.weight,n3595,unique q4_0 17408x5120 in block
+958,f32,5120x1x1x1,weight:blk.62.attn_norm.weight,n3598,f32[5120] MUL paired with pre-mixer RMS_NORM
+959,f32,30720x1x1x1,state:conv_state(blk.62),n3599,f32[30720]=10240x3 rolling conv window (d_conv-1 tokens x conv channels)
+960,q4_0,5120x10240x1x1,weight:blk.62.attn_qkv.weight,n3607,unique q4_0 5120x10240 in block
+961,f32,786432x1x1x1,state:ssm_state(blk.62),n3614,f32[786432]=128x128x48 GDN recurrent state
+962,f32,4x10240x1x1,weight:blk.62.ssm_conv1d.weight,n3621,f32 4x10240 SSM_CONV kernel
+963,f16,5120x48x1x1,weight:blk.62.ssm_alpha.weight,n3628,f16 5120x48 GEMV feeding ADD(ssm_dt.bias)->softplus->MUL(ssm_a) (decay path)
+964,f32,48x1x1x1,weight:blk.62.ssm_dt.bias,n3630,f32[48] ADD operand on the alpha path
+965,f32,48x1x1x1,weight:blk.62.ssm_a,n3632,f32[48] MUL operand after softplus (-exp(A_log) factor)
+966,f16,5120x48x1x1,weight:blk.62.ssm_beta.weight,n3634,f16 5120x48 GEMV feeding sigmoid (mixing path)
+967,f32,128x1x1x1,weight:blk.62.ssm_norm.weight,n3645,f32[128] MUL after the per-head RMS_NORM of the GDN output
+968,q4_0,5120x6144x1x1,weight:blk.62.attn_gate.weight,n3646,unique q4_0 5120x6144 in block (z-gate GEMV)
+969,q4_0_ar16,6144x5120x1x1,weight:blk.62.ssm_out.weight,n3651,unique Q4_0_AR16 6144x5120 in block
+970,f32,5120x1x1x1,weight:blk.62.post_attention_norm.weight,n3655,f32[5120] MUL paired with pre-FFN RMS_NORM
+971,q4_0,5120x17408x1x1,weight:blk.62.ffn_gate.weight,n3656,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+972,q4_0,5120x17408x1x1,weight:blk.62.ffn_up.weight,n3657,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+973,q4_0,17408x5120x1x1,weight:blk.62.ffn_down.weight,n3659,unique q4_0 17408x5120 in block
+974,f32,5120x1x1x1,weight:blk.63.attn_norm.weight,n3662,f32[5120] MUL paired with pre-mixer RMS_NORM
+975,q4_0,5120x12288x1x1,weight:blk.63.attn_q.weight,n3663,unique q4_0 5120x12288 in block (q+gate interleaved)
+976,f32,256x1x1x1,weight:blk.63.attn_q_norm.weight,n3666,"f32[256] norm weight; MUL output has 24 heads (24=q, 4=k)"
+977,q4_0,5120x1024x1x1,weight:blk.63.attn_v.weight,n3668,q4_0 5120x1024 whose GEMV goes straight to the V-cache SET_ROWS
+978,q4_0,5120x1024x1x1,weight:blk.63.attn_k.weight,n3670,q4_0 5120x1024 whose GEMV feeds k_norm RMS_NORM + ROPE
+979,f32,256x1x1x1,weight:blk.63.attn_k_norm.weight,n3673,"f32[256] norm weight; MUL output has 4 heads (24=q, 4=k)"
+980,f16,1024x262144x1x1,cache_k(blk.63),n3676,"f16 1024x262144 KV line; SET_ROWS value comes from ROPE (K is roped, V is not)"
+981,f16,1024x262144x1x1,cache_v(blk.63),n3678,"f16 1024x262144 KV line; SET_ROWS value does not come from ROPE (K is roped, V is not)"
+982,q4_0,6144x5120x1x1,weight:blk.63.attn_output.weight,n3691,unique q4_0 6144x5120 in block
+983,f32,5120x1x1x1,weight:blk.63.post_attention_norm.weight,n3694,f32[5120] MUL paired with pre-FFN RMS_NORM
+984,q4_0,5120x17408x1x1,weight:blk.63.ffn_gate.weight,n3695,"q4_0 5120x17408; its GEMV is GLU src0 (src0=gate, src1=up)"
+985,q4_0,5120x17408x1x1,weight:blk.63.ffn_up.weight,n3696,"q4_0 5120x17408; its GEMV is GLU src1 (src0=gate, src1=up)"
+986,q4_0,17408x5120x1x1,weight:blk.63.ffn_down.weight,n3698,unique q4_0 17408x5120 in block
+987,i32,1x1x1x1,other:out_row_index,n3700,i32[1] logits row selector (epilogue GET_ROWS src1)
+988,f32,5120x1x1x1,weight:output_norm.weight,n3702,f32[5120] MUL in the final norm
+989,f16,5120x248320x1x1,weight:output.weight,n3703,f16 5120x248320 as MUL_MAT weight of the final logits GEMV
