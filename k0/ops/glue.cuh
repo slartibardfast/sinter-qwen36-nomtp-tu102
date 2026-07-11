@@ -22,12 +22,6 @@ __device__ __forceinline__ bool aligned16(const void *p) {
     return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
 }
 
-__device__ __forceinline__ float warp_sum(float v) {
-    for (int off = 16; off > 0; off >>= 1)
-        v += __shfl_xor_sync(0xffffffffu, v, off);
-    return v;
-}
-
 // ---------------------------------------------------------------------------
 // OP_RMSNORM: y = x * rsqrt(mean(x^2) + eps) * w, eps 1e-6, fused weight
 // multiply, matching the fork's rms_norm_f32 semantics (SEMANTICS.md #9:

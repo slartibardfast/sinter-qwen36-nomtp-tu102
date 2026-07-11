@@ -9,14 +9,10 @@
 #pragma once
 #include "glue.cuh"
 #include "gdn.cuh"
-// TODO(gemv family): #include "gemv.cuh"    + MK_OP lines for OP_QUANT_Q8_1,
-//     OP_MMVQ_Q4_0, OP_MMVQ_Q4_0_FUSED, OP_MMVQ_AR16, OP_GEMV_F16,
-//     OP_HEAD_GEMV_F16
-// TODO(attn family): #include "attn.cuh"    + MK_OP lines for
-//     OP_QK_NORM_ROPE, OP_KV_APPEND, OP_FATTN_DECODE, OP_FATTN_REDUCE,
-//     OP_ATTN_GATE
+#include "gemv.cuh"
+#include "attn.cuh"
 // TODO(xchg family): #include "xchg.cuh"    + MK_OP lines for OP_XCHG_PUSH,
-//     OP_XCHG_REDUCE
+//     OP_XCHG_REDUCE (dual-GPU milestone, core/EXCHANGE-DESIGN.md)
 
 namespace mk {
 
@@ -33,7 +29,18 @@ namespace mk {
     MK_OP(OP_GDN_GATES, op_gdn_gates)                  \
     MK_OP(OP_GDN_STEP, op_gdn_step)                    \
     MK_OP(OP_GATED_RMSNORM, op_gated_rmsnorm)          \
-    MK_OP(OP_STATE_STORE, op_state_store)
+    MK_OP(OP_STATE_STORE, op_state_store)              \
+    MK_OP(OP_QUANT_Q8_1, op_quant_q8_1)                \
+    MK_OP(OP_MMVQ_Q4_0, op_mmvq_q4_0)                  \
+    MK_OP(OP_MMVQ_Q4_0_FUSED, op_mmvq_q4_0_fused)      \
+    MK_OP(OP_MMVQ_AR16, op_mmvq_ar16)                  \
+    MK_OP(OP_GEMV_F16, op_gemv_f16)                    \
+    MK_OP(OP_HEAD_GEMV_F16, op_head_gemv_f16)          \
+    MK_OP(OP_QK_NORM_ROPE, op_qk_norm_rope)            \
+    MK_OP(OP_KV_APPEND, op_kv_append)                  \
+    MK_OP(OP_FATTN_DECODE, op_fattn_decode)            \
+    MK_OP(OP_FATTN_REDUCE, op_fattn_reduce)            \
+    MK_OP(OP_ATTN_GATE, op_attn_gate)
 
 __device__ __forceinline__ bool op_wired(uint16_t kind) {
     switch (kind) {

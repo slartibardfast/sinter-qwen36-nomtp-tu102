@@ -21,6 +21,15 @@
 
 namespace mk {
 
+// Full-warp butterfly sum (the fork's warp_reduce_sum shape, common.cuh:421):
+// offsets 16..1, every lane ends with the total. Shared by every op family;
+// canonical home so op headers do not each redefine it (ODR).
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
 __device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned *p) {
     unsigned v;
     asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");

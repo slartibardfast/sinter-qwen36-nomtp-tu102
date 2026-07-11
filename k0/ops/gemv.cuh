@@ -183,15 +183,7 @@ static __device__ __forceinline__ void stage_words_cg(
     __syncthreads();
 }
 
-// Butterfly reduce, the fork's warp_reduce_sum shape (common.cuh:421-428):
-// offsets 16,8,4,2,1. All lanes end with the full sum.
-static __device__ __forceinline__ float warp_sum(float x) {
-#pragma unroll
-    for (int off = 16; off; off >>= 1)
-        x += __shfl_xor_sync(0xFFFFFFFFu, x, off, 32);
-    return x;
-}
-
+// warp_sum: canonical definition in core/sync.cuh (shared across op families).
 struct WarpSlice {
     int gw;      // global warp index within the instruction's CTA range
     int nwarps;  // total warps across the range
