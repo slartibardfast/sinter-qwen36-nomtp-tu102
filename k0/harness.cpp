@@ -512,7 +512,8 @@ struct Runtime {
         alloc(R, "pass_ctx", sizeof(PassCtx));
         mask_cap = pad_up(n_ctx, 256);
         alloc(R, "mask_f16", (size_t) mask_cap * 2);
-        alloc(R, "logits", (size_t) n_vocab * 4);
+        // "logits" is owned by program.json's buffer table (the lm-head dst);
+        // allocated below from that table, or in the stub branch when absent.
         alloc(R, "result_norm", (size_t) N_EMBD * 4);
         // Parity dual-write target: row il = residual after block il
         // (0..62). The schedule must alias/copy each block's residual add
@@ -528,6 +529,7 @@ struct Runtime {
             // STUB: k0/program.json's buffer table was not available when
             // this ran; one generic scratch arena stands in for it.
             alloc(R, "scratch", 64ull << 20, false);
+            alloc(R, "logits", (size_t) n_vocab * 4);   // table absent: own it
             buffer_table_stubbed = true;
             printf("buffers: program.json buffer table ABSENT — stubbed with one 64 MiB "
                    "\"scratch\" arena (regenerate with python3 k0/compile_schedule.py)\n");
