@@ -61,9 +61,14 @@ across passes. dual_shutdown on backend free or fingerprint change.
   llama-server; perplexity pass.
 
 ## Risks (ranked)
-1. Weight slice layout: llama's meta slice vs the schedule's expected. Premise says
-   they match; verify via L4.
-2. KV byte layout: harness cache vs llama head-split cache. Verify via L4.
+1. Weight slice layout: RETIRED 2026-07-13. The live-graph geometry probe (see
+   R3-PARITY "Live decode geometry") shows llama's per-GPU weight shapes+strides
+   equal the harness's (qkv 5120/GPU AXIS_1, ssm_out 3072/GPU AXIS_0 F16, output
+   124160/GPU AXIS_1). Segment interleave for qkv still verified at L4.
+2. KV byte layout: RETIRED 2026-07-13. cache_k/v [512,256] pos-major, cache_r
+   [15360], cache_s [393216] all equal the harness (kv_row=512, CONV/2, SSM/2).
 3. Embed seed (input residual vs schedule embed).
 4. Position/n_kv sourcing: read llama's actual decode position, not a synthetic pos.
 5. Resident-kernel lifecycle vs llama rebuilding the graph (fingerprint re-check).
+6. Tool config: llama-bench MUST pass `-fa 1` (FA-on) to build the fingerprint
+   graph; FA-off aborts in the meta backend's set_rows handler (see R3-PARITY).

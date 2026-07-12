@@ -19,6 +19,7 @@
 #include <string>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -42,6 +43,48 @@ static bool extract(const ggml_tensor * t, dev_ptrs & out) {
     out.p[0] = it->second[0] ? it->second[0]->data : nullptr;
     out.p[1] = it->second[1] ? it->second[1]->data : nullptr;
     return out.p[0] && out.p[1];
+}
+
+// Simple (per-GPU) tensors behind a meta tensor, for geometry inspection.
+static bool simple_pair(const ggml_tensor * t, const ggml_tensor * out[2]) {
+    if (!t || !t->buffer || !ggml_backend_buffer_is_meta(t->buffer)) return false;
+    auto * mc = (meta_ctx_mirror *) t->buffer->context;
+    auto it = mc->simple_tensors.find(t);
+    if (it == mc->simple_tensors.end() || it->second.size() < 2) return false;
+    out[0] = it->second[0]; out[1] = it->second[1];
+    return out[0] && out[1];
+}
+
+static void log_geom1(const char * tag, const ggml_tensor * t) {
+    if (!t) { fprintf(stderr, "  %-22s <null>\n", tag); return; }
+    fprintf(stderr, "  %-22s type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+            tag, (int) t->type,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+}
+
+// For a meta tensor: log the meta geometry + each per-GPU simple tensor's geometry.
+// This is the L3 layout de-risk: the megakernel's fattn/ssm ops assume the harness
+// cache layout; here we read llama's actual cache_k/r/s (and a weight slice) shape.
+static void log_geom(const ggml_cgraph * g, const char * name) {
+    auto find = [&](const char * nm) -> const ggml_tensor * {
+        for (int i = 0; i < g->n_leafs; ++i)
+            if (g->leafs[i] && strcmp(g->leafs[i]->name, nm) == 0) return g->leafs[i];
+        for (int i = 0; i < g->n_nodes; ++i) {
+            if (g->nodes[i] && strcmp(g->nodes[i]->name, nm) == 0) return g->nodes[i];
+            for (int s = 0; s < GGML_MAX_SRC; ++s)
+                if (g->nodes[i]->src[s] && strcmp(g->nodes[i]->src[s]->name, nm) == 0)
+                    return g->nodes[i]->src[s];
+        }
+        return nullptr;
+    };
+    const ggml_tensor * t = find(name);
+    if (!t) { fprintf(stderr, "[MK geom] %-18s NOT FOUND\n", name); return; }
+    fprintf(stderr, "[MK geom] %s\n", name);
+    log_geom1("meta", t);
+    const ggml_tensor * s[2];
+    if (simple_pair(t, s)) { log_geom1("gpu0", s[0]); log_geom1("gpu1", s[1]); }
+    else fprintf(stderr, "  (not a 2-way meta tensor)\n");
 }
 
 // Walk the graph, collect every named tensor (leaves = weights + KV/state, and
@@ -86,6 +129,13 @@ bool mk_dispatch(struct ggml_cgraph * cgraph) {
             "attn_qkv=%d ffn_down=%d ssm_out=%d cache_k=%d cache_r=%d cache_s=%d output.weight=%d\n",
             cgraph->n_nodes, cgraph->n_leafs, ptrs.size(),
             qkv, ffn_down, ssm_out, cache_k, cache_r, cache_s, out_w);
+        // L3 layout de-risk: dump llama's actual KV + weight-slice geometry so we
+        // can compare against the harness's assumed cache layout (cache_k =
+        // n_ctx x N_EMBD_GQA/2 f16; conv/ssm state; qkv/ssm_out/output slices).
+        for (const char * nm : { "cache_k_l3", "cache_v_l3", "cache_r_l0", "cache_s_l0",
+                                 "blk.0.attn_qkv.weight", "blk.0.ssm_out.weight",
+                                 "output.weight", "blk.0.ssm_in.weight" })
+            log_geom(cgraph, nm);
         ++logged;
     }
 
