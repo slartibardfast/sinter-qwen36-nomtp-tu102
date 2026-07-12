@@ -1,10 +1,24 @@
-# megakernel
+# sinter-qwen36-nomtp-tu102
 
-The persistent decode megakernel for `plan/0135` of
-[yarn-agentic](https://github.com/slartibardfast/yarn-agentic): batch-1
-decode of Qwen3.6-27B (hybrid gated-DeltaNet + full attention) on a pair of
-NVLink-linked TU102 GPUs (sm_75), run underneath an unmodified `llama-server`
-as an out-of-tree dynamic ggml backend.
+The **sinter** persistent decode megakernel, in one instance: batch-1 decode of
+Qwen3.6-27B (hybrid gated-DeltaNet + full attention) on a pair of NVLink-linked
+TU102 GPUs (sm_75), no MTP, run underneath an unmodified `llama-server` as an
+out-of-tree dynamic ggml backend.
+
+**Why "sinter".** Sintering coalesces a powder into a solid mass by heat without
+fully melting it: bonded but porous, partial by design. That is this artifact
+honestly. Its ops are fused but not fully coalesced (964 grid boundaries remain,
+G15), it does decode and not prefill, it carries no speculation, and it ties the
+DRAM floor rather than beating it. It is one instance, not "the megakernel".
+
+**Two repositories.**
+[`sinter`](https://github.com/slartibardfast/sinter) is the skeleton: the
+config-invariant method (the cooperative launch spine, the `op_*` device
+functions, the schedule compiler, the gate harness) — the reusable way to author
+such kernels (`core/` and `k0/ops/` here, extracted into `sinter` as the skeleton
+matures). `sinter-qwen36-nomtp-tu102` (this repo) is the worked example: this
+config's fused macro-op schedule, fingerprint binding, dual-GPU split, oracle
+references, and measured results.
 
 This repository is the software; the thought lives in the host project. Read
 there first:
@@ -29,8 +43,10 @@ there first:
 | `docs/` | the extracted anatomy and semantics dossiers; build lore | knowledge transfer |
 
 The playbook expects other serving configurations (the production MTP
-depth-3 kernel among them) to be **different instantiations beside `k0/`,
-sharing `core/`** — never one kernel accreting config flags.
+depth-3 kernel among them) to be **different instances sharing the `sinter`
+skeleton**, never one kernel accreting config flags. This example is the
+`spec_depth 0` (no-MTP) instance; the skeleton is what makes the next instance
+cheap to author.
 
 ## The G11 envelope (binds every build)
 
