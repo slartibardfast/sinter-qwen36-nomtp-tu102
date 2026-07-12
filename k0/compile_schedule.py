@@ -721,6 +721,70 @@ if sorted(WEIGHTS_USED) != all_weights:
     miss = [w for w in all_weights if w not in used]
     fail("weight operand mismatch; dup=%s missing=%s" % (dup[:5], miss[:5]))
 
+# ---------------------------------------------------------------- boundary coalescing
+# v0 emitted one boundary after every window; most windows are single ops in a
+# strictly dependent chain, but a fraction of ADJACENT windows are provably
+# independent and can share one boundary window. Two adjacent windows may merge
+# iff their union stays a valid antichain: no instruction in one reads or writes
+# a buffer the other writes (the same WAR/WAW/RAW test the lifetime check uses,
+# lifted to the union of each window's reads/writes). Every block runs a merged
+# window's instructions concurrently on disjoint block ranges, so a missed
+# hazard is a silent wrong answer -- the union test below is the guard, and the
+# lifetime check re-runs on the merged windows.
+#
+# Occupancy guard: split_grid divides the 72 blocks across a window's ops by
+# est, so merging a heavy (weight-streaming) op with light glue keeps the heavy
+# op on nearly all blocks, but merging two heavy ops would halve each one's SMs.
+# A merge is refused when it would place two heavy ops (est >= HEAVY_EST) in one
+# window. Pre-existing multi-heavy windows are never split -- coalescing only
+# removes boundaries, never adds them.
+#
+# Cross-GPU exchange sites (OP_XCHG_PUSH / OP_XCHG_REDUCE) are excluded from
+# coalescing entirely: their boundary is a cross-GPU handshake the local
+# reads/writes sets do not model, so it must never be dissolved.
+HEAVY_EST = 512 * 1024
+COALESCE = os.environ.get("MK_NO_COALESCE") != "1"
+XCHG_KINDS = {"OP_XCHG_PUSH", "OP_XCHG_REDUCE"}
+
+
+def _win_rw(w):
+    r, wr = set(), set()
+    for i in w:
+        r |= PROG[i]["_r"]
+        wr |= PROG[i]["_w"]
+    return r, wr
+
+
+def _independent(wa, wb):
+    ra, wra = _win_rw(wa)
+    rb, wrb = _win_rw(wb)
+    # hazard if either window's writes touch the other's reads or writes
+    return not (wra & (rb | wrb)) and not (wrb & ra)
+
+
+def _n_heavy(w):
+    return sum(1 for i in w if PROG[i]["_est"] >= HEAVY_EST)
+
+
+def _has_xchg(w):
+    return any(PROG[i]["kind"] in XCHG_KINDS for i in w)
+
+
+if COALESCE:
+    n_before = len(WINDOWS)
+    merged = []
+    for w in WINDOWS:
+        if (merged and not _has_xchg(merged[-1]) and not _has_xchg(w) and
+                _independent(merged[-1], w) and
+                _n_heavy(merged[-1]) + _n_heavy(w) <= 1):
+            merged[-1] = merged[-1] + w
+        else:
+            merged.append(w)
+    WINDOWS = merged
+    print("coalesce: %d windows -> %d (removed %d boundaries)"
+          % (n_before, len(WINDOWS), n_before - len(WINDOWS)), file=sys.stderr)
+
+
 # ---------------------------------------------------------------- block ranges
 def split_grid(ests):
     n = len(ests)

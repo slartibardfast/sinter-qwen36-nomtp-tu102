@@ -67,6 +67,11 @@ struct Control {
                                             // deltas from block 0 (G15);
                                             // nullptr disables recording
     unsigned pass_cycles_cap;               // ring capacity in entries
+    // REDLINE itemization (MK_PROFILE builds only): block-0 clock64 cycles
+    // accumulated per macro-op kind across passes; op_cycles[OP_BOUNDARY]
+    // carries the boundary-wait total. OP_KIND_COUNT entries, nullptr or a
+    // non-MK_PROFILE kernel leaves it untouched (production is unaffected).
+    long long *op_cycles;
 };
 
 } // namespace mk

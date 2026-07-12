@@ -57,24 +57,39 @@ __device__ inline void op_rmsnorm(const Instr &in, char *smem) {
     const RmsnormArgs &a = *reinterpret_cast<const RmsnormArgs *>(in.payload);
     const unsigned nblk = in.block_hi - in.block_lo;
     float *red = reinterpret_cast<float *>(smem); // one partial per warp
+    // The trunk norms are one 5120-row on one block; the v0 write loop then
+    // re-read x+add from L2 (scalar) and wrote y/sum/dbg scalar -- ~4 latency
+    // passes on a single SM. Stage the summed row (x+add) into the smem slab
+    // during the reduction, then write vectorized from smem: one memory read
+    // of x+add, no re-read, float4 stores. Bit-identical (same fold order,
+    // same scale, same (x+add)); it only removes redundant traffic. The stage
+    // holds one row (ncols f32) after red[]; falls back to the re-read form
+    // when a row does not fit the slab.
+    float *stage = reinterpret_cast<float *>(smem + 64);
+    const bool can_stage = (size_t)a.ncols * 4 + 64 <= SMEM_BYTES;
 
     for (uint32_t row = blockIdx.x - in.block_lo; row < a.nrows; row += nblk) {
         const float *x = a.x + (size_t)row * a.ncols;
         const float *add = a.add ? a.add + (size_t)row * a.ncols : nullptr;
         float *y = a.y + (size_t)row * a.ncols;
+        float *sum = a.sum ? a.sum + (size_t)row * a.ncols : nullptr;
+        float *dbg = a.dbg ? a.dbg + (size_t)row * a.ncols : nullptr;
 
         float acc = 0.0f;
         const bool vec = (a.ncols % 4u == 0) && aligned16(x) &&
                          (!add || aligned16(add));
+        const bool staged = vec && can_stage;
         if (vec) {
             const float4 *x4 = reinterpret_cast<const float4 *>(x);
             const float4 *a4 = reinterpret_cast<const float4 *>(add);
+            float4 *st4 = reinterpret_cast<float4 *>(stage);
             for (uint32_t i = threadIdx.x; i < a.ncols / 4; i += blockDim.x) {
                 float4 v = ld_cg(x4 + i);
                 if (add) {
                     const float4 r = ld_cg(a4 + i);
                     v.x += r.x; v.y += r.y; v.z += r.z; v.w += r.w;
                 }
+                if (staged) st4[i] = v;   // keep (x+add) hot in smem for the write
                 acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
             }
         } else {
@@ -97,16 +112,41 @@ __device__ inline void op_rmsnorm(const Instr &in, char *smem) {
         }
         __syncthreads();
         const float scale = red[0];
-        __syncthreads(); // red[] is reused by the next row
+        __syncthreads(); // red[]/stage are reused by the next row
 
-        float *sum = a.sum ? a.sum + (size_t)row * a.ncols : nullptr;
-        float *dbg = a.dbg ? a.dbg + (size_t)row * a.ncols : nullptr;
-        for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
-            float v = ld_cg(x + i);
-            if (add) v += ld_cg(add + i);
-            if (sum) sum[i] = v;   // residual trunk write-back (x + add)
-            if (dbg) dbg[i] = v;   // parity residual-stream snapshot (l_out)
-            y[i] = scale * v * a.w[i];
+        if (staged) {
+            const float4 *st4 = reinterpret_cast<const float4 *>(stage);
+            const float4 *w4 = reinterpret_cast<const float4 *>(a.w);
+            float4 *y4 = reinterpret_cast<float4 *>(y);
+            float4 *s4 = reinterpret_cast<float4 *>(sum);
+            float4 *d4 = reinterpret_cast<float4 *>(dbg);
+            const bool wv = aligned16(a.w) && aligned16(y) &&
+                            (!sum || aligned16(sum)) && (!dbg || aligned16(dbg));
+            if (wv) {
+                for (uint32_t i = threadIdx.x; i < a.ncols / 4; i += blockDim.x) {
+                    const float4 v = st4[i];
+                    if (sum) s4[i] = v;
+                    if (dbg) d4[i] = v;
+                    const float4 w = w4[i];
+                    y4[i] = make_float4(scale * v.x * w.x, scale * v.y * w.y,
+                                        scale * v.z * w.z, scale * v.w * w.w);
+                }
+            } else {
+                for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
+                    const float v = stage[i];
+                    if (sum) sum[i] = v;
+                    if (dbg) dbg[i] = v;
+                    y[i] = scale * v * a.w[i];
+                }
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
+                float v = ld_cg(x + i);
+                if (add) v += ld_cg(add + i);
+                if (sum) sum[i] = v;   // residual trunk write-back (x + add)
+                if (dbg) dbg[i] = v;   // parity residual-stream snapshot (l_out)
+                y[i] = scale * v * a.w[i];
+            }
         }
     }
 }

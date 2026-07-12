@@ -80,12 +80,26 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
         if (blockIdx.x == 0 && threadIdx.x == 0 && ctl.pass_cycles)
             t0 = clock64();
 
+#ifdef MK_PROFILE
+        // REDLINE itemization: block-0 thread-0 attributes clock64 cycles per
+        // op kind (and the boundary-wait total to op_cycles[OP_BOUNDARY]).
+        // split_grid balances every antichain window by est, so block 0's
+        // first-op time approximates that window's critical path.
+        const bool prof = (blockIdx.x == 0 && threadIdx.x == 0 && ctl.op_cycles);
+#endif
+
         // ---- the instruction loop -----------------------------------------
         for (uint32_t i = 0; i < hdr.n_instr; ++i) {
             const Instr &in = program[i]; // immutable: plain cached loads
             const uint16_t kind = in.kind;
             if (kind == OP_BOUNDARY) {
+#ifdef MK_PROFILE
+                long long tb = prof ? clock64() : 0;
                 bar.cross(epoch);
+                if (prof) ctl.op_cycles[OP_BOUNDARY] += clock64() - tb;
+#else
+                bar.cross(epoch);
+#endif
                 continue;
             }
             if (kind >= OP_KIND_COUNT || !op_wired(kind)) {
@@ -97,8 +111,15 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
                                                       : ERR_UNWIRED_KIND, i);
                 return;
             }
-            if (blockIdx.x >= in.block_lo && blockIdx.x < in.block_hi)
+            if (blockIdx.x >= in.block_lo && blockIdx.x < in.block_hi) {
+#ifdef MK_PROFILE
+                long long to = prof ? clock64() : 0;
                 op_dispatch(in, mk_smem);
+                if (prof) ctl.op_cycles[kind] += clock64() - to;
+#else
+                op_dispatch(in, mk_smem);
+#endif
+            }
         }
 
         // ---- pass epilogue ------------------------------------------------

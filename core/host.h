@@ -44,6 +44,7 @@ struct Host {
     int32_t *d_token = nullptr;          // per-pass token-id input cell
     long long *d_pass_cycles = nullptr;  // G15 ring (block-0 clock64 deltas)
     unsigned pass_cycles_cap = 0;
+    long long *d_op_cycles = nullptr;    // REDLINE: per-kind cycles (OP_KIND_COUNT)
     // host-mapped mailbox
     unsigned *h_mail = nullptr;
     volatile unsigned *h_doorbell = nullptr;
@@ -70,5 +71,12 @@ void host_destroy(Host &h);
 // Read back up to `count` device-recorded per-pass cycle deltas, oldest slot
 // first (ring order; caller indexes by (pass-1) % cap).
 bool host_read_pass_cycles(Host &h, long long *out, unsigned count);
+
+// REDLINE itemization: zero the per-kind cycle accumulator (call between the
+// warmup and timed regions), and read back OP_KIND_COUNT accumulated totals.
+// Both are no-ops unless the kernel was built with -DMK_PROFILE (the array is
+// still allocated so a profile build can write it).
+bool host_reset_op_cycles(Host &h);
+bool host_read_op_cycles(Host &h, long long *out, unsigned count);
 
 } // namespace mk

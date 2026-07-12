@@ -1836,6 +1836,53 @@ static void watermark(GpuCtx g2[2], const char *tag, int64_t pos) {
     fflush(stdout);
 }
 
+// REDLINE itemization: per-op-kind clock64 breakdown from block 0. Only an
+// MK_PROFILE-built kernel fills op_cycles (otherwise all zero -> no print). The
+// caller resets after warmup; here we read back, convert cycles->ms per pass at
+// 1.455 GHz, and print ms + %-of-pass per kind, the boundary total, the reduce
+// total, and the on-device sum cross-checked against the pass_cycles wall.
+static const char *KIND_NAME[mk::OP_KIND_COUNT] = {
+    "NOP", "BOUNDARY", "EMBED_LOOKUP", "RMSNORM", "QUANT_Q8_1",
+    "HEAD_GEMV_F16", "LOGITS_EMIT", "MMVQ_Q4_0", "MMVQ_Q4_0_FUSED",
+    "MMVQ_AR16", "GEMV_F16", "CONV_SHIFT_CONCAT", "SSM_CONV_SILU",
+    "QK_L2NORM", "GDN_GATES", "GDN_STEP", "GATED_RMSNORM", "QK_NORM_ROPE",
+    "KV_APPEND", "FATTN_DECODE", "FATTN_REDUCE", "ATTN_GATE", "RESIDUAL_ADD",
+    "STATE_LOAD", "STATE_STORE", "XCHG_PUSH", "XCHG_REDUCE"};
+
+static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
+                               double pass_ms) {
+    long long oc[mk::OP_KIND_COUNT] = {0};
+    if (!mk::host_read_op_cycles(h, oc, mk::OP_KIND_COUNT)) return;
+    long long sum = 0;
+    for (int k = 0; k < mk::OP_KIND_COUNT; k++) sum += oc[k];
+    if (sum == 0) return;  // non-profile kernel: nothing recorded
+    const double gHz = 1.455;
+    auto ms = [&](long long c) { return (double) c / n_tokens / gHz / 1e6; };
+    const double total_ms = ms(sum);
+    printf("PROFILE gpu %d: block-0 itemization over %lld passes "
+           "(on-device sum %.3f ms/pass vs pass_cycles wall %.3f ms)\n",
+           gpu, (long long) n_tokens, total_ms, pass_ms);
+    printf("  %-18s %10s %8s\n", "kind", "ms/pass", "%pass");
+    // sort by descending cycles
+    int order[mk::OP_KIND_COUNT];
+    for (int k = 0; k < mk::OP_KIND_COUNT; k++) order[k] = k;
+    for (int a = 0; a < mk::OP_KIND_COUNT; a++)
+        for (int b = a + 1; b < mk::OP_KIND_COUNT; b++)
+            if (oc[order[b]] > oc[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+    double reduce_ms = ms(oc[mk::OP_XCHG_PUSH] + oc[mk::OP_XCHG_REDUCE]);
+    for (int i = 0; i < mk::OP_KIND_COUNT; i++) {
+        int k = order[i];
+        if (oc[k] == 0) continue;
+        printf("  %-18s %10.4f %7.2f%%\n", KIND_NAME[k], ms(oc[k]),
+               100.0 * oc[k] / sum);
+    }
+    printf("  ---- boundary total %.4f ms (%.2f%%), reduce total (push+reduce) "
+           "%.4f ms (%.2f%%)\n",
+           ms(oc[mk::OP_BOUNDARY]), 100.0 * oc[mk::OP_BOUNDARY] / sum,
+           reduce_ms, 100.0 * (oc[mk::OP_XCHG_PUSH] + oc[mk::OP_XCHG_REDUCE]) / sum);
+    fflush(stdout);
+}
+
 // -- tensor bench / soak: dual-GPU decode floor + leak watermark --------------
 // pos0 seeds the starting decode position; at pos0 near n_ctx the KV read (~8.6
 // GB/GPU) dominates, giving the true deep-context floor. Long n_tokens with the
@@ -1858,6 +1905,9 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         if (!dual_run_pass(g2, 11, pass, 60000.0)) return 3;
     }
     watermark(g2, "warmed", pos);
+    // REDLINE: zero the per-kind accumulator so the itemization covers only the
+    // timed region (safe here — both kernels are spinning at the doorbell).
+    for (int g = 0; g < 2; g++) mk::host_reset_op_cycles(g2[g].ln.h);
     const int64_t sample_every = n_tokens > 20 ? n_tokens / 20 : 1;
     auto t0 = std::chrono::steady_clock::now();
     for (int64_t i = 0; i < n_tokens; i++, pos++) {
@@ -1877,6 +1927,7 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         unsigned cap = g2[g].ln.h.pass_cycles_cap;
         if (!cap || n_tokens <= 0) continue;
         std::vector<long long> cyc(cap);
+        double pass_ms = 0;
         if (mk::host_read_pass_cycles(g2[g].ln.h, cyc.data(), cap)) {
             unsigned cnt = (unsigned) std::min<int64_t>(n_tokens, cap);
             double sum = 0; long long mn = cyc[0], mx = cyc[0];
@@ -1885,10 +1936,12 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
                 sum += (double) v; if (v < mn) mn = v; if (v > mx) mx = v;
             }
             const double gHz = 1.455;
+            pass_ms = sum / cnt / gHz / 1e6;
             printf("bench-tensor: gpu %d per-pass on-device clock64: mean %.3f ms, "
                    "min %.3f, max %.3f (%u samples)\n",
-                   g, sum / cnt / gHz / 1e6, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
+                   g, pass_ms, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
         }
+        print_op_breakdown(g2[g].ln.h, g, n_tokens, pass_ms);
     }
     dual_shutdown(g2);
     return 0;

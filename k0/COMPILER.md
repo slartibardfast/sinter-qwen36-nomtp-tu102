@@ -26,16 +26,24 @@ C++ packer later resolves to device pointers and packs into 128-byte
 - `mask_convert` — the harness/backend writes the f16 KQ mask directly
   (`binding.mask` in program.json), so the f32→f16 CPY is host-side.
 
-## OPEN: boundary placement is v0 (drives G15)
+## RESOLVED: boundary placement is v0, and it is (almost) forced
 
-The 964 boundaries are the conservative "boundary between adjacent
-dependent instructions" placement; it fails G15 (2 % gate) at the measured
-806 ns/boundary (5.7 % of budget — `k0/ops/NOTES-spine.md`). The compiler
-needs an antichain-coalescing pass: two instructions may share one boundary
-window iff neither reads a buffer the other writes (the buffer read/write
-sets are already tracked per instruction — `reads=`/`writes=`). Target
-~320–380 boundaries. This is the next single-GPU-milestone task, tracked in
-`plan/0135 mtp-off-build.md`.
+The antichain-coalescing pass now exists (`compile_schedule.py`, the
+`# boundary coalescing` block): two adjacent windows merge iff their union
+stays an antichain (no WAR/WAW/RAW across the union of each window's
+`reads=`/`writes=`), with an occupancy guard (no two heavy weight-streaming
+ops per window) and XCHG sites excluded.
+
+It removes **zero** boundaries: an exhaustive scan finds **0 of the 1219
+adjacent window pairs independent**, at single-GPU and dual-GPU. The v0
+schedule is a genuine, fully-serial dependency chain — logically-independent
+ops false-share the reused scratch buffers (`xn`, `q8_act`, `mixer_out`,
+`attn_out`, `proj_out`, `gdn_*`), so nearly every adjacent pair has a real
+hazard. The "~320-380 boundaries" target assumed independence that
+buffer-reuse eliminates; reducing boundaries needs **buffer renaming** to
+break the false-sharing, not just coalescing. The boundary total is ~1.29 ms
+(6 % of the dual-GPU pass) and is data-dependency-required. Full itemization
+and the true bound: `k0/REDLINE.md`.
 
 ## Constraint: FATTN KV chunks must be 32-aligned
 
