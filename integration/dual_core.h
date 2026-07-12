@@ -19,11 +19,13 @@ struct MkPtrMap { std::map<std::string, std::array<void *, 2>> p; };
 void mk_dual_setup(const MkPtrMap & pm, const char * program_path,
                    int64_t n_ctx, int64_t n_vocab);
 
-// Run one decode pass for `token` at position `pos`, then copy each GPU's
-// vocab-half logits (n_vocab/2 f32) into out0/out1 (device pointers resident on
-// GPU0/GPU1 respectively — the output meta tensor's per-GPU simple tensors).
-// Returns false if the pass timed out or a device error was raised.
-bool mk_dual_step(int32_t token, int64_t pos, void * out0, void * out1);
+// Run one decode pass at position `pos`: seed the mirrored residual from
+// seed0/seed1 (MK#model.input_embed#0's per-GPU data, 5120 f32 — MK's graph does
+// the embed on the CPU side), run the megakernel, then copy each GPU's vocab-half
+// logits (n_vocab/2 f32) into out0/out1 (the output meta tensor's per-GPU simple
+// tensors on GPU0/GPU1). Returns false on timeout or a device error.
+bool mk_dual_step(const void * seed0, const void * seed1, int64_t pos,
+                  void * out0, void * out1);
 
 bool mk_dual_ready();
 void mk_dual_shutdown();

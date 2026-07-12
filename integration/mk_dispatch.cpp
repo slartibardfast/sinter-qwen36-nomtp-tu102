@@ -13,7 +13,9 @@
 #include "ggml-impl.h"          // full ggml_cgraph struct (n_nodes/n_leafs/nodes/leafs)
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "dual_core.h"          // mk_dual_setup / mk_dual_step (k0/harness.cpp)
 
+#include <cuda_runtime.h>
 #include <map>
 #include <vector>
 #include <string>
@@ -102,6 +104,31 @@ static void build_ptr_map(const ggml_cgraph * g, std::map<std::string, dev_ptrs>
     }
 }
 
+static const ggml_tensor * find_named(const ggml_cgraph * g, const char * nm) {
+    for (int i = 0; i < g->n_leafs; ++i)
+        if (g->leafs[i] && strcmp(g->leafs[i]->name, nm) == 0) return g->leafs[i];
+    for (int i = 0; i < g->n_nodes; ++i) {
+        if (g->nodes[i] && strcmp(g->nodes[i]->name, nm) == 0) return g->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s)
+            if (g->nodes[i]->src[s] && strcmp(g->nodes[i]->src[s]->name, nm) == 0)
+                return g->nodes[i]->src[s];
+    }
+    return nullptr;
+}
+
+// Read the first index of a (meta or plain) index tensor to host: the decode
+// position lives in the SET_ROWS k_idxs (= [n_past]).
+static int64_t read_index0(const ggml_tensor * t) {
+    if (!t) return -1;
+    void * p = nullptr; dev_ptrs d;
+    if (extract(t, d)) p = d.p[0]; else p = t->data;
+    if (!p) return -1;
+    if (t->type == GGML_TYPE_I64) {
+        int64_t v = -1; return cudaMemcpy(&v, p, 8, cudaMemcpyDeviceToHost) == cudaSuccess ? v : -1;
+    }
+    int32_t v = -1; return cudaMemcpy(&v, p, 4, cudaMemcpyDeviceToHost) == cudaSuccess ? (int64_t) v : -1;
+}
+
 } // namespace
 
 // R5 dispatch entry. Returns true iff it ran the megakernel (then the caller
@@ -134,7 +161,8 @@ bool mk_dispatch(struct ggml_cgraph * cgraph) {
         // n_ctx x N_EMBD_GQA/2 f16; conv/ssm state; qkv/ssm_out/output slices).
         for (const char * nm : { "cache_k_l3", "cache_v_l3", "cache_r_l0", "cache_s_l0",
                                  "blk.0.attn_qkv.weight", "blk.0.ssm_out.weight",
-                                 "output.weight", "blk.0.ssm_in.weight", "token_embd.weight" })
+                                 "output.weight", "blk.0.ssm_in.weight", "token_embd.weight",
+                                 "result_output", "MK#model.input_embed#0" })
             log_geom(cgraph, nm);
         // Embed-seed question: dump the leaves (inputs) and node[0..2] so we can
         // see whether MK's graph starts from the token (embed inside) or the
@@ -168,6 +196,45 @@ bool mk_dispatch(struct ggml_cgraph * cgraph) {
         ++logged;
     }
 
-    // Layer 1: never claims the graph. Fall through to the R3 forward.
-    return false;
+    // Default (and any non-decode graph): forward. MK_DISPATCH_RUN opts into the
+    // megakernel; the k=0 decode graph is the transformer stack (~3703 nodes).
+    if (!getenv("MK_DISPATCH_RUN") || cgraph->n_nodes < 3000) return false;
+
+    // Residual seed (CPU embed output), position (SET_ROWS k_idxs), output halves.
+    auto seed = ptrs.find("MK#model.input_embed#0");
+    if (seed == ptrs.end()) return false;
+    // DECODE ONLY: the k=0 megakernel processes exactly one token. The residual
+    // seed's ne[1] is the token count; forward prefill (ne[1] > 1) to stock so it
+    // populates the KV the decode then reads.
+    const ggml_tensor * seed_t = find_named(cgraph, "MK#model.input_embed#0");
+    if (!seed_t || seed_t->ne[1] != 1) return false;
+    int64_t pos = -1;
+    for (int i = 0; i < cgraph->n_nodes; ++i)
+        if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS) {
+            pos = read_index0(cgraph->nodes[i]->src[1]); break;
+        }
+    if (pos < 0) return false;
+    const ggml_tensor * out = cgraph->nodes[cgraph->n_nodes - 1];
+    dev_ptrs od;
+    if (!extract(out, od)) return false;
+    const ggml_tensor * ck = find_named(cgraph, "cache_k_l3");
+    int64_t n_ctx   = ck ? ck->ne[1] : 8192;
+    int64_t n_vocab = out->ne[0];
+
+    static bool warned = false;
+    if (!warned) {
+        fprintf(stderr, "[MK dispatch RUN] pos=%lld n_ctx=%lld n_vocab=%lld out=%s "
+                "out.ne=[%lld,%lld] seed(%p,%p)\n", (long long) pos, (long long) n_ctx,
+                (long long) n_vocab, out->name, (long long) out->ne[0], (long long) out->ne[1],
+                seed->second.p[0], seed->second.p[1]);
+        warned = true;
+    }
+
+    if (!mk_dual_ready()) {
+        MkPtrMap pm;
+        for (auto & kv : ptrs) pm.p[kv.first] = { kv.second.p[0], kv.second.p[1] };
+        const char * prog = getenv("MK_PROGRAM");
+        mk_dual_setup(pm, prog ? prog : "k0/program-split.json", n_ctx, n_vocab);
+    }
+    return mk_dual_step(seed->second.p[0], seed->second.p[1], pos, od.p[0], od.p[1]);
 }

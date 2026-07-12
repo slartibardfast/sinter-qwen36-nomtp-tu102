@@ -1982,6 +1982,15 @@ static void gpu_bind_llama(GpuCtx &c, const MkPtrMap &pm) {
     for (auto &kv : pm.p) {
         const std::string &n = kv.first;
         if (n.find(' ') != std::string::npos) continue;
+        // Bind ONLY GGUF model tensors (blk.* / output* / token_embd*) + KV/state;
+        // intermediate/output nodes (result_output, norm-*, Vcur-*, MK#...) are
+        // MK-owned scratch or the gather target, not inputs. GGUF names carry a
+        // stable prefix that computed-node names never do.
+        bool is_gguf  = n.rfind("blk.", 0) == 0 || n.rfind("output", 0) == 0 ||
+                        n.rfind("token_embd", 0) == 0;
+        bool is_cache = n.rfind("cache_k_l", 0) == 0 || n.rfind("cache_v_l", 0) == 0 ||
+                        n.rfind("cache_r_l", 0) == 0 || n.rfind("cache_s_l", 0) == 0;
+        if (!is_gguf && !is_cache) continue;
         void *ptr = kv.second[c.gpu_index];
         if (!ptr) continue;
         std::string bind = n;
@@ -1995,6 +2004,19 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
                    int64_t n_ctx, int64_t n_vocab) {
     if (g_mk_up) return;
     Jv program = json_load(program_path);
+    // Strip the leading OP_EMBED_LOOKUP: token_embd is not in MK's split-1 graph
+    // (llama does the embed on the CPU side), so pack would fail on it. MK seeds
+    // buf:residual from MK#model.input_embed#0 each pass instead.
+    for (auto &kv : program.obj)
+        if (kv.first == "instructions" && !kv.second.arr.empty()) {
+            const Jv *knd = kv.second.arr.front().get("kind");
+            if (knd && knd->str == "OP_EMBED_LOOKUP") {
+                kv.second.arr.erase(kv.second.arr.begin());
+                fprintf(stderr, "[MK dual] stripped leading OP_EMBED_LOOKUP; "
+                                "residual seeded from the CPU embed\n");
+            }
+            break;
+        }
     for (int a = 0; a < 2; a++)
         for (int b = 0; b < 2; b++)
             if (a != b) {
@@ -2031,18 +2053,30 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
     g_mk_up = true; g_mk_nvocab = n_vocab;
 }
 
-bool mk_dual_step(int32_t token, int64_t pos, void *out0, void *out1) {
-    gpu_set_inputs(g_mk[0], pos);
-    gpu_set_inputs(g_mk[1], pos);
-    if (!dual_run_pass(g_mk, token, ++g_mk_seqno, 60000.0)) return false;
+bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
+                  void *out0, void *out1) {
+    // All copies ride c.pstream: the persistent kernel spins on kstream, so a
+    // default-stream copy (or cudaDeviceSynchronize) would serialize against a
+    // kernel that never exits and deadlock.
+    const void *seeds[2] = { seed0, seed1 };
     void *outs[2] = { out0, out1 };
+    for (int g = 0; g < 2; g++) {
+        CUDA_CHECK(cudaSetDevice(g_mk[g].device));
+        // seed the mirrored residual trunk (5120 f32) from the CPU embed output
+        CUDA_CHECK(cudaMemcpyAsync(g_mk[g].bufs["residual"].ptr, seeds[g],
+                                   (size_t) N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                   g_mk[g].pstream));
+        CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
+        gpu_set_inputs(g_mk[g], pos);
+    }
+    if (!dual_run_pass(g_mk, 0, ++g_mk_seqno, 60000.0)) return false;
     size_t half = (size_t)(g_mk_nvocab / 2) * 4;
     for (int g = 0; g < 2; g++) {
         CUDA_CHECK(cudaSetDevice(g_mk[g].device));
-        CUDA_CHECK(cudaMemcpy(outs[g], g_mk[g].bufs["result_output"].ptr, half,
-                              cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(outs[g], g_mk[g].bufs["result_output"].ptr, half,
+                                   cudaMemcpyDeviceToDevice, g_mk[g].pstream));
+        CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
     return true;
 }
 
