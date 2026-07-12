@@ -67,6 +67,7 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>                 // sysconf(_SC_PAGESIZE) for the soak RSS watermark
 
 #include <cuda_runtime.h>
 
@@ -511,6 +512,7 @@ struct Runtime {
         alloc(R, "positions", 16);          // i32[4] M-RoPE ids, all = seq pos
         alloc(R, "kv_row", 8);              // i64[1] KV append row = position
         alloc(R, "rs_row", 8);              // i64[1] = 0 (single-seq ring slot 0)
+        alloc(R, "n_kv", 4);               // u32[1] padded KV window, read strong by FATTN
         mask_cap = pad_up(n_ctx, 256);
         alloc(R, "mask_f16", (size_t) mask_cap * 2);
         // Output cells the ops write but the harness reads via buf:logits /
@@ -540,10 +542,10 @@ struct Runtime {
         }
     }
 
-    // Write positions / kv_row / mask / zero fattn_error for this token; the
-    // token id itself rides host_run_pass -> h.d_token. Returns padded n_kv so
-    // the driver can patch the FATTN_DECODE payloads. All copies land (synced)
-    // before the caller rings the doorbell.
+    // Write positions / kv_row / n_kv cell / mask / zero fattn_error for this
+    // token; the token id itself rides host_run_pass -> h.d_token. Writes the
+    // padded KV window into the "n_kv" cell (read STRONG by OP_FATTN_DECODE) and
+    // returns it. All copies land (synced) before the caller rings the doorbell.
     int64_t set_pass_inputs(int64_t pos) {
         int32_t p4[4] = { (int32_t) pos, (int32_t) pos, (int32_t) pos, (int32_t) pos };
         int64_t row = pos;
@@ -553,6 +555,8 @@ struct Runtime {
         int64_t n_past = pos;
         int64_t n_kv = pad_up(n_past + 1, 256);
         if (n_kv > mask_cap) throw std::runtime_error("mask: n_kv past n_ctx padding cap");
+        uint32_t nkv32 = (uint32_t) n_kv;
+        CUDA_CHECK(cudaMemcpyAsync(bufs["n_kv"].ptr, &nkv32, 4, cudaMemcpyHostToDevice, pstream));
         static std::vector<uint16_t> mask;
         mask.resize((size_t) n_kv);
         for (int64_t j = 0; j < n_kv; j++)
@@ -622,7 +626,7 @@ static float *dev_f32(const Resolver &R, const Jv &a, const char *k, int64_t off
 
 // Everything a pack fn needs: the resolver, the proto instruction (kind /
 // block range / flags / dbg_node prefilled), and a hook to record the emitted
-// FATTN_DECODE positions so the per-pass driver can patch their $n_kv field.
+// FATTN_DECODE positions (reporting count).
 struct PackCtx {
     const Resolver &R;
     const mk::Instr &proto;
@@ -897,11 +901,11 @@ static void pack_FATTN_DECODE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     f.v_cache    = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "cache_v")));
     f.mask       = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "mask")));
     f.partials   = dev_f32(c.R, a, "partials");
-    f.n_kv       = 0;                                  // $n_kv, patched per pass
+    f.n_kv_cell  = reinterpret_cast<const uint32_t *>(dev_ptr(c.R, arg_str(a, "n_kv")));
     f.n_q        = (uint32_t) arg_i(a, "q_heads");
     f.n_kv_heads = (uint32_t) arg_i(a, "kv_heads");
     f.row_width  = (uint32_t)(arg_i(a, "kv_heads") * arg_i(a, "head_dim"));
-    c.out_idx_fattn.push_back(out.size());             // record for $n_kv patch
+    c.out_idx_fattn.push_back(out.size());             // record for reporting count
     emit(out, c.proto, f);
 }
 static void pack_FATTN_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -1004,7 +1008,7 @@ static const KindEntry *kind_by_name(const std::string &raw) {
 
 struct PackedProgram {
     std::vector<mk::Instr> instrs;
-    std::vector<size_t> fattn_idx;     // FATTN_DECODE positions ($n_kv patch)
+    std::vector<size_t> fattn_idx;     // FATTN_DECODE positions (reporting count)
     std::vector<size_t> xchg_idx;      // OP_XCHG_REDUCE positions ($seqno patch)
     uint32_t epoch_stride = 0;
     bool complete = false;
@@ -1060,18 +1064,14 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R,
 // host_init allocates the control cells (incl. h.d_token, the per-pass token
 // input); host_upload uploads the packed Instr[] and wires the y02 counter;
 // host_launch does the cooperative launch (72x384, 60 KiB slab); run_pass ->
-// host_run_pass. The FATTN_DECODE payloads carry a per-pass $n_kv (padded KV
-// window) patched into device memory before each pass.
+// host_run_pass. The per-pass padded KV window rides the host-written "n_kv"
+// cell (set_pass_inputs), read STRONG by OP_FATTN_DECODE — no payload patch.
 // ---------------------------------------------------------------------------
 
 struct Launcher {
     mk::Host h;
-    std::vector<size_t> fattn_idx;     // instr indices needing $n_kv patched
     bool program_uploaded = false;
     static constexpr bool kernel_available = true;
-    // byte offset of FattnDecodeArgs::n_kv within mk::Instr (payload + field).
-    static constexpr size_t N_KV_OFF =
-        offsetof(mk::Instr, payload) + offsetof(mk::FattnDecodeArgs, n_kv);
 
     void init(int device) {
         if (!mk::host_init(h, device, /*pass_cycles_cap=*/1024))
@@ -1083,17 +1083,9 @@ struct Launcher {
     void upload_program(const PackedProgram &p) {
         if (!mk::host_upload(h, p.instrs.data(), (uint32_t) p.instrs.size(), p.epoch_stride))
             throw std::runtime_error("mk::host_upload failed");
-        fattn_idx = p.fattn_idx;
         if (!mk::host_launch(h))
             throw std::runtime_error("mk::host_launch failed (cooperative launch)");
         program_uploaded = true;
-    }
-
-    // Patch $n_kv into every FATTN_DECODE payload for this pass.
-    void patch_n_kv(uint32_t n_kv) {
-        for (size_t idx : fattn_idx)
-            CUDA_CHECK(cudaMemcpy((char *) h.d_program + idx * sizeof(mk::Instr) + N_KV_OFF,
-                                  &n_kv, sizeof(n_kv), cudaMemcpyHostToDevice));
     }
 
     bool run_pass(int32_t token) {
@@ -1228,7 +1220,7 @@ static int parity_run(Residency &res, Runtime &rt, Launcher &ln, const std::stri
     // Prefill: one decode pass per prompt token, logits discarded until the
     // last (decode-only prefill, position from 0).
     for (size_t i = 0; i < prompt.arr.size(); i++, pos++) {
-        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        rt.set_pass_inputs(pos);
         if (!ln.run_pass((int32_t) prompt.arr[i].as_i())) return 3;
     }
     rt.read_f32("logits", logits, (size_t) res.n_vocab);
@@ -1237,7 +1229,7 @@ static int parity_run(Residency &res, Runtime &rt, Launcher &ln, const std::stri
     for (int s = 0; s < steps; s++, pos++) {
         int32_t tok = argmax_f32_first(logits);   // token s from row s
         emitted.push_back(tok);
-        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        rt.set_pass_inputs(pos);
         if (!ln.run_pass(tok)) return 3;
         rt.read_f32("logits", logits, (size_t) res.n_vocab);
         dump.add_logits_row(logits);   // row s+1
@@ -1307,12 +1299,12 @@ static int bench_run(Runtime &rt, Launcher &ln, int gpu, int64_t n_tokens) {
            WARMUP, (long long) n_tokens);
     int64_t pos = 0;
     for (int i = 0; i < WARMUP; i++, pos++) {
-        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        rt.set_pass_inputs(pos);
         if (!ln.run_pass(11)) return 3;
     }
     auto t0 = std::chrono::steady_clock::now();
     for (int64_t i = 0; i < n_tokens; i++, pos++) {
-        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        rt.set_pass_inputs(pos);
         if (!ln.run_pass(11)) return 3;
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -1480,7 +1472,7 @@ struct GpuCtx {
     unsigned *mbox_seqno = nullptr;     // my inbox seqnos, one 128 B line/site
     std::map<std::string, void *> mtab; // "peer_payload:0" -> ptr (for the packer)
     Launcher ln;
-    std::vector<size_t> fattn_idx, xchg_idx;
+    std::vector<size_t> xchg_idx;      // OP_XCHG_REDUCE positions ($seqno patch)
     int64_t n_ctx = 8192, mask_cap = 0, n_vocab_full = 0;
     cudaStream_t pstream = nullptr;
     // seqno field offset inside a packed OP_XCHG_REDUCE instruction.
@@ -1546,6 +1538,7 @@ static void gpu_alloc_buffers(GpuCtx &c, const Jv &program) {
     alloc("positions", 16);
     alloc("kv_row", 8);
     alloc("rs_row", 8);
+    alloc("n_kv", 4);                                     // u32 padded KV window (strong read)
     c.mask_cap = pad_up(c.n_ctx, 256);
     alloc("mask_f16", (size_t) c.mask_cap * 2);
     alloc("result_output", (size_t)(c.n_vocab_full / 2) * 4);  // this GPU's vocab half
@@ -1583,8 +1576,10 @@ static int64_t gpu_set_inputs(GpuCtx &c, int64_t pos) {
     int32_t p4[4] = { (int32_t) pos, (int32_t) pos, (int32_t) pos, (int32_t) pos };
     int64_t row = pos, n_past = pos, n_kv = pad_up(n_past + 1, 256);
     if (n_kv > c.mask_cap) throw std::runtime_error("mask: n_kv past n_ctx padding cap");
+    uint32_t nkv32 = (uint32_t) n_kv;
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["positions"].ptr, p4, 16, cudaMemcpyHostToDevice, c.pstream));
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["kv_row"].ptr, &row, 8, cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["n_kv"].ptr, &nkv32, 4, cudaMemcpyHostToDevice, c.pstream));
     static std::vector<uint16_t> mask;
     mask.resize((size_t) n_kv);
     for (int64_t j = 0; j < n_kv; j++) mask[(size_t) j] = j <= n_past ? F16_ZERO : F16_NEG_INF;
@@ -1603,15 +1598,16 @@ static void gpu_read_f32(GpuCtx &c, const std::string &name, std::vector<float> 
                           n_elems * 4, cudaMemcpyDeviceToHost));
 }
 
-// Ring both doorbells, then wait both done (bounded; never kills).
-static bool dual_run_pass(GpuCtx g2[2], int32_t token, uint32_t n_kv, unsigned seqno,
+// Ring both doorbells, then wait both done (bounded; never kills). The padded
+// KV window is already in each GPU's "n_kv" cell (gpu_set_inputs); FATTN reads
+// it STRONG, so only $seqno + the token are patched here.
+static bool dual_run_pass(GpuCtx g2[2], int32_t token, unsigned seqno,
                           double timeout_ms) {
-    // Per-pass device patches ($n_kv, $seqno) and the token ride the copy
-    // stream ASYNC; one sync per GPU collapses what would be 288 blocking
-    // 4-byte copies/pass into 2 stream syncs. The persistent kernel spins at
-    // the doorbell between passes, so patching d_program in place is safe.
-    static thread_local unsigned s_nkv, s_seq;   // stable sources for async copies
-    s_nkv = n_kv;
+    // Per-pass device patch ($seqno) and the token ride the copy stream ASYNC;
+    // one sync per GPU collapses the 4-byte copies/pass into 2 stream syncs. The
+    // persistent kernel spins at the doorbell between passes, so patching
+    // d_program in place is safe.
+    static thread_local unsigned s_seq;   // stable source for async copies
     s_seq = seqno;
     for (int g = 0; g < 2; g++) {
         GpuCtx &c = g2[g];
@@ -1621,10 +1617,6 @@ static bool dual_run_pass(GpuCtx g2[2], int32_t token, uint32_t n_kv, unsigned s
                     c.device, c.ln.h.h_err[0], c.ln.h.h_err[1]);
             return false;
         }
-        for (size_t idx : c.fattn_idx)
-            CUDA_CHECK(cudaMemcpyAsync((char *) c.ln.h.d_program + idx * sizeof(mk::Instr) +
-                                       Launcher::N_KV_OFF, &s_nkv, 4, cudaMemcpyHostToDevice,
-                                       c.ln.h.cstream));
         for (size_t idx : c.xchg_idx)
             CUDA_CHECK(cudaMemcpyAsync((char *) c.ln.h.d_program + idx * sizeof(mk::Instr) +
                                        GpuCtx::SEQNO_OFF, &s_seq, 4, cudaMemcpyHostToDevice,
@@ -1707,7 +1699,6 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
         if (!p.complete)
             throw std::runtime_error("gpu " + std::to_string(g) + " pack failed after " +
                                      std::to_string(p.packed_before_failure) + ": " + p.first_failure);
-        c.fattn_idx = p.fattn_idx;
         c.xchg_idx  = p.xchg_idx;
         c.ln.upload_program(p);
         printf("  gpu %d: packed %zu instrs (%zu FATTN, %zu XCHG_REDUCE), kernel launched\n",
@@ -1760,10 +1751,10 @@ static int parity_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
 
     // prefill: one pass per prompt token
     for (size_t i = 0; i < prompt.arr.size(); i++, pos++) {
-        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, (int32_t) prompt.arr[i].as_i(), (uint32_t) nkv, pass, 60000.0))
+        if (!dual_run_pass(g2, (int32_t) prompt.arr[i].as_i(), pass, 60000.0))
             return 3;
     }
     gather_logits();
@@ -1772,10 +1763,10 @@ static int parity_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
     for (int s = 0; s < steps; s++, pos++) {
         int32_t tok = argmax_f32_first(logits);
         emitted.push_back(tok);
-        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, tok, (uint32_t) nkv, pass, 60000.0)) return 3;
+        if (!dual_run_pass(g2, tok, pass, 60000.0)) return 3;
         gather_logits();
         dump.add_logits_row(logits);
 
@@ -1824,30 +1815,57 @@ static int parity_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
     return 0;
 }
 
-// -- tensor bench: the real dual-GPU decode floor ----------------------------
+// Resident set size of this process (MB), for the soak leak watermark.
+static double rss_mb() {
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return 0.0;
+    long total_pages = 0, rss_pages = 0;
+    if (fscanf(f, "%ld %ld", &total_pages, &rss_pages) != 2) rss_pages = 0;
+    fclose(f);
+    return rss_pages * (double)(sysconf(_SC_PAGESIZE)) / 1e6;
+}
+
+// One watermark line: free VRAM on each GPU + host RSS. A persistent-kernel
+// leak shows as any of these drifting monotonically over the soak.
+static void watermark(GpuCtx g2[2], const char *tag, int64_t pos) {
+    size_t f0 = 0, f1 = 0, tt = 0;
+    cudaSetDevice(g2[0].device); cudaMemGetInfo(&f0, &tt);
+    cudaSetDevice(g2[1].device); cudaMemGetInfo(&f1, &tt);
+    printf("watermark %-6s pos %8lld: gpu0 free %.1f MB, gpu1 free %.1f MB, host RSS %.1f MB\n",
+           tag, (long long) pos, f0 / 1e6, f1 / 1e6, rss_mb());
+    fflush(stdout);
+}
+
+// -- tensor bench / soak: dual-GPU decode floor + leak watermark --------------
+// pos0 seeds the starting decode position; at pos0 near n_ctx the KV read (~8.6
+// GB/GPU) dominates, giving the true deep-context floor. Long n_tokens with the
+// periodic watermark is the 256K soak (device-free + RSS must be flat).
 static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
-                            int64_t n_vocab, int64_t n_tokens) {
+                            int64_t n_vocab, int64_t n_tokens, int64_t pos0) {
     GpuCtx g2[2];
     dual_setup(g2, gg, program, n_ctx, n_vocab);
     const int WARMUP = 32;
-    if ((int64_t) WARMUP + n_tokens > n_ctx)
-        throw std::runtime_error("warmup + N exceed --n-ctx");
-    printf("bench-tensor: %d warmup + %lld timed dual-GPU decode passes\n",
-           WARMUP, (long long) n_tokens);
-    int64_t pos = 0;
+    if (pos0 + (int64_t) WARMUP + n_tokens > n_ctx)
+        throw std::runtime_error("pos0 + warmup + N exceed --n-ctx");
+    printf("bench-tensor: %d warmup + %lld timed dual-GPU decode passes from pos0 %lld\n",
+           WARMUP, (long long) n_tokens, (long long) pos0);
+    int64_t pos = pos0;
     unsigned pass = 0;
     for (int i = 0; i < WARMUP; i++, pos++) {
-        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, 11, (uint32_t) nkv, pass, 60000.0)) return 3;
+        if (!dual_run_pass(g2, 11, pass, 60000.0)) return 3;
     }
+    watermark(g2, "warmed", pos);
+    const int64_t sample_every = n_tokens > 20 ? n_tokens / 20 : 1;
     auto t0 = std::chrono::steady_clock::now();
     for (int64_t i = 0; i < n_tokens; i++, pos++) {
-        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, 11, (uint32_t) nkv, pass, 60000.0)) return 3;
+        if (!dual_run_pass(g2, 11, pass, 60000.0)) return 3;
+        if ((i + 1) % sample_every == 0) watermark(g2, "soak", pos);
     }
     auto t1 = std::chrono::steady_clock::now();
     double sec = std::chrono::duration<double>(t1 - t0).count();
@@ -1891,7 +1909,7 @@ int main(int argc, char **argv) {
     std::string model = "/opt/models/Qwen3.6-27B-Q4_0AR16-b9222.gguf";
     std::string program_path;
     std::string parity_ref, out_dir, diag_out;
-    int64_t n_ctx = 8192, bench_n = -1;
+    int64_t n_ctx = 8192, bench_n = -1, bench_pos0 = 0;
     int gpu = 0;
     enum { M_VALIDATE, M_PARITY, M_BENCH, M_PARITY_TENSOR, M_BENCH_TENSOR } mode = M_VALIDATE;
 
@@ -1911,6 +1929,7 @@ int main(int argc, char **argv) {
         else if (a == "--out")     out_dir = need("dump dir");
         else if (a == "--diag")    diag_out = need("diag out file");
         else if (a == "--n-ctx")   n_ctx = strtoll(need("context size"), nullptr, 10);
+        else if (a == "--pos0")    bench_pos0 = strtoll(need("start decode position"), nullptr, 10);
         else if (a == "--gpu")     gpu = atoi(need("device index"));
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -1960,9 +1979,9 @@ int main(int argc, char **argv) {
             if (!diag_out.empty()) {   // 1-pass pos-0 residual bisect (dual)
                 GpuCtx g2[2];
                 dual_setup(g2, res.gg, program, n_ctx, res.n_vocab);
-                int64_t nkv = gpu_set_inputs(g2[0], 0);
+                gpu_set_inputs(g2[0], 0);
                 gpu_set_inputs(g2[1], 0);
-                if (!dual_run_pass(g2, 11, (uint32_t) nkv, 1, 60000.0)) return 3;
+                if (!dual_run_pass(g2, 11, 1, 60000.0)) return 3;
                 std::vector<float> lout, lout1, lmid, lo0, lo1;
                 gpu_read_f32(g2[0], "dbg_lout", lout, (size_t) N_LOUT * N_EMBD);
                 gpu_read_f32(g2[1], "dbg_lout", lout1, (size_t) N_LOUT * N_EMBD);
@@ -1988,7 +2007,7 @@ int main(int argc, char **argv) {
                     out_dir = "/var/tmp/mk-harness/cand-tensor-" + basename_of(parity_ref);
                 rc = parity_run_tensor(res.gg, program, n_ctx, res.n_vocab, parity_ref, out_dir);
             } else {
-                rc = bench_run_tensor(res.gg, program, n_ctx, res.n_vocab, bench_n);
+                rc = bench_run_tensor(res.gg, program, n_ctx, res.n_vocab, bench_n, bench_pos0);
             }
             return rc;
         }
@@ -2059,7 +2078,7 @@ int main(int argc, char **argv) {
         if (have_program && mode != M_VALIDATE) {
             packed = pack_program(program, R);
             if (packed.complete) {
-                printf("pack: %zu instrs packed (%zu FATTN_DECODE need $n_kv patched)\n",
+                printf("pack: %zu instrs packed (%zu FATTN_DECODE ops, n_kv via cell)\n",
                        packed.instrs.size(), packed.fattn_idx.size());
                 ln.upload_program(packed);
                 printf("pack: program uploaded + cooperative kernel launched "
@@ -2095,8 +2114,7 @@ int main(int argc, char **argv) {
         }
 
         if (!diag_out.empty()) {   // 1-pass pos-0 residual bisect (single GPU)
-            int64_t nkv = rt.set_pass_inputs(0);
-            ln.patch_n_kv((uint32_t) nkv);
+            rt.set_pass_inputs(0);
             if (!ln.run_pass(11)) return 3;
             std::vector<float> lout, lmid, logits;
             rt.read_f32("dbg_lout", lout, (size_t) N_LOUT * N_EMBD);

@@ -615,14 +615,14 @@ def emit_attn_block(bi, pending_add):
     W(I("OP_FATTN_DECODE", fprep + fdec,
         {"q": "buf:fattn_q", "cache_k": "cache:" + caches["k"],
          "cache_v": "cache:" + caches["v"], "mask": "cell:mask_f16",
-         "n_kv": "sym:$n_kv", "q_heads": sp(ATTN_Q_HEADS),
+         "n_kv": "cell:n_kv", "q_heads": sp(ATTN_Q_HEADS),
          "kv_heads": sp(ATTN_KV_HEADS),
          "gqa": sp(ATTN_Q_HEADS) // sp(ATTN_KV_HEADS),
          "head_dim": ATTN_HEAD_DIM, "scale": 0.0625, "prec": "f32",
          "partials": "buf:fattn_partial",
          "partial_layout": "[split][q_head][256 vkq | max | sumexp]"},
         est=64 << 20,
-        reads={"fattn_q", caches["k"], caches["v"], "mask_f16"},
+        reads={"fattn_q", caches["k"], caches["v"], "mask_f16", "n_kv"},
         writes={"fattn_partial"}))
     i_red = I("OP_FATTN_REDUCE", [],
               {"partials": "buf:fattn_partial", "n_splits": GRID,
@@ -834,7 +834,7 @@ program = {
                         "(SCHEDULE-QUESTIONS items 14/15, a design decision "
                         "the capture alone does not prove safe)",
             "mask": "the f32->f16 mask conversion (n219) is host-side: the "
-                    "harness writes cell:mask_f16 (0 / -inf, width $n_kv) "
+                    "harness writes cell:mask_f16 (0 / -inf, width n_kv) "
                     "directly; the f32 mask leaf l65 is not materialized",
             "q_heads": "24 q-heads x 4 kv-heads, head_dim 256 (measured, "
                        "QUESTIONS item 1; the briefed 32 is wrong)",
@@ -890,9 +890,6 @@ program = {
                      "payload per pass",
         },
         "runtime_symbols": {
-            "$n_kv": "current KV window length, padded to a multiple of 256 "
-                     "(the mask width and FATTN row window are per-pass "
-                     "dynamic; host patches OP_FATTN_DECODE payloads)",
             "$kv_row": "destination cache row for this token's KV append "
                        "(i64; one value, shared by all 16 attention layers)",
             "$rs_row": "recurrent-state row for the active sequence (i32; "
@@ -907,7 +904,11 @@ program = {
         "input_cells": {
             "token": "i32[1] token id",
             "positions": "i32[4] M-RoPE position ids for this token",
-            "mask_f16": "f16[$n_kv] KQ mask, 0 attend / -inf masked, "
+            "n_kv": "u32[1] current KV window length, padded to a multiple of "
+                    "256; host-written once per pass, read STRONG (.cg) by "
+                    "OP_FATTN_DECODE so a deep-context change is never a stale "
+                    "cached-payload read",
+            "mask_f16": "f16[n_kv] KQ mask, 0 attend / -inf masked, "
                         "host-written",
             "result_output": "f32[248320] logits out (host-visible)",
             "done_flag": "host completion flag set by OP_LOGITS_EMIT",

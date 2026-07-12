@@ -242,15 +242,18 @@ __device__ inline void op_kv_append(const Instr &ins, char *) {
 // skipped entirely).
 
 struct FattnDecodeArgs {
-    const float *q;         // [n_q][256] roped q, unscaled (strong reads)
-    const half  *k_cache;   // dense rows of row_width f16 (strong reads)
-    const half  *v_cache;   // dense rows of row_width f16 (strong reads)
-    const half  *mask;      // [n_kv] f16, 0 / -inf (strong reads)
-    float       *partials;  // [n_q][n_chunks][MK_FATTN_PSTRIDE]
-    uint32_t     n_kv;      // padded KV length (multiple of 256)
-    uint32_t     n_q;       // local q heads (12)
-    uint32_t     n_kv_heads;// local kv heads (2); gqa = n_q / n_kv_heads
-    uint32_t     row_width; // f16 elems per cache row (512)
+    const float    *q;         // [n_q][256] roped q, unscaled (strong reads)
+    const half     *k_cache;   // dense rows of row_width f16 (strong reads)
+    const half     *v_cache;   // dense rows of row_width f16 (strong reads)
+    const half     *mask;      // [n_kv] f16, 0 / -inf (strong reads)
+    float          *partials;  // [n_q][n_chunks][MK_FATTN_PSTRIDE]
+    const uint32_t *n_kv_cell;  // device cell: padded KV length (multiple of 256),
+                                // host-written once per pass, read STRONG (.cg).
+                                // The payload pointer is immutable (pack-time);
+                                // only the CELL varies per pass — like `mask`.
+    uint32_t        n_q;       // local q heads (12)
+    uint32_t        n_kv_heads;// local kv heads (2); gqa = n_q / n_kv_heads
+    uint32_t        row_width; // f16 elems per cache row (512)
 };
 static_assert(sizeof(FattnDecodeArgs) <= 112, "payload overflow");
 
@@ -279,6 +282,10 @@ __device__ inline void mk_load_kv_slice(const half *cache, half *tile, uint32_t 
 
 __device__ inline void op_fattn_decode(const Instr &ins, char *smem) {
     const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
+    // n_kv changes every 256 tokens at deep context; the persistent kernel's L1
+    // is incoherent across passes, so a plain read of a per-pass-patched payload
+    // could return a stale window. Read it STRONG from the host-written cell.
+    const uint32_t n_kv = ld_cg(reinterpret_cast<const unsigned *>(a.n_kv_cell));
     const int nchunks = ins.block_hi - ins.block_lo;
     const int chunk   = blockIdx.x - ins.block_lo;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -296,10 +303,10 @@ __device__ inline void op_fattn_decode(const Instr &ins, char *smem) {
     // 32-aligned chunk boundaries (NOTES-attn.md / COMPILER.md): clen rounded
     // up to a multiple of the tile so kv0 = chunk*clen is 32-aligned and the
     // packed 2-f16 mask word read never faults. Trailing chunks fall empty.
-    uint32_t clen = (a.n_kv + nchunks - 1) / nchunks;
+    uint32_t clen = (n_kv + nchunks - 1) / nchunks;
     clen = (clen + MK_FATTN_TILE - 1) / MK_FATTN_TILE * MK_FATTN_TILE;
-    const uint32_t kv0  = min((uint32_t)(chunk * clen), a.n_kv);
-    const uint32_t kv1  = min(kv0 + clen, a.n_kv);
+    const uint32_t kv0  = min((uint32_t)(chunk * clen), n_kv);
+    const uint32_t kv1  = min(kv0 + clen, n_kv);
 
     // Q pre-scaled exactly like the fork (fattn-mma-f16.cuh:1230), kept f32
     // (the graph pins GGML_PREC_F32 on FLASH_ATTN_EXT). All n_q heads staged.

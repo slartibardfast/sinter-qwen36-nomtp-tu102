@@ -460,9 +460,12 @@ static void test_fattn_case(int n_q, int n_kv_heads, int real_kv, int n_kv,
     float *d_dst = dalloc((size_t) n_q * HD);
     unsigned *d_err; CUDA_CHECK(cudaMalloc(&d_err, sizeof(unsigned)));
     CUDA_CHECK(cudaMemset(d_err, 0, sizeof(unsigned)));
+    uint32_t *d_nkv; CUDA_CHECK(cudaMalloc(&d_nkv, sizeof(uint32_t)));
+    uint32_t nkv_u = (uint32_t) n_kv;
+    CUDA_CHECK(cudaMemcpy(d_nkv, &nkv_u, sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    mk::FattnDecodeArgs dec = {d_q, d_kc, d_vc, d_mask, d_part,
-                               (uint32_t) n_kv, (uint32_t) n_q,
+    mk::FattnDecodeArgs dec = {d_q, d_kc, d_vc, d_mask, d_part, d_nkv,
+                               (uint32_t) n_q,
                                (uint32_t) n_kv_heads, (uint32_t) row_width};
     const int nb_red = (n_q < NBLK) ? n_q : NBLK;
     mk::FattnReduceArgs red = {d_part, d_dst, d_err, (uint32_t) n_q, (uint32_t) nchunks};
@@ -489,7 +492,7 @@ static void test_fattn_case(int n_q, int n_kv_heads, int real_kv, int n_kv,
 
     CUDA_CHECK(cudaFree(d_kc)); CUDA_CHECK(cudaFree(d_vc)); CUDA_CHECK(cudaFree(d_mask));
     CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_part));
-    CUDA_CHECK(cudaFree(d_dst)); CUDA_CHECK(cudaFree(d_err));
+    CUDA_CHECK(cudaFree(d_dst)); CUDA_CHECK(cudaFree(d_err)); CUDA_CHECK(cudaFree(d_nkv));
 }
 
 static void test_fattn() {
@@ -610,9 +613,12 @@ static void bench_fattn_kv_bw(int n_sm) {
     float *d_q = dalloc(q.size()); up(d_q, q.data(), q.size());
     const size_t np = (size_t) n_q * nchunks * mk::MK_FATTN_PSTRIDE;
     float *d_part = dalloc(np);
+    uint32_t *d_nkv; CUDA_CHECK(cudaMalloc(&d_nkv, sizeof(uint32_t)));
+    uint32_t nkv_u = (uint32_t) n_kv;
+    CUDA_CHECK(cudaMemcpy(d_nkv, &nkv_u, sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    mk::FattnDecodeArgs dec = {d_q, d_kc, d_vc, d_mask, d_part,
-                               (uint32_t) n_kv, (uint32_t) n_q,
+    mk::FattnDecodeArgs dec = {d_q, d_kc, d_vc, d_mask, d_part, d_nkv,
+                               (uint32_t) n_q,
                                (uint32_t) n_kv_heads, (uint32_t) row_width};
     std::vector<mk::Instr> prog = {make_instr(mk::OP_FATTN_DECODE, 0, (uint16_t) nchunks, dec)};
     mk::Instr *d_prog; CUDA_CHECK(cudaMalloc(&d_prog, prog.size() * sizeof(mk::Instr)));
@@ -636,6 +642,7 @@ static void bench_fattn_kv_bw(int n_sm) {
     cudaEventDestroy(a); cudaEventDestroy(b);
     CUDA_CHECK(cudaFree(d_kc)); CUDA_CHECK(cudaFree(d_vc)); CUDA_CHECK(cudaFree(d_mask));
     CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_part)); CUDA_CHECK(cudaFree(d_prog));
+    CUDA_CHECK(cudaFree(d_nkv));
 }
 
 // ---------------------------------------------------------------------------
