@@ -117,14 +117,20 @@ the deep references. Output lanes below; residual-RMS/state are the pending lane
 | depth | logits KL (tol 0.02) | greedy tokens | verdict (output) |
 |---|---|---|---|
 | 4K  | 5.90e-4 | 8/8 | PASS |
-| 64K | (background run) | | pending |
+| 64K | **2.19e-5** | 8/8 | **PASS** |
 | 256K| proxy-validated | | see note |
+
+64K PASS at KL **2.19e-5** (tighter than 4K — after a 64K prefill the 8
+measured decode steps carry almost no recurrent drift and the KV is dominated
+by the identically-built prefix; the n_kv .cg fix sweeps 256 padding classes
+over the 64K prefill). Two depths of DIRECT deep parity now confirm the
+decode path; only the literal 256K number remains runtime-bound.
 
 **Deep-parity methodology limit (honest).** The megakernel is a *decode*
 engine: it prefills one decode pass per token (~30–60 ms each, rising with
 n_kv), because it cannot batch prefill the way the stock oracle does
 (2048-token chunks). So a token-exact parity run must decode the entire
-prefix: 4K ≈ 2 min (done, PASS), **64K ≈ 40 min** (running in the
+prefix: 4K ~2 min and 64K ~30 min (both done, PASS), **64K ≈ 40 min** (running in the
 background), **256K ≈ several hours** (impractical to gate on).
 
 The 256K decode-path correctness is instead validated by proxy, and the
