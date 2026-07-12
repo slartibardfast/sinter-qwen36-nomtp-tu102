@@ -147,7 +147,9 @@ def insts(blk, kind, want=None):
 # ---------------------------------------------------------------- scratch buffers
 Q8_ELEMS = N_FF                       # largest quantized activation vector
 Q8_BYTES = Q8_ELEMS // 32 * 36        # q8_1: 36 B per 32-element block
-FATTN_PARTIAL_ELEMS = GRID * ATTN_Q_HEADS * (ATTN_HEAD_DIM + 2)
+# pstride 260 = 256 vkq + max + sumexp + 2 pad (16 B record alignment,
+# MK_FATTN_PSTRIDE in k0/ops/attn.cuh); the buffer must match the op's stride.
+FATTN_PARTIAL_ELEMS = GRID * ATTN_Q_HEADS * (ATTN_HEAD_DIM + 4)
 
 BUFFERS = [
     ("residual", "f32", N_EMBD, "the residual trunk x"),

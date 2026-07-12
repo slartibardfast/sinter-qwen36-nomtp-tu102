@@ -376,10 +376,12 @@ static void test_kv_append() {
 // OP_FATTN_DECODE + OP_FATTN_REDUCE: direct flash-attention reference in
 // double over the shared f16 K/V. q pre-scaled by MK_ATTN_SCALE, mask added
 // (0 attend / -inf masked), stable softmax, rowsum divide.
-static unsigned fattn_smem_bytes(uint32_t n_q, uint32_t row_width) {
-    const uint32_t row_p = row_width + 2;
-    return (unsigned)(n_q * HD * sizeof(float)          // q_s
-                      + mk::MK_FATTN_TILE * row_p * sizeof(__half) // KV tile
+static unsigned fattn_smem_bytes(uint32_t n_q, uint32_t /*row_width*/) {
+    // tile is one kv head's 256-wide slice (HD+2 pitch), independent of the
+    // physical cache row_width (the op loops kv heads on the outer axis).
+    const uint32_t row_p = HD + 2;
+    return (unsigned)(n_q * HD * sizeof(float)          // q_s (all heads)
+                      + mk::MK_FATTN_TILE * row_p * sizeof(__half) // KV slice tile
                       + mk::MK_FATTN_TILE * sizeof(__half));       // mask tile
 }
 
@@ -498,6 +500,12 @@ static void test_fattn() {
     // single-kv-head variant (gqa still 6), a different row_width (256):
     test_fattn_case(6, 1, 256, 256, 4, "fattn 1kvhead 4chunk");
     test_fattn_case(6, 1, 500, 512, 8, "fattn 1kvhead pad500");
+    // single-GPU shape: 24 q / 4 kv (gqa 6), row_width 1024 — the shape the
+    // k=0 harness drives (n_q > warps/block AND a full-row tile would overflow
+    // the slab; the kv-head outer loop handles both). nchunks <= NBLK (the
+    // mini-interpreter grid) so every chunk's block exists.
+    test_fattn_case(24, 4, 256, 256, 8, "fattn 24q4kv 8chunk");
+    test_fattn_case(24, 4, 700, 768, 8, "fattn 24q4kv pad700");
 }
 
 // ---------------------------------------------------------------------------

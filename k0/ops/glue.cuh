@@ -43,6 +43,13 @@ struct RmsnormArgs {
     float *y;          // output row(s); y == x (in place) is allowed
     uint32_t ncols;
     uint32_t nrows;
+    // The pre-norm sum (x + add) is the updated residual trunk. When `add` is
+    // set the schedule folds the previous sublayer's output here, so the sum
+    // must be published: `sum` receives it (the residual write-back, typically
+    // sum == x) and `dbg` mirrors it to the parity residual-stream buffer
+    // (l_out node). Both nullptr => sum not published (the op's plain form).
+    float *sum;
+    float *dbg;
 };
 static_assert(sizeof(RmsnormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -92,9 +99,13 @@ __device__ inline void op_rmsnorm(const Instr &in, char *smem) {
         const float scale = red[0];
         __syncthreads(); // red[] is reused by the next row
 
+        float *sum = a.sum ? a.sum + (size_t)row * a.ncols : nullptr;
+        float *dbg = a.dbg ? a.dbg + (size_t)row * a.ncols : nullptr;
         for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
             float v = ld_cg(x + i);
             if (add) v += ld_cg(add + i);
+            if (sum) sum[i] = v;   // residual trunk write-back (x + add)
+            if (dbg) dbg[i] = v;   // parity residual-stream snapshot (l_out)
             y[i] = scale * v * a.w[i];
         }
     }

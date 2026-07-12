@@ -51,7 +51,9 @@
 //   - blk.64.* (the nextn/MTP head) is enumerated and counted but NOT
 //     uploaded: it is absent from the k=0 decode graph (BLOCKS.md, MTP off).
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +70,11 @@
 #include <cuda_runtime.h>
 
 #include "../core/isa.cuh"
+#include "../core/host.h"          // mk::Host control-plane API (the launcher)
+#include "ops/glue.cuh"            // Args structs for the packer (compiled by nvcc)
+#include "ops/gdn.cuh"
+#include "ops/gemv.cuh"
+#include "ops/attn.cuh"
 #include "gguf.h"
 
 #define CUDA_CHECK(expr) do { \
@@ -453,23 +460,16 @@ struct Residency {
     }
 };
 
-// Per-pass host-visible context, mirrored to the "pass_ctx" device buffer
-// every pass (how ops get per-pass scalars like n_kv that cannot live in
-// the once-packed Instr payloads).
-struct PassCtx {
-    int32_t token;
-    int32_t pos[4];
-    int32_t n_past;
-    int32_t n_kv;
-    int64_t kv_row;
-};
-
 struct Runtime {
     int64_t n_ctx = 8192;
     int64_t n_vocab = 0;
     int64_t mask_cap = 0;   // pad(n_ctx, 256) f16 entries
     std::map<std::string, DevBuf> bufs;
     bool buffer_table_stubbed = false;
+    // Pass-input copies ride a non-blocking stream so they never serialize
+    // against the persistent kernel (which lives on its own non-blocking
+    // stream and never returns); the legacy default stream would be a hazard.
+    cudaStream_t pstream = nullptr;
 
     void *alloc(Resolver &R, const std::string &name, size_t bytes, bool zero = true) {
         void *p = nullptr;
@@ -489,7 +489,10 @@ struct Runtime {
     }
 
     void allocate(Resolver &R, const Jv *program) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&pstream, cudaStreamNonBlocking));
         // KV caches: 16 attention layers, [n_ctx rows x 1024] f16 per K and V.
+        // Zero-filled: padded/unwritten rows read as finite 0.0 f16 (the FATTN
+        // op loads padded rows but the -inf mask zeroes their weight).
         for (int il = 0; il < N_LAYER; il++) {
             if (!is_attn_layer(il)) continue;
             size_t b = (size_t) n_ctx * N_EMBD_GQA * 2;
@@ -502,22 +505,20 @@ struct Runtime {
             alloc(R, "conv_state_l" + std::to_string(il), (size_t) CONV_STATE_N * 4);
             alloc(R, "ssm_state_l" + std::to_string(il), (size_t) SSM_STATE_N * 4);
         }
-        // Per-pass IO.
-        alloc(R, "token_id", 4);
+        // Per-pass IO. cell:token is bound to the Host's d_token elsewhere.
         alloc(R, "positions", 16);          // i32[4] M-RoPE ids, all = seq pos
-        alloc(R, "kv_row", 8);              // i64[1], shared k_idxs/v_idxs
-        alloc(R, "rs_row", 4);              // i32[1] = 0 (ring slot 0)
-        alloc(R, "rs_clear", 4);            // i32[0] clear list (allocated, count 0)
-        alloc(R, "out_row", 4);             // i32[1] = 0 (batch-1)
-        alloc(R, "pass_ctx", sizeof(PassCtx));
+        alloc(R, "kv_row", 8);              // i64[1] KV append row = position
+        alloc(R, "rs_row", 8);              // i64[1] = 0 (single-seq ring slot 0)
         mask_cap = pad_up(n_ctx, 256);
         alloc(R, "mask_f16", (size_t) mask_cap * 2);
-        // "logits" is owned by program.json's buffer table (the lm-head dst);
-        // allocated below from that table, or in the stub branch when absent.
-        alloc(R, "result_norm", (size_t) N_EMBD * 4);
-        // Parity dual-write target: row il = residual after block il
-        // (0..62). The schedule must alias/copy each block's residual add
-        // into this buffer for the parity dump to carry real data.
+        // Output cells the ops write but the harness reads via buf:logits /
+        // the kernel's pass-done: result_output (LOGITS_EMIT copy), done_flag
+        // (op-set flag, unused), fattn_error (FATTN_REDUCE sentinel count).
+        alloc(R, "result_output", (size_t) n_vocab * 4);
+        alloc(R, "done_flag", 4);
+        alloc(R, "fattn_error", 4);
+        // Parity residual-stream buffer: row il = residual after block il
+        // (l_out-il, blocks 0..62), written by each attn_norm RMSNORM's dbg.
         alloc(R, "dbg_lout", (size_t) N_LOUT * N_EMBD * 4);
 
         if (program && program->get("buffers")) {
@@ -536,28 +537,28 @@ struct Runtime {
         }
     }
 
-    void set_pass_inputs(int32_t token, int64_t pos) {
-        int32_t tok = token;
+    // Write positions / kv_row / mask / zero fattn_error for this token; the
+    // token id itself rides host_run_pass -> h.d_token. Returns padded n_kv so
+    // the driver can patch the FATTN_DECODE payloads. All copies land (synced)
+    // before the caller rings the doorbell.
+    int64_t set_pass_inputs(int64_t pos) {
         int32_t p4[4] = { (int32_t) pos, (int32_t) pos, (int32_t) pos, (int32_t) pos };
         int64_t row = pos;
-        CUDA_CHECK(cudaMemcpy(bufs["token_id"].ptr, &tok, 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(bufs["positions"].ptr, p4, 16, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(bufs["kv_row"].ptr, &row, 8, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(bufs["positions"].ptr, p4, 16, cudaMemcpyHostToDevice, pstream));
+        CUDA_CHECK(cudaMemcpyAsync(bufs["kv_row"].ptr, &row, 8, cudaMemcpyHostToDevice, pstream));
         // Mask: n_kv = pad(n_past+1, 256); 0 for j <= n_past, -inf padding tail.
         int64_t n_past = pos;
         int64_t n_kv = pad_up(n_past + 1, 256);
         if (n_kv > mask_cap) throw std::runtime_error("mask: n_kv past n_ctx padding cap");
-        std::vector<uint16_t> mask((size_t) n_kv);
+        static std::vector<uint16_t> mask;
+        mask.resize((size_t) n_kv);
         for (int64_t j = 0; j < n_kv; j++)
             mask[(size_t) j] = j <= n_past ? F16_ZERO : F16_NEG_INF;
-        CUDA_CHECK(cudaMemcpy(bufs["mask_f16"].ptr, mask.data(), (size_t) n_kv * 2, cudaMemcpyHostToDevice));
-        PassCtx ctx{};
-        ctx.token = tok;
-        for (int i = 0; i < 4; i++) ctx.pos[i] = (int32_t) pos;
-        ctx.n_past = (int32_t) n_past;
-        ctx.n_kv = (int32_t) n_kv;
-        ctx.kv_row = row;
-        CUDA_CHECK(cudaMemcpy(bufs["pass_ctx"].ptr, &ctx, sizeof(ctx), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(bufs["mask_f16"].ptr, mask.data(), (size_t) n_kv * 2,
+                                   cudaMemcpyHostToDevice, pstream));
+        CUDA_CHECK(cudaMemsetAsync(bufs["fattn_error"].ptr, 0, 4, pstream));
+        CUDA_CHECK(cudaStreamSynchronize(pstream));
+        return n_kv;
     }
 
     void read_f32(const std::string &name, std::vector<float> &out, size_t n_elems, size_t byte_off = 0) {
@@ -578,27 +579,342 @@ struct Runtime {
 // and point the table entry at it.
 // ---------------------------------------------------------------------------
 
-using PackFn = void (*)(const Jv &args, const Resolver &R, mk::Instr &out);
+// ---- arg accessors + namespace-aware pointer resolution --------------------
+// program.json args carry namespaced names ("gguf:NAME", "buf:NAME",
+// "cell:NAME", "cache:NAME") and runtime symbols ("sym:$NAME"). dev_ptr maps a
+// namespaced name to a device pointer via the Resolver; the resolver is keyed
+// on BARE names (weights by GGUF name, buffers/cells by name, caches under the
+// harness's own cache names), so dev_ptr strips the namespace and applies the
+// cache-name mapping (state_r_l<i> -> conv_state_l<i>, state_s_l<i> ->
+// ssm_state_l<i>). "sym:" is a per-pass scalar and is NOT a pointer.
 
-[[noreturn]] static void stub_fail(const char *kind) {
-    throw std::runtime_error(std::string("packer stub: ") + kind +
-        " — no Args struct (k0/ops/*.cuh absent at harness-writing time); implement pack_" + kind);
+static std::string arg_str(const Jv &a, const char *k) { return a.at(k).str; }
+static int64_t arg_i(const Jv &a, const char *k) { return a.at(k).as_i(); }
+static int64_t arg_i_def(const Jv &a, const char *k, int64_t d) {
+    const Jv *v = a.get(k); return v ? v->as_i() : d;
 }
-#define PACK_STUB(KIND) \
-    static void pack_##KIND(const Jv &, const Resolver &, mk::Instr &) { stub_fail(#KIND); }
+static bool arg_has(const Jv &a, const char *k) { return a.get(k) != nullptr; }
+static bool is_sym(const Jv &a, const char *k) {
+    const Jv *v = a.get(k);
+    return v && v->k == Jv::STR && v->str.rfind("sym:", 0) == 0;
+}
 
-PACK_STUB(EMBED_LOOKUP)     PACK_STUB(RMSNORM)          PACK_STUB(QUANT_Q8_1)
-PACK_STUB(HEAD_GEMV_F16)    PACK_STUB(LOGITS_EMIT)      PACK_STUB(MMVQ_Q4_0)
-PACK_STUB(MMVQ_Q4_0_FUSED)  PACK_STUB(MMVQ_AR16)        PACK_STUB(GEMV_F16)
-PACK_STUB(CONV_SHIFT_CONCAT) PACK_STUB(SSM_CONV_SILU)   PACK_STUB(QK_L2NORM)
-PACK_STUB(GDN_GATES)        PACK_STUB(GDN_STEP)         PACK_STUB(GATED_RMSNORM)
-PACK_STUB(QK_NORM_ROPE)     PACK_STUB(KV_APPEND)        PACK_STUB(FATTN_DECODE)
-PACK_STUB(FATTN_REDUCE)     PACK_STUB(ATTN_GATE)        PACK_STUB(RESIDUAL_ADD)
-PACK_STUB(STATE_LOAD)       PACK_STUB(STATE_STORE)      PACK_STUB(XCHG_PUSH)
-PACK_STUB(XCHG_REDUCE)
+static void *dev_ptr(const Resolver &R, const std::string &spec) {
+    size_t colon = spec.find(':');
+    if (colon == std::string::npos) return R.resolve(spec);
+    std::string ns = spec.substr(0, colon), name = spec.substr(colon + 1);
+    if (ns == "sym")
+        throw std::runtime_error("dev_ptr: '" + spec + "' is a runtime symbol, not a pointer");
+    if (ns == "cache") {
+        if (name.rfind("state_r_l", 0) == 0) name = "conv_state_l" + name.substr(9);
+        else if (name.rfind("state_s_l", 0) == 0) name = "ssm_state_l" + name.substr(9);
+        // cache_k_l<i>/cache_v_l<i> pass through to the harness's own names
+    }
+    return R.resolve(name);           // gguf/buf/cell/cache resolve by bare name
+}
+// buffer/weight base + element offset (offsets in program.json are f32 elems).
+static float *dev_f32(const Resolver &R, const Jv &a, const char *k, int64_t off_elems = 0) {
+    return reinterpret_cast<float *>(dev_ptr(R, arg_str(a, k))) + off_elems;
+}
 
-static void pack_NOP(const Jv &, const Resolver &, mk::Instr &) {}
-static void pack_BOUNDARY(const Jv &, const Resolver &, mk::Instr &) {}
+// Everything a pack fn needs: the resolver, the proto instruction (kind /
+// block range / flags / dbg_node prefilled), and a hook to record the emitted
+// FATTN_DECODE positions so the per-pass driver can patch their $n_kv field.
+struct PackCtx {
+    const Resolver &R;
+    const mk::Instr &proto;
+    std::vector<size_t> &out_idx_fattn;  // indices (into `out`) of FATTN_DECODEs
+};
+
+template <class Args>
+static mk::Instr with_payload(const mk::Instr &proto, const Args &args) {
+    static_assert(sizeof(Args) <= sizeof(proto.payload), "payload overflow");
+    mk::Instr ins = proto;
+    memset(ins.payload, 0, sizeof(ins.payload));
+    memcpy(ins.payload, &args, sizeof(Args));
+    return ins;
+}
+template <class Args>
+static void emit(std::vector<mk::Instr> &out, const mk::Instr &proto, const Args &args) {
+    out.push_back(with_payload(proto, args));
+}
+
+// l_out node index for a residual-fold RMSNORM: block M's attn_norm folds
+// block (M-1)'s FFN output, so residual after it is l_out-(M-1). Returns -1
+// for the first norm (no fold), post_attention_norm folds, and output_norm.
+static int lout_index_of(const Jv &a) {
+    if (!arg_has(a, "add_src")) return -1;
+    const std::string w = arg_str(a, "weight");         // "gguf:blk.M.attn_norm.weight"
+    size_t b = w.find("blk.");
+    if (b == std::string::npos) return -1;               // output_norm: no l_out
+    if (w.find(".attn_norm.weight") == std::string::npos) return -1; // post_attention: no l_out
+    int m = atoi(w.c_str() + b + 4);
+    return m - 1;                                         // blk.1 -> l_out-0
+}
+
+using PackFn = void (*)(const Jv &args, PackCtx &c, std::vector<mk::Instr> &out);
+
+static void pack_NOP(const Jv &, PackCtx &c, std::vector<mk::Instr> &out) { out.push_back(c.proto); }
+static void pack_BOUNDARY(const Jv &, PackCtx &c, std::vector<mk::Instr> &out) { out.push_back(c.proto); }
+
+static void pack_EMBED_LOOKUP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::EmbedLookupArgs e{};
+    e.emb        = reinterpret_cast<const __half *>(dev_ptr(c.R, arg_str(a, "weight")));
+    e.token      = reinterpret_cast<const int32_t *>(dev_ptr(c.R, arg_str(a, "token")));
+    e.y          = dev_f32(c.R, a, "dst");
+    e.ncols      = (uint32_t) arg_i(a, "n_embd");
+    e.row_stride = e.ncols;
+    emit(out, c.proto, e);
+}
+
+static void pack_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::RmsnormArgs r{};
+    r.x     = dev_f32(c.R, a, "src");
+    r.w     = dev_f32(c.R, a, "weight");
+    r.add   = arg_has(a, "add_src") ? dev_f32(c.R, a, "add_src") : nullptr;
+    r.y     = dev_f32(c.R, a, "dst");
+    r.ncols = (uint32_t) arg_i(a, "width");
+    r.nrows = 1;                                     // batch-1 trunk (row_select = 0)
+    r.sum   = arg_has(a, "write_sum") ? dev_f32(c.R, a, "write_sum") : nullptr;
+    int il  = lout_index_of(a);
+    r.dbg   = il >= 0 ? reinterpret_cast<float *>(c.R.resolve("dbg_lout")) + (size_t) il * N_EMBD
+                      : nullptr;
+    emit(out, c.proto, r);
+}
+
+static void pack_QUANT_Q8_1(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::QuantQ8_1Args q{};
+    q.x          = dev_f32(c.R, a, "src");
+    q.y          = dev_ptr(c.R, arg_str(a, "dst"));
+    q.ne00       = (uint32_t) arg_i(a, "elems");
+    q.ne0_padded = (uint32_t) pad_up(q.ne00, 512);  // MATRIX_ROW_PADDING
+    emit(out, c.proto, q);
+}
+
+static void pack_gemv_f16_common(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out,
+                                 uint32_t ncols_default) {
+    mk::GemvF16Args g{};
+    g.w      = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "weight")));
+    g.x      = dev_f32(c.R, a, "src");
+    g.dst    = dev_f32(c.R, a, "dst");
+    g.ncols  = (uint32_t) arg_i_def(a, "src_elems", ncols_default);
+    g.row_lo = (uint32_t) arg_i(a, "row_lo");
+    g.row_hi = (uint32_t) arg_i(a, "row_hi");
+    emit(out, c.proto, g);
+}
+static void pack_GEMV_F16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    pack_gemv_f16_common(a, c, out, N_EMBD);
+}
+static void pack_HEAD_GEMV_F16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    pack_gemv_f16_common(a, c, out, N_EMBD);       // src = xn (5120), no src_elems arg
+}
+
+static void pack_MMVQ_Q4_0(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::MmvqQ40Args m{};
+    m.w      = dev_ptr(c.R, arg_str(a, "weight"));
+    m.y      = dev_ptr(c.R, arg_str(a, "src"));
+    m.dst    = dev_f32(c.R, a, "dst", arg_i_def(a, "dst_off", 0));
+    m.ncols  = (uint32_t) arg_i(a, "src_elems");
+    m.row_lo = (uint32_t) arg_i(a, "row_lo");
+    m.row_hi = (uint32_t) arg_i(a, "row_hi");
+    emit(out, c.proto, m);
+}
+static void pack_MMVQ_Q4_0_FUSED(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::MmvqQ40FusedArgs m{};
+    m.w_up   = dev_ptr(c.R, arg_str(a, "weight_up"));
+    m.w_gate = dev_ptr(c.R, arg_str(a, "weight_gate"));
+    m.y      = dev_ptr(c.R, arg_str(a, "src"));
+    m.dst    = dev_f32(c.R, a, "dst");
+    m.ncols  = (uint32_t) arg_i(a, "src_elems");
+    m.row_lo = (uint32_t) arg_i(a, "row_lo");
+    m.row_hi = (uint32_t) arg_i(a, "row_hi");
+    emit(out, c.proto, m);
+}
+static void pack_MMVQ_AR16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::MmvqAr16Args m{};
+    m.w      = dev_ptr(c.R, arg_str(a, "weight"));
+    m.y      = dev_ptr(c.R, arg_str(a, "src"));
+    m.dst    = dev_f32(c.R, a, "dst", arg_i_def(a, "dst_off", 0));
+    m.ncols  = (uint32_t) arg_i(a, "src_elems");
+    m.row_lo = (uint32_t) arg_i(a, "row_lo");
+    m.row_hi = (uint32_t) arg_i(a, "row_hi");
+    emit(out, c.proto, m);
+}
+
+static void pack_CONV_SHIFT_CONCAT(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::ConvShiftConcatArgs s{};
+    // rs_row is always 0 (single sequence), so the history row = cache base.
+    s.hist       = dev_f32(c.R, a, "conv_state");
+    s.xnew       = dev_f32(c.R, a, "token_col");
+    s.win        = dev_f32(c.R, a, "window_dst");
+    s.state      = dev_f32(c.R, a, "state_writeback");
+    s.row        = reinterpret_cast<const int64_t *>(dev_ptr(c.R, "rs_row"));
+    s.channels   = (int32_t) arg_i(a, "channels");
+    s.row_stride = (int64_t) CONV_STATE_N;          // one conv-cache row
+    emit(out, c.proto, s);
+}
+static void pack_SSM_CONV_SILU(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::SsmConvSiluArgs s{};
+    s.win      = dev_f32(c.R, a, "window");
+    s.weight   = dev_f32(c.R, a, "kernel");
+    s.dst      = dev_f32(c.R, a, "dst");
+    s.channels = (int32_t) arg_i(a, "channels");
+    emit(out, c.proto, s);
+}
+static void pack_QK_L2NORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    // q at q_off and k at k_off are contiguous 128-wide heads: normalize both
+    // in one call (per-head l2 norm is independent). Assert contiguity.
+    const int64_t q_off = arg_i(a, "q_off"), k_off = arg_i(a, "k_off");
+    const int64_t heads = arg_i(a, "heads"), hd = arg_i(a, "head_dim");
+    if (k_off != q_off + heads * hd)
+        throw std::runtime_error("QK_L2NORM: q|k not contiguous");
+    mk::QkL2NormArgs n{};
+    n.src     = dev_f32(c.R, a, "buf", q_off);
+    n.dst     = dev_f32(c.R, a, "buf", q_off);   // in place
+    n.n_heads = (int32_t)(2 * heads);
+    n.eps     = (float) a.at("eps").num;
+    emit(out, c.proto, n);
+}
+static void pack_GDN_GATES(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::GdnGatesArgs g{};
+    g.alpha_raw = dev_f32(c.R, a, "alpha");
+    g.beta_raw  = dev_f32(c.R, a, "beta");
+    g.dt_bias   = dev_f32(c.R, a, "dt_bias");
+    g.a         = dev_f32(c.R, a, "a");
+    g.g         = dev_f32(c.R, a, "g_dst");
+    g.beta      = dev_f32(c.R, a, "beta_dst");
+    g.n_heads   = (int32_t) arg_i(a, "heads");
+    emit(out, c.proto, g);
+}
+static void pack_GDN_STEP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::GdnStepArgs s{};
+    s.q         = dev_f32(c.R, a, "qkv", arg_i(a, "q_off"));
+    s.k         = dev_f32(c.R, a, "qkv", arg_i(a, "k_off"));
+    s.v         = dev_f32(c.R, a, "qkv", arg_i(a, "v_off"));
+    s.g         = dev_f32(c.R, a, "g");
+    s.beta      = dev_f32(c.R, a, "beta");
+    s.state_in  = dev_f32(c.R, a, "state");
+    s.state_out = dev_f32(c.R, a, "state");   // in place (may alias state_in)
+    s.attn_out  = dev_f32(c.R, a, "dst");
+    s.n_heads   = (int32_t) arg_i(a, "v_heads");
+    s.n_k_heads = (int32_t) arg_i(a, "k_heads");
+    s.scale     = (float) a.at("scale").num;
+    emit(out, c.proto, s);
+}
+static void pack_GATED_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::GatedRmsNormArgs g{};
+    g.x       = dev_f32(c.R, a, "src");
+    g.w       = dev_f32(c.R, a, "weight");
+    g.z       = dev_f32(c.R, a, "gate");
+    g.dst     = dev_f32(c.R, a, "dst");
+    g.n_heads = (int32_t) arg_i(a, "heads");
+    g.eps     = (float) a.at("eps").num;
+    emit(out, c.proto, g);
+}
+static void pack_STATE_LOAD(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::StateLoadArgs s{};
+    s.src        = dev_f32(c.R, a, "src");
+    s.rows       = reinterpret_cast<const int64_t *>(dev_ptr(c.R, "rs_row"));
+    s.dst        = dev_f32(c.R, a, "dst");
+    s.n_elems    = (int32_t) arg_i(a, "elems");
+    s.row_stride = (int64_t) s.n_elems;
+    s.n_rows     = 1;
+    emit(out, c.proto, s);
+}
+static void pack_STATE_STORE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::StateStoreArgs s{};
+    s.src        = dev_f32(c.R, a, "src");
+    s.dst        = dev_f32(c.R, a, "dst");
+    s.rows       = reinterpret_cast<const int64_t *>(dev_ptr(c.R, "rs_row"));
+    s.n_elems    = (int32_t) arg_i(a, "elems");
+    s.row_stride = (int64_t) s.n_elems;
+    s.n_rows     = 1;
+    emit(out, c.proto, s);
+}
+
+static void pack_QK_NORM_ROPE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    // program.json fuses the q and k norm+rope into one node; the op does one
+    // tensor, so emit two independent instructions (disjoint writes, no
+    // boundary needed between them).
+    const int32_t *pos = reinterpret_cast<const int32_t *>(dev_ptr(c.R, arg_str(a, "positions")));
+    mk::QkNormRopeArgs q{};
+    q.src        = dev_f32(c.R, a, "q_src", arg_i_def(a, "q_off", 0));
+    q.norm_w     = dev_f32(c.R, a, "q_norm_weight");
+    q.pos        = pos;
+    q.dst        = dev_f32(c.R, a, "q_dst");
+    q.n_heads    = (uint32_t) arg_i(a, "q_heads");
+    q.src_stride = (uint32_t) arg_i(a, "q_head_stride");
+    emit(out, c.proto, q);
+
+    mk::QkNormRopeArgs k{};
+    k.src        = dev_f32(c.R, a, "k_src");
+    k.norm_w     = dev_f32(c.R, a, "k_norm_weight");
+    k.pos        = pos;
+    k.dst        = dev_f32(c.R, a, "k_dst");
+    k.n_heads    = (uint32_t) arg_i(a, "k_heads");
+    k.src_stride = (uint32_t) arg_i(a, "head_dim");   // k rows are dense (256)
+    emit(out, c.proto, k);
+}
+static void pack_KV_APPEND(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    // K and V SET_ROWS as two independent instructions (one cache each).
+    const long long *row = reinterpret_cast<const long long *>(dev_ptr(c.R, "kv_row"));
+    const uint32_t rw = (uint32_t) arg_i(a, "row_width");
+    mk::KvAppendArgs kk{};
+    kk.src = dev_f32(c.R, a, "k_src"); kk.row_idx = row;
+    kk.cache = reinterpret_cast<half *>(dev_ptr(c.R, arg_str(a, "cache_k")));
+    kk.row_width = rw;
+    emit(out, c.proto, kk);
+    mk::KvAppendArgs vv{};
+    vv.src = dev_f32(c.R, a, "v_src"); vv.row_idx = row;
+    vv.cache = reinterpret_cast<half *>(dev_ptr(c.R, arg_str(a, "cache_v")));
+    vv.row_width = rw;
+    emit(out, c.proto, vv);
+}
+static void pack_FATTN_DECODE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::FattnDecodeArgs f{};
+    f.q          = dev_f32(c.R, a, "q");
+    f.k_cache    = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "cache_k")));
+    f.v_cache    = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "cache_v")));
+    f.mask       = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "mask")));
+    f.partials   = dev_f32(c.R, a, "partials");
+    f.n_kv       = 0;                                  // $n_kv, patched per pass
+    f.n_q        = (uint32_t) arg_i(a, "q_heads");
+    f.n_kv_heads = (uint32_t) arg_i(a, "kv_heads");
+    f.row_width  = (uint32_t)(arg_i(a, "kv_heads") * arg_i(a, "head_dim"));
+    c.out_idx_fattn.push_back(out.size());             // record for $n_kv patch
+    emit(out, c.proto, f);
+}
+static void pack_FATTN_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::FattnReduceArgs f{};
+    f.partials = dev_f32(c.R, a, "partials");
+    f.dst      = dev_f32(c.R, a, "dst");
+    f.error    = reinterpret_cast<unsigned *>(dev_ptr(c.R, "fattn_error"));
+    f.n_q      = (uint32_t) arg_i(a, "q_heads");
+    f.n_chunks = (uint32_t) arg_i(a, "n_splits");
+    emit(out, c.proto, f);
+}
+static void pack_ATTN_GATE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::AttnGateArgs g{};
+    g.attn        = dev_f32(c.R, a, "attn");
+    g.gate        = dev_f32(c.R, a, "gate_src", arg_i_def(a, "gate_off", 0));
+    g.dst         = dev_f32(c.R, a, "dst");
+    g.n_q         = (uint32_t) arg_i(a, "heads");
+    g.gate_stride = (uint32_t) arg_i(a, "gate_head_stride");
+    emit(out, c.proto, g);
+}
+static void pack_LOGITS_EMIT(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::LogitsEmitArgs e{};
+    e.src        = dev_f32(c.R, a, "src");
+    e.dst        = reinterpret_cast<float *>(dev_ptr(c.R, arg_str(a, "dst")));
+    e.n          = (uint32_t) arg_i(a, "elems");
+    e.flag_value = 0;
+    e.flag       = nullptr;   // multi-block copy: rely on the kernel's pass done
+    emit(out, c.proto, e);
+}
+[[noreturn]] static void pack_unsupported(const Jv &, PackCtx &c, std::vector<mk::Instr> &) {
+    throw std::runtime_error(std::string("packer: kind ") +
+        std::to_string(c.proto.kind) + " not supported at the single-GPU binding");
+}
 
 struct KindEntry { mk::MacroKind kind; const char *name; PackFn pack; };
 static const KindEntry KIND_TABLE[] = {
@@ -624,11 +940,11 @@ static const KindEntry KIND_TABLE[] = {
     { mk::OP_FATTN_DECODE,      "FATTN_DECODE",      pack_FATTN_DECODE },
     { mk::OP_FATTN_REDUCE,      "FATTN_REDUCE",      pack_FATTN_REDUCE },
     { mk::OP_ATTN_GATE,         "ATTN_GATE",         pack_ATTN_GATE },
-    { mk::OP_RESIDUAL_ADD,      "RESIDUAL_ADD",      pack_RESIDUAL_ADD },
+    { mk::OP_RESIDUAL_ADD,      "RESIDUAL_ADD",      pack_unsupported },
     { mk::OP_STATE_LOAD,        "STATE_LOAD",        pack_STATE_LOAD },
     { mk::OP_STATE_STORE,       "STATE_STORE",       pack_STATE_STORE },
-    { mk::OP_XCHG_PUSH,         "XCHG_PUSH",         pack_XCHG_PUSH },
-    { mk::OP_XCHG_REDUCE,       "XCHG_REDUCE",       pack_XCHG_REDUCE },
+    { mk::OP_XCHG_PUSH,         "XCHG_PUSH",         pack_unsupported },
+    { mk::OP_XCHG_REDUCE,       "XCHG_REDUCE",       pack_unsupported },
 };
 
 static const KindEntry *kind_by_name(const std::string &raw) {
@@ -639,6 +955,7 @@ static const KindEntry *kind_by_name(const std::string &raw) {
 
 struct PackedProgram {
     std::vector<mk::Instr> instrs;
+    std::vector<size_t> fattn_idx;     // FATTN_DECODE positions ($n_kv patch)
     uint32_t epoch_stride = 0;
     bool complete = false;
     std::string first_failure;
@@ -647,9 +964,11 @@ struct PackedProgram {
 
 static PackedProgram pack_program(const Jv &pj, const Resolver &R) {
     PackedProgram out;
-    out.epoch_stride = pj.get("epoch_stride") ? (uint32_t) pj.at("epoch_stride").as_i() : 0;
-    // compile_schedule.py emits the array under "instructions"; accept the
-    // older "instrs" too.
+    // epoch_stride lives under meta.per_pass (boundaries per pass); the kernel
+    // crosses boundaries by counter, so this is informational (G15 accounting).
+    if (const Jv *m = pj.get("meta"))
+        if (const Jv *pp = m->get("per_pass"))
+            if (const Jv *es = pp->get("epoch_stride")) out.epoch_stride = (uint32_t) es->as_i();
     const Jv &instrs = pj.get("instructions") ? pj.at("instructions") : pj.at("instrs");
     out.instrs.reserve(instrs.arr.size());
     for (size_t i = 0; i < instrs.arr.size(); i++) {
@@ -661,22 +980,23 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R) {
             out.packed_before_failure = i;
             return out;
         }
-        mk::Instr ins{};
-        ins.kind = (uint16_t) ke->kind;
-        ins.block_lo = (uint16_t) ij.at("block_lo").as_i();
-        ins.block_hi = (uint16_t) ij.at("block_hi").as_i();
-        ins.flags = ij.get("flags") ? (uint16_t) ij.at("flags").as_i() : 0;
-        ins.dbg_node = ij.get("dbg_node") ? (uint32_t) ij.at("dbg_node").as_i() : 0;
+        mk::Instr proto{};
+        proto.kind = (uint16_t) ke->kind;
+        proto.block_lo = (uint16_t) ij.at("block_lo").as_i();
+        proto.block_hi = (uint16_t) ij.at("block_hi").as_i();
+        proto.flags = ij.get("flags") ? (uint16_t) ij.at("flags").as_i() : 0;
+        proto.dbg_node = ij.get("dbg_node") && ij.get("dbg_node")->k == Jv::NUM
+                             ? (uint32_t) ij.at("dbg_node").as_i() : 0;
         static const Jv empty_args;
         const Jv *args = ij.get("args");
+        PackCtx ctx{R, proto, out.fattn_idx};
         try {
-            ke->pack(args ? *args : empty_args, R, ins);
+            ke->pack(args ? *args : empty_args, ctx, out.instrs);
         } catch (const std::exception &e) {
             out.first_failure = "instr " + std::to_string(i) + " (" + kname + "): " + e.what();
             out.packed_before_failure = i;
             return out;
         }
-        out.instrs.push_back(ins);
     }
     out.complete = true;
     out.packed_before_failure = out.instrs.size();
@@ -684,48 +1004,57 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R) {
 }
 
 // ---------------------------------------------------------------------------
-// LAUNCHER STAND-IN (duplication, noted)
-//
-// core/host.h (the persistent-kernel upload/launch/run_pass library a
-// parallel agent owns) did not exist when this harness was written, so
-// this is the harness's own minimal notion of the same contract:
-//   upload_program(instrs, epoch_stride)  — device Instr[] + Program header
-//                                           + zeroed y02 counter (real)
-//   run_pass()                            — one decode pass; UNAVAILABLE
-//                                           here: no interpreter kernel is
-//                                           linked into this binary.
-// When core/host.h lands, port parity_run/bench_run to its API and delete
-// this struct.
+// LAUNCHER — the persistent interpreter, driven through mk::Host (core/host.h).
+// host_init allocates the control cells (incl. h.d_token, the per-pass token
+// input); host_upload uploads the packed Instr[] and wires the y02 counter;
+// host_launch does the cooperative launch (72x384, 60 KiB slab); run_pass ->
+// host_run_pass. The FATTN_DECODE payloads carry a per-pass $n_kv (padded KV
+// window) patched into device memory before each pass.
 // ---------------------------------------------------------------------------
 
 struct Launcher {
-    mk::Instr *d_instr = nullptr;
-    unsigned *d_y02 = nullptr;
-    mk::Program hdr{};
+    mk::Host h;
+    std::vector<size_t> fattn_idx;     // instr indices needing $n_kv patched
     bool program_uploaded = false;
-    static constexpr bool kernel_available = false;
+    static constexpr bool kernel_available = true;
+    // byte offset of FattnDecodeArgs::n_kv within mk::Instr (payload + field).
+    static constexpr size_t N_KV_OFF =
+        offsetof(mk::Instr, payload) + offsetof(mk::FattnDecodeArgs, n_kv);
 
-    void upload_program(const std::vector<mk::Instr> &prog, uint32_t epoch_stride) {
-        CUDA_CHECK(cudaMalloc(&d_instr, prog.size() * sizeof(mk::Instr)));
-        CUDA_CHECK(cudaMemcpy(d_instr, prog.data(), prog.size() * sizeof(mk::Instr),
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&d_y02, sizeof(unsigned)));
-        CUDA_CHECK(cudaMemset(d_y02, 0, sizeof(unsigned)));
-        hdr.n_instr = (uint32_t) prog.size();
-        hdr.epoch_stride = epoch_stride;
-        hdr.y02_counter = d_y02;
+    void init(int device) {
+        if (!mk::host_init(h, device, /*pass_cycles_cap=*/1024))
+            throw std::runtime_error("mk::host_init failed (G11 envelope / coop launch)");
+    }
+    // d_token is valid only after host_init; the resolver binds cell:token to it.
+    int32_t *d_token() { return h.d_token; }
+
+    void upload_program(const PackedProgram &p) {
+        if (!mk::host_upload(h, p.instrs.data(), (uint32_t) p.instrs.size(), p.epoch_stride))
+            throw std::runtime_error("mk::host_upload failed");
+        fattn_idx = p.fattn_idx;
+        if (!mk::host_launch(h))
+            throw std::runtime_error("mk::host_launch failed (cooperative launch)");
         program_uploaded = true;
     }
 
-    bool run_pass() {
-        static bool warned = false;
-        if (!warned) {
-            fprintf(stderr, "mk-harness: run_pass UNAVAILABLE — the persistent interpreter "
-                    "kernel (core/host.cpp + k0/ops/*.cuh) is not built into this binary "
-                    "(core/host.h was absent at harness-writing time)\n");
-            warned = true;
+    // Patch $n_kv into every FATTN_DECODE payload for this pass.
+    void patch_n_kv(uint32_t n_kv) {
+        for (size_t idx : fattn_idx)
+            CUDA_CHECK(cudaMemcpy((char *) h.d_program + idx * sizeof(mk::Instr) + N_KV_OFF,
+                                  &n_kv, sizeof(n_kv), cudaMemcpyHostToDevice));
+    }
+
+    bool run_pass(int32_t token) {
+        mk::RunStatus st = mk::host_run_pass(h, token, /*timeout_ms=*/60000.0);
+        if (st != mk::RUN_OK) {
+            fprintf(stderr, "mk-harness: run_pass status %d (pass %u)\n", (int) st, h.pass);
+            return false;
         }
-        return false;
+        return true;
+    }
+    void shutdown() {
+        if (program_uploaded) mk::host_shutdown(h, 5000.0);
+        mk::host_destroy(h);
     }
 };
 
@@ -847,8 +1176,8 @@ static int parity_run(Residency &res, Runtime &rt, Launcher &ln, const std::stri
     // Prefill: one decode pass per prompt token, logits discarded until the
     // last (decode-only prefill, position from 0).
     for (size_t i = 0; i < prompt.arr.size(); i++, pos++) {
-        rt.set_pass_inputs((int32_t) prompt.arr[i].as_i(), pos);
-        if (!ln.run_pass()) return 3;
+        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        if (!ln.run_pass((int32_t) prompt.arr[i].as_i())) return 3;
     }
     rt.read_f32("logits", logits, (size_t) res.n_vocab);
     dump.add_logits_row(logits);   // row 0 = prefill output
@@ -856,8 +1185,8 @@ static int parity_run(Residency &res, Runtime &rt, Launcher &ln, const std::stri
     for (int s = 0; s < steps; s++, pos++) {
         int32_t tok = argmax_f32_first(logits);   // token s from row s
         emitted.push_back(tok);
-        rt.set_pass_inputs(tok, pos);
-        if (!ln.run_pass()) return 3;
+        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        if (!ln.run_pass(tok)) return 3;
         rt.read_f32("logits", logits, (size_t) res.n_vocab);
         dump.add_logits_row(logits);   // row s+1
 
@@ -872,7 +1201,9 @@ static int parity_run(Residency &res, Runtime &rt, Launcher &ln, const std::stri
             dump.node_row(s, il, name, "ADD", N_EMBD, st);
             dump.write_bin(s, "full", name, "ADD", rel, lout.data() + (size_t) il * N_EMBD, N_EMBD);
         }
-        rt.read_f32("result_norm", rnorm, N_EMBD);
+        // result_norm = the final output_norm result (buf:xn after the last
+        // RMSNORM, before the head GEMV). Informational in compare.py.
+        rt.read_f32("xn", rnorm, N_EMBD);
         dump.node_row(s, 3702, "result_norm", "MUL", N_EMBD, stats_of(rnorm.data(), N_EMBD));
         dump.node_row(s, 3703, "result_output", "MUL_MAT", (size_t) res.n_vocab,
                       stats_of(logits.data(), logits.size()));
@@ -924,23 +1255,36 @@ static int bench_run(Runtime &rt, Launcher &ln, int gpu, int64_t n_tokens) {
            WARMUP, (long long) n_tokens);
     int64_t pos = 0;
     for (int i = 0; i < WARMUP; i++, pos++) {
-        rt.set_pass_inputs(11, pos);
-        if (!ln.run_pass()) return 3;
+        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        if (!ln.run_pass(11)) return 3;
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
     auto t0 = std::chrono::steady_clock::now();
     for (int64_t i = 0; i < n_tokens; i++, pos++) {
-        rt.set_pass_inputs(11, pos);
-        if (!ln.run_pass()) return 3;
+        ln.patch_n_kv((uint32_t) rt.set_pass_inputs(pos));
+        if (!ln.run_pass(11)) return 3;
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
     double sec = std::chrono::duration<double>(t1 - t0).count();
     printf("bench: %lld tokens in %.3f s = %.2f tok/s [%s]\n",
            (long long) n_tokens, sec, n_tokens / sec,
            idle ? "GPU otherwise idle" : "CONTENDED/INDICATIVE: GPU not idle at start");
-    printf("bench: per-pass ms breakdown unavailable (the spine's on-device timing is not "
-           "built into this binary)\n");
+    // On-device per-pass cycle deltas (block-0 clock64) from the G15 ring.
+    unsigned cap = ln.h.pass_cycles_cap;
+    if (cap && n_tokens > 0) {
+        std::vector<long long> cyc(cap);
+        if (mk::host_read_pass_cycles(ln.h, cyc.data(), cap)) {
+            unsigned cnt = (unsigned) std::min<int64_t>(n_tokens, cap);
+            double sum = 0; long long mn = cyc[0], mx = cyc[0];
+            for (unsigned k = 0; k < cnt; k++) {
+                long long v = cyc[(ln.h.pass - 1 - k) % cap];
+                sum += (double) v; if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            // TU102 boost 1455 MHz; cycles -> ms.
+            const double gHz = 1.455;
+            printf("bench: per-pass on-device clock64: mean %.3f ms, min %.3f, max %.3f (%u samples)\n",
+                   sum / cnt / gHz / 1e6, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
+        }
+    }
     return 0;
 }
 
@@ -1027,6 +1371,15 @@ int main(int argc, char **argv) {
                 have_program = true;
             }
         }
+        // The launcher owns the persistent kernel's control plane. host_init
+        // allocates h.d_token (the per-pass token cell); bind cell:token to it
+        // BEFORE the packer resolves names. Validate mode skips the launch.
+        Launcher ln;
+        if (mode != M_VALIDATE) {
+            ln.init(gpu);
+            R.add("token", ln.d_token(), 128);   // cell:token -> Host d_token
+        }
+
         rt.allocate(R, have_program ? &program : nullptr);
         printf("runtime: KV 16 layers x 2 x %lld x %d f16 (%.2f GB), state 48 x (%d + %d) f32 (%.2f MB), "
                "mask cap %lld f16\n",
@@ -1034,30 +1387,30 @@ int main(int argc, char **argv) {
                SSM_STATE_N, CONV_STATE_N, 48.0 * (SSM_STATE_N + CONV_STATE_N) * 4 / 1e6,
                (long long) rt.mask_cap);
 
-        Launcher ln;
         PackedProgram packed;
-        if (have_program) {
+        if (have_program && mode != M_VALIDATE) {
             packed = pack_program(program, R);
             if (packed.complete) {
-                printf("pack: %zu instrs packed\n", packed.instrs.size());
-                ln.upload_program(packed.instrs, packed.epoch_stride);
-                printf("pack: program uploaded (%u instrs, epoch_stride %u)\n",
-                       ln.hdr.n_instr, ln.hdr.epoch_stride);
+                printf("pack: %zu instrs packed (%zu FATTN_DECODE need $n_kv patched)\n",
+                       packed.instrs.size(), packed.fattn_idx.size());
+                ln.upload_program(packed);
+                printf("pack: program uploaded + cooperative kernel launched "
+                       "(%zu instrs, epoch_stride %u)\n",
+                       packed.instrs.size(), packed.epoch_stride);
             } else {
                 printf("pack: FAILED after %zu instrs: %s\n",
                        packed.packed_before_failure, packed.first_failure.c_str());
             }
-        } else {
-            printf("pack: SKIPPED — no %s and no k0/compile_schedule.py to generate it\n",
-                   program_path.c_str());
         }
 
         printf("pipeline status: inventory %s, checksums %s, buffers %s, program %s, kernel %s\n",
                inventory_ok ? "OK" : "MISMATCH",
                checksums_ok ? "OK" : "MISMATCH",
                rt.buffer_table_stubbed ? "STUBBED (no program.json buffer table)" : "from program.json",
-               !have_program ? "ABSENT" : (packed.complete ? "PACKED" : "PACK-FAILED (op Args stubs)"),
-               Launcher::kernel_available ? "linked" : "NOT LINKED (core/host.h absent at build)");
+               !have_program ? "ABSENT"
+                   : (mode == M_VALIDATE ? "PRESENT (not packed in validate mode)"
+                      : (packed.complete ? "PACKED" : "PACK-FAILED")),
+               Launcher::kernel_available ? "linked" : "NOT LINKED");
 
         if (mode == M_VALIDATE)
             return (inventory_ok && checksums_ok) ? 0 : 1;
@@ -1073,12 +1426,16 @@ int main(int argc, char **argv) {
             return 3;
         }
 
+        int rc;
         if (mode == M_PARITY) {
             if (out_dir.empty())
                 out_dir = "/var/tmp/mk-harness/cand-" + basename_of(parity_ref);
-            return parity_run(res, rt, ln, parity_ref, out_dir);
+            rc = parity_run(res, rt, ln, parity_ref, out_dir);
+        } else {
+            rc = bench_run(rt, ln, gpu, bench_n);
         }
-        return bench_run(rt, ln, gpu, bench_n);
+        ln.shutdown();   // HALT the persistent kernel + free cleanly
+        return rc;
     } catch (const std::exception &e) {
         fprintf(stderr, "mk-harness: %s\n", e.what());
         return 2;

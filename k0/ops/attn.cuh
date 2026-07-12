@@ -217,19 +217,21 @@ __device__ inline void op_kv_append(const Instr &ins, char *) {
 // blockIdx.x - block_lo, n_chunks = block_hi - block_lo) and processes it
 // for ALL local q heads, producing one partial record per (head, chunk).
 //
-// Within the block, KV positions are processed in smem tiles of 32 rows:
-// phase K loads the K tile (16B strong loads, the G12 discipline: the KV
-// stream at deep context is the dominant read) and computes 32 scores per
-// head (lane = position); phase V reuses the same smem for the V tile and
-// accumulates. One warp per q head: requires n_q <= blockDim.x/32 (12 <= 12
-// at the production shape).
+// The kv heads are the OUTER loop: for each kv head, its gqa = n_q/n_kv_heads
+// q heads are carried one-warp-per-head (gqa <= blockDim.x/32) while the smem
+// tile holds only that kv head's 256-wide slice of the cache row. This bounds
+// the slab independent of the physical row_width, so the single-GPU shape
+// (24 q / 4 kv, row_width 1024) fits where a full-row tile would be 65 KiB;
+// each slice is a disjoint 256 columns of the row, so the four passes read the
+// whole KV once (no extra DRAM). KV positions run in smem tiles of 32 rows:
+// phase K loads the K slice (16B strong loads, the G12 discipline) and scores
+// 32 positions (lane = position); phase V reuses the smem for the V slice and
+// accumulates.
 //
-// smem (within the 60 KiB slab): q_s n_q*256 f32, then a 32-row tile of
-// (row_width + 2) f16 (the +2 pad makes lane-per-row half2 reads
-// bank-conflict-free: (row_width+2)/2 words == 1 mod 32 for row_width 512
-// or 1024), then 32 f16 of mask. Production (n_q=12, row 512): 45,248 B.
-// row_width <= 512 fits the slab at tile 32; a wider row needs a smaller
-// tile and is not implemented.
+// smem (within the 60 KiB slab): q_s n_q*256 f32 (all heads staged once), then
+// a 32-row tile of (256 + 2) f16 (the +2 pad makes lane-per-row half2 reads
+// bank-conflict-free), then 32 f16 of mask. Single-GPU (n_q=24): 41,152 B;
+// per-GPU (n_q=12): 28,864 B. Independent of row_width.
 //
 // The mask is the padded f32->f16 KQ mask: 0 attend / -inf masked, columns
 // [real n_kv, padded n_kv) are -inf. Padded-class cache rows are never
@@ -252,18 +254,23 @@ struct FattnDecodeArgs {
 };
 static_assert(sizeof(FattnDecodeArgs) <= 112, "payload overflow");
 
-// Cooperative tile load: rows [t0, t0+32) of a KV cache into the padded smem
-// tile; rows >= limit are zero-filled (finite, so a skipped V contribution
-// can never read NaN).
-__device__ inline void mk_load_kv_tile(const half *cache, half *tile, uint32_t t0,
-                                       uint32_t limit, uint32_t row_width,
-                                       uint32_t row_p) {
-    const uint32_t nv4 = row_width / 8; // uint4 (8 f16) per row
+// Cooperative tile load: the MK_ATTN_HD-wide slice of one kv head (base offset
+// `head_off` inside each cache row, stride `row_width`) for rows [t0, t0+32)
+// into the padded smem tile; rows >= limit are zero-filled (finite, so a
+// skipped V contribution can never read NaN). The tile pitch `row_p` is
+// MK_ATTN_HD+2 f16 (bank-conflict-free half2 rows), independent of the cache's
+// full row_width — one kv head's 256 dims fit the slab even when the physical
+// cache row packs all kv heads (single-GPU: row_width=1024, 4 heads).
+__device__ inline void mk_load_kv_slice(const half *cache, half *tile, uint32_t t0,
+                                        uint32_t limit, uint32_t row_width,
+                                        uint32_t head_off, uint32_t row_p) {
+    const uint32_t nv4 = MK_ATTN_HD / 8; // uint4 (8 f16) per 256-wide slice = 32
     for (uint32_t i = threadIdx.x; i < MK_FATTN_TILE * nv4; i += blockDim.x) {
         const uint32_t t = i / nv4, c = i % nv4;
         uint4 v = make_uint4(0u, 0u, 0u, 0u);
         if (t0 + t < limit) {
-            v = ld_cg(reinterpret_cast<const uint4 *>(cache + (size_t)(t0 + t) * row_width) + c);
+            v = ld_cg(reinterpret_cast<const uint4 *>(
+                          cache + (size_t)(t0 + t) * row_width + head_off) + c);
         }
         unsigned *d = reinterpret_cast<unsigned *>(tile + t * row_p + c * 8);
         d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
@@ -276,98 +283,113 @@ __device__ inline void op_fattn_decode(const Instr &ins, char *smem) {
     const int chunk   = blockIdx.x - ins.block_lo;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
 
-    const uint32_t row_p = a.row_width + 2; // smem row pitch in f16 (pad, see above)
+    // The smem tile holds ONE kv head's 256-wide slice (not the full row):
+    // this keeps the slab bounded at the single-GPU shape (24 q / 4 kv,
+    // row_width 1024) where a full-row tile would be 65 KiB. The op loops the
+    // kv heads on the outer axis; each carries its gqa q heads (one warp per q
+    // head, gqa <= blockDim/32).
+    const uint32_t row_p = MK_ATTN_HD + 2; // slice pitch in f16
     float *q_s    = reinterpret_cast<float *>(smem);
     half  *tile   = reinterpret_cast<half *>(q_s + a.n_q * MK_ATTN_HD);
     half  *mask_t = tile + MK_FATTN_TILE * row_p;
 
-    const uint32_t clen = (a.n_kv + nchunks - 1) / nchunks;
+    // 32-aligned chunk boundaries (NOTES-attn.md / COMPILER.md): clen rounded
+    // up to a multiple of the tile so kv0 = chunk*clen is 32-aligned and the
+    // packed 2-f16 mask word read never faults. Trailing chunks fall empty.
+    uint32_t clen = (a.n_kv + nchunks - 1) / nchunks;
+    clen = (clen + MK_FATTN_TILE - 1) / MK_FATTN_TILE * MK_FATTN_TILE;
     const uint32_t kv0  = min((uint32_t)(chunk * clen), a.n_kv);
     const uint32_t kv1  = min(kv0 + clen, a.n_kv);
 
     // Q pre-scaled exactly like the fork (fattn-mma-f16.cuh:1230), kept f32
-    // (the graph pins GGML_PREC_F32 on FLASH_ATTN_EXT).
+    // (the graph pins GGML_PREC_F32 on FLASH_ATTN_EXT). All n_q heads staged.
     for (uint32_t i = threadIdx.x; i < a.n_q * MK_ATTN_HD; i += blockDim.x) {
         q_s[i] = MK_ATTN_SCALE * ld_cg(a.q + i);
     }
     __syncthreads();
 
     const uint32_t gqa = a.n_q / a.n_kv_heads;
-    const uint32_t g   = (warp < (int) a.n_q) ? warp / gqa : 0; // this warp's kv head
 
-    float m = -FLT_MAX / 2.0f; // fork KQ_max init, fattn-mma-f16.cuh:1196
-    float s = 0.0f;
-    float vacc[MK_ATTN_HD / 32] = {0.0f};
+    for (uint32_t kvh = 0; kvh < a.n_kv_heads; kvh++) {
+        const uint32_t head_off = kvh * MK_ATTN_HD;  // slice base in each row
+        const uint32_t qh = kvh * gqa + (uint32_t) warp; // this warp's global q head
+        const bool active = (uint32_t) warp < gqa;
 
-    for (uint32_t t0 = kv0; t0 < kv1; t0 += MK_FATTN_TILE) {
-        // ---- phase K: scores for 32 positions, all heads
-        mk_load_kv_tile(a.k_cache, tile, t0, kv1, a.row_width, row_p);
-        if (threadIdx.x < MK_FATTN_TILE / 2) {
-            // mask tile as 16 words (n_kv is even: padded to 256).
-            const uint32_t j = t0 + 2 * threadIdx.x;
-            unsigned w = 0;
-            if (j < kv1) w = ld_cg(reinterpret_cast<const unsigned *>(a.mask + j));
-            reinterpret_cast<unsigned *>(mask_t)[threadIdx.x] = w;
-        }
-        __syncthreads();
+        float m = -FLT_MAX / 2.0f; // fork KQ_max init, fattn-mma-f16.cuh:1196
+        float s = 0.0f;
+        float vacc[MK_ATTN_HD / 32] = {0.0f};
 
-        float p = 0.0f, f = 1.0f;
-        if (warp < (int) a.n_q) {
-            const uint32_t j = t0 + lane; // this lane's KV position
-            float score = -INFINITY;      // chunk-tail positions stay -inf
-            if (j < kv1) {
-                const half  *kr = tile + lane * row_p + g * MK_ATTN_HD;
-                const float *qh = q_s + warp * MK_ATTN_HD;
-                float dot = 0.0f;
-#pragma unroll
-                for (int c = 0; c < MK_ATTN_HD; c += 2) {
-                    const half2 kk = *reinterpret_cast<const half2 *>(kr + c);
-                    dot += qh[c] * __low2float(kk) + qh[c + 1] * __high2float(kk);
-                }
-                score = dot + __half2float(mask_t[lane]); // q pre-scaled; mask 0/-inf
+        for (uint32_t t0 = kv0; t0 < kv1; t0 += MK_FATTN_TILE) {
+            // ---- phase K: scores for 32 positions, this kv head's slice
+            mk_load_kv_slice(a.k_cache, tile, t0, kv1, a.row_width, head_off, row_p);
+            if (threadIdx.x < MK_FATTN_TILE / 2) {
+                // mask tile as 16 words (n_kv even: padded to 256; kv0 32-aligned).
+                const uint32_t j = t0 + 2 * threadIdx.x;
+                unsigned w = 0;
+                if (j < kv1) w = ld_cg(reinterpret_cast<const unsigned *>(a.mask + j));
+                reinterpret_cast<unsigned *>(mask_t)[threadIdx.x] = w;
             }
-            const float m_new = fmaxf(m, warp_max_f32(score));
-            f = expf(m - m_new);                      // m > -inf always: no NaN
-            p = (j < kv1) ? expf(score - m_new) : 0.0f;
-            s = s * f + warp_sum_f32(p);
-            m = m_new;
-        }
-        __syncthreads();
+            __syncthreads();
 
-        // ---- phase V: same smem, weighted accumulation
-        mk_load_kv_tile(a.v_cache, tile, t0, kv1, a.row_width, row_p);
-        __syncthreads();
-        if (warp < (int) a.n_q) {
+            float p = 0.0f, f = 1.0f;
+            if (active) {
+                const uint32_t j = t0 + lane; // this lane's KV position
+                float score = -INFINITY;      // chunk-tail positions stay -inf
+                if (j < kv1) {
+                    const half  *kr = tile + lane * row_p; // slice already selected
+                    const float *qh_p = q_s + qh * MK_ATTN_HD;
+                    float dot = 0.0f;
 #pragma unroll
-            for (int i = 0; i < MK_ATTN_HD / 32; i++) vacc[i] *= f;
-            const half *vb = tile + g * MK_ATTN_HD + lane * 8; // lane owns dims [8*lane, 8*lane+8)
-            for (int t = 0; t < MK_FATTN_TILE; t++) {
-                const float pt = __shfl_sync(0xffffffffu, p, t); // warp-uniform
-                if (pt != 0.0f) {
-                    const half *vr = vb + t * row_p;
+                    for (int c = 0; c < MK_ATTN_HD; c += 2) {
+                        const half2 kk = *reinterpret_cast<const half2 *>(kr + c);
+                        dot += qh_p[c] * __low2float(kk) + qh_p[c + 1] * __high2float(kk);
+                    }
+                    score = dot + __half2float(mask_t[lane]); // q pre-scaled; mask 0/-inf
+                }
+                const float m_new = fmaxf(m, warp_max_f32(score));
+                f = expf(m - m_new);                      // m > -inf always: no NaN
+                p = (j < kv1) ? expf(score - m_new) : 0.0f;
+                s = s * f + warp_sum_f32(p);
+                m = m_new;
+            }
+            __syncthreads();
+
+            // ---- phase V: same smem, weighted accumulation
+            mk_load_kv_slice(a.v_cache, tile, t0, kv1, a.row_width, head_off, row_p);
+            __syncthreads();
+            if (active) {
 #pragma unroll
-                    for (int i = 0; i < MK_ATTN_HD / 32; i += 2) {
-                        const half2 vv = *reinterpret_cast<const half2 *>(vr + i);
-                        vacc[i]     += pt * __low2float(vv);
-                        vacc[i + 1] += pt * __high2float(vv);
+                for (int i = 0; i < MK_ATTN_HD / 32; i++) vacc[i] *= f;
+                const half *vb = tile + lane * 8; // lane owns dims [8*lane, 8*lane+8)
+                for (int t = 0; t < MK_FATTN_TILE; t++) {
+                    const float pt = __shfl_sync(0xffffffffu, p, t); // warp-uniform
+                    if (pt != 0.0f) {
+                        const half *vr = vb + t * row_p;
+#pragma unroll
+                        for (int i = 0; i < MK_ATTN_HD / 32; i += 2) {
+                            const half2 vv = *reinterpret_cast<const half2 *>(vr + i);
+                            vacc[i]     += pt * __low2float(vv);
+                            vacc[i + 1] += pt * __high2float(vv);
+                        }
                     }
                 }
             }
+            __syncthreads(); // tile is reloaded next iteration
         }
-        __syncthreads(); // tile is reloaded next iteration
-    }
 
-    // One partial record per (head, chunk); written even for an empty or
-    // fully-masked chunk (max = -FLT_MAX/2, sumexp = 0) so that only a
-    // never-executed write leaves the -inf sentinel in place.
-    if (warp < (int) a.n_q) {
-        float *rec = a.partials + ((size_t) warp * nchunks + chunk) * MK_FATTN_PSTRIDE;
+        // One partial record per (head, chunk); written even for an empty or
+        // fully-masked chunk (max = -FLT_MAX/2, sumexp = 0) so that only a
+        // never-executed write leaves the -inf sentinel in place.
+        if (active) {
+            float *rec = a.partials + ((size_t) qh * nchunks + chunk) * MK_FATTN_PSTRIDE;
 #pragma unroll
-        for (int i = 0; i < MK_ATTN_HD / 32; i++) rec[lane * 8 + i] = vacc[i];
-        if (lane == 0) {
-            rec[MK_ATTN_HD]     = m;
-            rec[MK_ATTN_HD + 1] = s;
+            for (int i = 0; i < MK_ATTN_HD / 32; i++) rec[lane * 8 + i] = vacc[i];
+            if (lane == 0) {
+                rec[MK_ATTN_HD]     = m;
+                rec[MK_ATTN_HD + 1] = s;
+            }
         }
+        __syncthreads(); // tile handoff before the next kv head reloads it
     }
 }
 

@@ -54,8 +54,10 @@ add_executable(mk-litmus-mp-cg tests/litmus_boundary.cu)
 target_compile_definitions(mk-litmus-mp-cg PRIVATE LITMUS_MP LITMUS_MP_CG)
 
 # mk-harness: the standalone parity/bench harness (k0/harness.cpp + the
-# GGUF mmap reader k0/gguf.h). Pure C++ against the CUDA runtime; the
-# interpreter kernel (core/host.cpp, when it lands) is not linked yet.
+# GGUF mmap reader k0/gguf.h). Compiled as CUDA (nvcc) because the packer
+# includes the op Args structs from k0/ops/*.cuh (half types, __device__
+# wrappers); links mk-core so the persistent interpreter kernel is launchable.
 find_package(CUDAToolkit REQUIRED)
+set_source_files_properties(k0/harness.cpp PROPERTIES LANGUAGE CUDA)
 add_executable(mk-harness k0/harness.cpp)
-target_link_libraries(mk-harness PRIVATE CUDA::cudart)
+target_link_libraries(mk-harness PRIVATE mk-core CUDA::cudart)

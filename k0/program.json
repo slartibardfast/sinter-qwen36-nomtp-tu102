@@ -685,8 +685,8 @@
   {
    "name": "fattn_partial",
    "type": "f32",
-   "elems": 445824,
-   "bytes": 1783296,
+   "elems": 449280,
+   "bytes": 1797120,
    "purpose": "split-KV partials: 72 splits x 24 heads x (256 vkq + max + sumexp)"
   },
   {
