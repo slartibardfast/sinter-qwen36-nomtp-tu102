@@ -33,14 +33,23 @@ Replaces `dual_setup` + `gpu_upload_weights`:
 7. mailboxes: gpu_alloc_mailboxes + gpu_wire_mailboxes (count OP_XCHG_REDUCE).
 8. pack_program(program, c.R, &c.mtab, g); upload_program (host_upload + launch).
 
-## Per decode graph_compute (the hot path)
-1. gpu_set_inputs(c, pos) both GPUs: positions/kv_row/n_kv/mask from the graph's
-   position input (read llama's inp_pos / the KV head-cell), token from the graph.
-2. dual_run_pass(g2, token, seqno, timeout).
-3. Gather logits: each GPU's `result_output` is its vocab half (lm_head column-
-   split); gather the two halves into the graph's OUTPUT tensor (the logits llama
-   samples). The output tensor is a meta tensor -> write each half to its per-GPU
-   simple tensor's data, or gather to the single output buffer llama reads.
+## Per decode graph_compute (the hot path)   [seed-from-residual, no token]
+0. POSITION (risk #4, RESOLVED 2026-07-13): MK's graph exposes NO position/idx
+   named tensor and only ONE `MK#` boundary input (the residual). The megakernel
+   computes RoPE/KV internally from a scalar `pos`, so read only that scalar from
+   the set_rows KV-write index: find the first OP_SET_ROWS node (op=42), take its
+   src[1] (k_idxs, a mirrored int32 = [n_past]); cudaMemcpy 4 B from its per-GPU
+   data -> pos. (Robust across warmup/resets/deep, unlike a call counter.)
+1. Seed the residual: cudaMemcpy MK#model.input_embed#0[gpu] (5120 f32, mirrored)
+   -> buf:residual[gpu] on each GPU. Strip the leading OP_EMBED_LOOKUP from the
+   program at load (its gguf:token_embd.weight isn't in MK's graph -> pack would
+   fail; and buf:residual is now seeded, not embedded).
+2. gpu_set_inputs(c, pos) both GPUs: positions/kv_row/n_kv/mask (token unused).
+3. dual_run_pass(g2, /*token=*/0, seqno, timeout)  (token arg dead once embed
+   is stripped; kept for signature).
+4. Gather logits: each GPU's `result_output` is its vocab half (lm_head column-
+   split); cudaMemcpy each half into the graph OUTPUT tensor's per-GPU simple
+   tensor data. llama's meta get_tensor then gathers the two halves.
 
 ## Embed  (RESOLVED 2026-07-13: seed from the CPU residual)
 CONFIRMED via probe: token_embd.weight is NOT in MK's graph, and node[0] is

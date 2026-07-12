@@ -152,6 +152,19 @@ bool mk_dispatch(struct ggml_cgraph * cgraph) {
             fprintf(stderr, "[MK node%d] %-28s op=%d src0=%s src1=%s\n", i, t->name, (int) t->op,
                     t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-");
         }
+        // Position sourcing (risk #4): find any tensor whose name mentions pos /
+        // inp / idx, plus the input residual, and report its type+shape+location.
+        { std::map<std::string,const ggml_tensor*> hits;
+          auto note=[&](const ggml_tensor*t){ if(!t||!t->name[0])return; std::string n=t->name;
+            if(n.find("pos")!=std::string::npos||n.rfind("inp",0)==0||n.find("idx")!=std::string::npos
+               ||n.find("input_embed")!=std::string::npos) hits.emplace(n,t); };
+          for(int i=0;i<cgraph->n_leafs;++i) note(cgraph->leafs[i]);
+          for(int i=0;i<cgraph->n_nodes;++i){ note(cgraph->nodes[i]);
+            for(int s=0;s<GGML_MAX_SRC;++s) note(cgraph->nodes[i]->src[s]); }
+          for(auto&kv:hits){ const ggml_tensor*t=kv.second;
+            fprintf(stderr,"[MK posrc] %-30s op=%d type=%d ne=[%lld,%lld] %s\n",
+              kv.first.c_str(),(int)t->op,(int)t->type,(long long)t->ne[0],(long long)t->ne[1],
+              (t->buffer?(ggml_backend_buffer_is_meta(t->buffer)?"META":"nonmeta"):"nobuf")); } }
         ++logged;
     }
 
