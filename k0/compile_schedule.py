@@ -26,6 +26,28 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# --split: emit the dual-GPU tensor-parallel program (core/DUAL-GPU-DESIGN.md).
+# NGPU=2. Row-split expand GEMVs (qkv/up|gate/lm_head) get half the output
+# rows; col-split contract GEMVs (attn_output/ffn_down/ssm_out) dot half the
+# input columns into a local partial, then an OP_XCHG_PUSH -> OP_BOUNDARY ->
+# OP_XCHG_REDUCE triple folds p0+p1 to the mirrored residual. KV/state ops get
+# the per-GPU head range (halved counts/offsets). Mirrored ops (norms,
+# elementwise, rope, gates, embed) are unchanged: both GPUs run them on the
+# mirrored residual. The op implementations are reused UNCHANGED; the split is
+# entirely in the halved ranges/counts and the inserted reduce. One program
+# serves both GPUs: the harness packs it per GPU, patching $gpu_index (fold
+# order) and the peer mailbox pointers.
+SPLIT = "--split" in sys.argv
+NGPU = 2 if SPLIT else 1
+
+
+def sp(n):
+    """This GPU's local share of a split dimension (exact half under --split)."""
+    assert n % NGPU == 0, "split dim %d not divisible by %d" % (n, NGPU)
+    return n // NGPU
+
+
 N_NODES = 3704
 GRID = 72              # persistent blocks per GPU
 EPS = 1e-6
@@ -145,42 +167,46 @@ def insts(blk, kind, want=None):
 
 
 # ---------------------------------------------------------------- scratch buffers
-Q8_ELEMS = N_FF                       # largest quantized activation vector
+# Under --split every buffer downstream of a row-split expand (or feeding a
+# col-split contract) holds this GPU's LOCAL half at offset 0; the mirrored
+# trunk (residual, xn) and the contract OUTPUT (proj_out, full 5120 partial
+# then reduced to mirrored) stay full width.
+Q8_ELEMS = sp(N_FF)                   # largest LOCAL quantized activation vector
 Q8_BYTES = Q8_ELEMS // 32 * 36        # q8_1: 36 B per 32-element block
 # pstride 260 = 256 vkq + max + sumexp + 2 pad (16 B record alignment,
 # MK_FATTN_PSTRIDE in k0/ops/attn.cuh); the buffer must match the op's stride.
-FATTN_PARTIAL_ELEMS = GRID * ATTN_Q_HEADS * (ATTN_HEAD_DIM + 4)
+FATTN_PARTIAL_ELEMS = GRID * sp(ATTN_Q_HEADS) * (ATTN_HEAD_DIM + 4)
 
 BUFFERS = [
-    ("residual", "f32", N_EMBD, "the residual trunk x"),
-    ("xn", "f32", N_EMBD, "rmsnorm output (normed activations)"),
+    ("residual", "f32", N_EMBD, "the residual trunk x (mirrored)"),
+    ("xn", "f32", N_EMBD, "rmsnorm output (mirrored, feeds row-split expands)"),
     ("q8_act", "q8_1", Q8_ELEMS,
-     "quantized activations for MMVQ; sized for the largest quantized vector "
-     "(the 17408-wide FFN GLU output); rewritten several times per block"),
-    ("mixer_out", "f32", 12288,
-     "mixer GEMV output: attn q|gate (24x512=12288) or DN qkv (10240); on DN "
-     "blocks reused for the post-conv qkv activations (OP_SSM_CONV_SILU dst)"),
-    ("conv_ws", "f32", D_CONV * CONV_CHANNELS,
-     "conv concat window [d_conv=4 x 10240 channels]"),
-    ("gdn_alpha", "f32", GDN_HEADS,
+     "quantized activations for MMVQ; sized for the largest LOCAL quantized "
+     "vector (the 8704-wide half FFN GLU output); rewritten several times/block"),
+    ("mixer_out", "f32", sp(12288),
+     "mixer GEMV output: attn q|gate (local 12x512=6144) or DN qkv (local "
+     "5120); on DN blocks reused for post-conv qkv (OP_SSM_CONV_SILU dst)"),
+    ("conv_ws", "f32", D_CONV * sp(CONV_CHANNELS),
+     "conv concat window [d_conv=4 x local channels]"),
+    ("gdn_alpha", "f32", sp(GDN_HEADS),
      "ssm_alpha GEMV out; becomes g = softplus(alpha+dt_bias)*a in place"),
-    ("gdn_beta", "f32", GDN_HEADS,
+    ("gdn_beta", "f32", sp(GDN_HEADS),
      "ssm_beta GEMV out; becomes sigmoid(beta) in place"),
-    ("gdn_state", "f32", 786432, "GDN state working copy (128x128x48)"),
-    ("attn_out", "f32", 6144,
+    ("gdn_state", "f32", sp(786432), "GDN state working copy (local heads)"),
+    ("attn_out", "f32", sp(6144),
      "mixer output vector: GDN token out / FATTN merged out; gated in place"),
-    ("gate_out", "f32", 6144, "DN z-gate GEMV out (attn_gate.weight)"),
-    ("k_stage", "f32", 1024, "current-token K row; normed+roped in place"),
-    ("v_stage", "f32", 1024, "current-token V row"),
-    ("fattn_q", "f32", ATTN_Q_HEADS * ATTN_HEAD_DIM,
-     "compact roped q (24 heads x 256), deinterleaved from mixer_out"),
+    ("gate_out", "f32", sp(6144), "DN z-gate GEMV out (attn_gate.weight)"),
+    ("k_stage", "f32", sp(1024), "current-token K row; normed+roped in place"),
+    ("v_stage", "f32", sp(1024), "current-token V row"),
+    ("fattn_q", "f32", sp(ATTN_Q_HEADS) * ATTN_HEAD_DIM,
+     "compact roped q (local heads x 256), deinterleaved from mixer_out"),
     ("fattn_partial", "f32", FATTN_PARTIAL_ELEMS,
-     "split-KV partials: 72 splits x 24 heads x (256 vkq + max + sumexp)"),
-    ("ffn_ws", "f32", N_FF, "FFN intermediate silu(gate)*up"),
+     "split-KV partials: 72 splits x local heads x (256 vkq + max + sumexp)"),
+    ("ffn_ws", "f32", sp(N_FF), "FFN intermediate silu(gate)*up (local half)"),
     ("proj_out", "f32", N_EMBD,
-     "block output projection (ssm_out / attn_output / ffn_down) awaiting the "
-     "residual fold in the next OP_RMSNORM (add_src)"),
-    ("logits", "f32", N_VOCAB, "lm head output"),
+     "block output projection (ssm_out / attn_output / ffn_down) partial, "
+     "reduced in place to the mirrored residual fold (next OP_RMSNORM add_src)"),
+    ("logits", "f32", sp(N_VOCAB), "lm head output (this GPU's vocab half)"),
 ]
 
 
@@ -268,16 +294,63 @@ def emit_quant(src, elems, anchor):
     return ins
 
 
-def emit_mmvq(kind, nodes, weight_ref, src_elems, dst, dst_off=0):
+def emit_mmvq(kind, nodes, weight_ref, src_elems, dst, dst_off=0, axis="row"):
+    """axis='row' (expand): this GPU computes M/NGPU output rows over the FULL
+    (mirrored) K-column input. axis='col' (contract): this GPU dots K/NGPU
+    input columns (its local activation half) over ALL M output rows into a
+    partial; the caller follows with emit_col_reduce. Both compact to local
+    buffers at offset 0 (the uploader slices each weight to this GPU's half)."""
     name = weight_name(weight_ref)
     lf = leaf(weight_ref)
-    rows = lf["ne"][1]
-    assert lf["ne"][0] == src_elems, (name, lf["ne"], src_elems)
+    K, M = lf["ne"][0], lf["ne"][1]
+    assert K == src_elems, (name, lf["ne"], src_elems)
+    if axis == "row":
+        row_hi, ncols = sp(M), K            # half rows, full mirrored input
+        est = weight_bytes(weight_ref) / NGPU
+    else:                                   # col: full rows, half input columns
+        row_hi, ncols = M, sp(K)
+        est = weight_bytes(weight_ref) / NGPU
     return I(kind, nodes,
              {"weight": "gguf:" + name, "src": "buf:q8_act",
-              "src_elems": src_elems, "dst": "buf:" + dst, "dst_off": dst_off,
-              "row_lo": 0, "row_hi": rows},   # FULL range: single-GPU binding
-             est=weight_bytes(weight_ref), reads={"q8_act"}, writes={dst})
+              "src_elems": ncols, "dst": "buf:" + dst, "dst_off": dst_off,
+              "row_lo": 0, "row_hi": row_hi, "split_axis": axis},
+             est=est, reads={"q8_act"}, writes={dst})
+
+
+# One reduce mailbox site per col-split contract projection (2/block x 64 =
+# 128). The push and the reduce are each a single-instruction window (whole
+# grid), so each adds one Y02 boundary: +2 boundaries per site.
+XCHG_SITE = [0]
+
+
+def emit_col_reduce(anchor):
+    """The cross-GPU fold for a col-split contract at buf:proj_out: push the
+    local partial to the peer's mailbox, boundary, then p0+p1 -> mirrored
+    proj_out (in place). No-op single-GPU."""
+    if not SPLIT:
+        return
+    site = XCHG_SITE[0]
+    XCHG_SITE[0] += 1
+    ipush = I("OP_XCHG_PUSH", [],
+              {"local_partial": "buf:proj_out",
+               "peer_payload": "mbox:peer_payload:%d" % site,
+               "n_elems": N_EMBD, "site": site},
+              est=N_EMBD * 4, reads={"proj_out"}, writes=set())
+    PROG[ipush]["dbg_node"] = anchor
+    PROG[ipush]["inserted"] = True
+    W(ipush)
+    ired = I("OP_XCHG_REDUCE", [],
+             {"local_partial": "buf:proj_out",
+              "my_payload": "mbox:my_payload:%d" % site,
+              "out": "buf:proj_out",
+              "peer_seqno": "mbox:peer_seqno:%d" % site,
+              "my_seqno": "mbox:my_seqno:%d" % site,
+              "n_elems": N_EMBD, "seqno": "sym:$seqno",
+              "gpu_index": "sym:$gpu_index", "site": site},
+             est=N_EMBD * 4, reads={"proj_out"}, writes={"proj_out"})
+    PROG[ired]["dbg_node"] = anchor
+    PROG[ired]["inserted"] = True
+    W(ired)
 
 
 # ---- per-block emitters ---------------------------------------------------
@@ -326,9 +399,10 @@ def emit_dn_block(bi, pending_add):
         gemv_nodes[which] = [mm, mm + 1]
         gemv_i[which] = I("OP_GEMV_F16", [mm, mm + 1],
                           {"weight": "gguf:" + name, "src": "buf:xn",
-                           "src_elems": N_EMBD, "row_lo": 0, "row_hi": GDN_HEADS,
+                           "src_elems": N_EMBD, "row_lo": 0,
+                           "row_hi": sp(GDN_HEADS),   # row-split: this GPU's heads
                            "dst": "buf:gdn_" + which},
-                          est=weight_bytes(wref),
+                          est=weight_bytes(wref) / NGPU,
                           reads={"xn"}, writes={"gdn_" + which})
     assert set(gemv_i) == {"alpha", "beta"}
 
@@ -341,8 +415,8 @@ def emit_dn_block(bi, pending_add):
     assert leaf(NODES[s_get[0]]["src"][1])["cls"] == "other:rs_main_index"
     i_load = I("OP_STATE_LOAD", ssf_live,
                {"src": "cache:" + s_name, "row": "sym:$rs_row",
-                "dst": "buf:gdn_state", "elems": 786432},
-               est=786432 * 4, reads={s_name}, writes={"gdn_state"})
+                "dst": "buf:gdn_state", "elems": sp(786432)},  # head-split state
+               est=sp(786432) * 4, reads={s_name}, writes={"gdn_state"})
     W(i_qkv, i_z, gemv_i["alpha"], gemv_i["beta"], i_load)
 
     # -- gate math + conv shift/concat (mutually independent)
@@ -355,7 +429,7 @@ def emit_dn_block(bi, pending_add):
                  "dt_bias": "gguf:" + weight_name(dt_ref),
                  "a": "gguf:" + weight_name(a_ref),
                  "g_dst": "buf:gdn_alpha", "beta_dst": "buf:gdn_beta",
-                 "heads": GDN_HEADS},
+                 "heads": sp(GDN_HEADS)},   # dt_bias/a sliced to this GPU's heads
                 est=512, reads={"gdn_alpha", "gdn_beta"},
                 writes={"gdn_alpha", "gdn_beta"})
 
@@ -366,10 +440,10 @@ def emit_dn_block(bi, pending_add):
     r_name = cache_name(resolve_leaf(NODES[c_get[0]]["src"][0]))
     i_conv = I("OP_CONV_SHIFT_CONCAT", css_live + ccs,
                {"conv_state": "cache:" + r_name, "row": "sym:$rs_row",
-                "token_col": "buf:mixer_out", "channels": CONV_CHANNELS,
+                "token_col": "buf:mixer_out", "channels": sp(CONV_CHANNELS),
                 "d_conv": D_CONV, "window_dst": "buf:conv_ws",
                 "state_writeback": "cache:" + r_name},
-               est=2 * (D_CONV - 1) * CONV_CHANNELS * 4,
+               est=2 * (D_CONV - 1) * sp(CONV_CHANNELS) * 4,
                reads={r_name, "mixer_out"}, writes={"conv_ws", r_name})
     W(i_gates, i_conv)
 
@@ -377,21 +451,22 @@ def emit_dn_block(bi, pending_add):
     conv_w = NODES[[x for x in scs if NODES[x]["op"] == "SSM_CONV"][0]]["src"][1]
     W(I("OP_SSM_CONV_SILU", scs,
         {"window": "buf:conv_ws", "kernel": "gguf:" + weight_name(conv_w),
-         "channels": CONV_CHANNELS, "d_conv": D_CONV, "silu": True,
+         "channels": sp(CONV_CHANNELS), "d_conv": D_CONV, "silu": True,
          "dst": "buf:mixer_out"},
         reads={"conv_ws"}, writes={"mixer_out"}))
+    # local qkv layout halves each segment: q [0,1024) k [1024,2048) v [2048,5120)
     W(I("OP_QK_L2NORM", l2n,
-        {"buf": "buf:mixer_out", "q_off": 0, "k_off": 2048,
-         "heads": 16, "head_dim": GDN_HEAD_DIM, "eps": EPS},
+        {"buf": "buf:mixer_out", "q_off": 0, "k_off": sp(2048),
+         "heads": sp(16), "head_dim": GDN_HEAD_DIM, "eps": EPS},
         reads={"mixer_out"}, writes={"mixer_out"}))
 
     # -- the delta-rule step
     W(I("OP_GDN_STEP", dstep,
-        {"qkv": "buf:mixer_out", "q_off": 0, "k_off": 2048, "v_off": 4096,
+        {"qkv": "buf:mixer_out", "q_off": 0, "k_off": sp(2048), "v_off": sp(4096),
          "g": "buf:gdn_alpha", "beta": "buf:gdn_beta", "state": "buf:gdn_state",
-         "dst": "buf:attn_out", "v_heads": GDN_HEADS, "k_heads": 16,
+         "dst": "buf:attn_out", "v_heads": sp(GDN_HEADS), "k_heads": sp(16),
          "head_dim": GDN_HEAD_DIM, "scale": 1.0 / math.sqrt(GDN_HEAD_DIM)},
-        est=786432 * 4,
+        est=sp(786432) * 4,
         reads={"mixer_out", "gdn_alpha", "gdn_beta", "gdn_state"},
         writes={"gdn_state", "attn_out"}))
 
@@ -402,22 +477,24 @@ def emit_dn_block(bi, pending_add):
     assert cache_name(NODES[st_view[0]]["src"][0]) == s_name
     i_store = I("OP_STATE_STORE", sst,
                 {"src": "buf:gdn_state", "dst": "cache:" + s_name,
-                 "row": "sym:$rs_row", "elems": 786432},
-                est=786432 * 4, reads={"gdn_state"}, writes={s_name})
+                 "row": "sym:$rs_row", "elems": sp(786432)},
+                est=sp(786432) * 4, reads={"gdn_state"}, writes={s_name})
     gon_rest = [x for x in gon if x not in z_nodes]
     assert len(gon_rest) == 6
     i_gated = I("OP_GATED_RMSNORM", gon_rest,
                 {"src": "buf:attn_out", "gate": "buf:gate_out",
                  "weight": "gguf:" + rmsnorm_weight(gon_rest),
-                 "dst": "buf:attn_out", "heads": GDN_HEADS,
+                 "dst": "buf:attn_out", "heads": sp(GDN_HEADS),
                  "head_dim": GDN_HEAD_DIM, "eps": EPS},
                 est=49152, reads={"attn_out", "gate_out"}, writes={"attn_out"})
     W(i_gated, i_store)
 
-    # -- output projection (AR16) and FFN
-    W(emit_quant("attn_out", 6144, opr[0]))
-    W(emit_mmvq("OP_MMVQ_AR16", opr, NODES[mulmats(opr)[0]]["src"][0],
-                6144, "proj_out"))
+    # -- output projection (AR16, col-split -> cross-GPU reduce) and FFN
+    W(emit_quant("attn_out", sp(6144), opr[0]))
+    i_op = emit_mmvq("OP_MMVQ_AR16", opr, NODES[mulmats(opr)[0]]["src"][0],
+                     6144, "proj_out", axis="col")
+    W(i_op)
+    emit_col_reduce(PROG[i_op]["dbg_node"])
     W(emit_rmsnorm(rms[1], rmsnorm_weight(rms[1]), "residual", "xn",
                    "proj_out", extra_nodes=radd[0]))
     emit_ffn(ffn)
@@ -440,15 +517,19 @@ def emit_ffn(ffn):
     assert weight_name(down_w).endswith("ffn_down.weight")
 
     W(emit_quant("xn", N_EMBD, gate_mm))
+    # up|gate: row-split (this GPU's half of the 17408 intermediate)
     W(I("OP_MMVQ_Q4_0_FUSED", [gate_mm, up_mm, glu],
         {"weight_gate": "gguf:" + weight_name(gate_w),
          "weight_up": "gguf:" + weight_name(up_w), "glu": "swiglu",
          "src": "buf:q8_act", "src_elems": N_EMBD, "dst": "buf:ffn_ws",
-         "row_lo": 0, "row_hi": N_FF},
-        est=weight_bytes(gate_w) + weight_bytes(up_w),
+         "row_lo": 0, "row_hi": sp(N_FF), "split_axis": "row"},
+        est=(weight_bytes(gate_w) + weight_bytes(up_w)) / NGPU,
         reads={"q8_act"}, writes={"ffn_ws"}))
-    W(emit_quant("ffn_ws", N_FF, down_mm[0]))
-    W(emit_mmvq("OP_MMVQ_Q4_0", down_mm, down_w, N_FF, "proj_out"))
+    # ffn_down: col-split (this GPU's half of the input) -> cross-GPU reduce
+    W(emit_quant("ffn_ws", sp(N_FF), down_mm[0]))
+    i_dn = emit_mmvq("OP_MMVQ_Q4_0", down_mm, down_w, N_FF, "proj_out", axis="col")
+    W(i_dn)
+    emit_col_reduce(PROG[i_dn]["dbg_node"])
 
 
 ROPE_PARAMS = {"n_dims": 64, "mode": "IMROPE", "sections": [11, 11, 10, 0],
@@ -499,10 +580,10 @@ def emit_attn_block(bi, pending_add):
             assert leaf(NODES[x]["src"][1])["cls"] == "positions"
     W(I("OP_QK_NORM_ROPE", q_rest + k_rest,
         {"q_src": "buf:mixer_out", "q_off": 0, "q_head_stride": 512,
-         "q_heads": ATTN_Q_HEADS,
+         "q_heads": sp(ATTN_Q_HEADS),
          "q_norm_weight": "gguf:" + rmsnorm_weight(q_rest),
          "q_dst": "buf:fattn_q",
-         "k_src": "buf:k_stage", "k_heads": ATTN_KV_HEADS,
+         "k_src": "buf:k_stage", "k_heads": sp(ATTN_KV_HEADS),
          "k_norm_weight": "gguf:" + rmsnorm_weight(k_rest),
          "k_dst": "buf:k_stage",
          "head_dim": ATTN_HEAD_DIM, "eps": EPS,
@@ -522,7 +603,8 @@ def emit_attn_block(bi, pending_add):
     W(I("OP_KV_APPEND", kva,
         {"k_src": "buf:k_stage", "v_src": "buf:v_stage",
          "cache_k": "cache:" + caches["k"], "cache_v": "cache:" + caches["v"],
-         "row": "sym:$kv_row", "row_width": 1024},
+         "row": "sym:$kv_row",
+         "row_width": sp(ATTN_KV_HEADS) * ATTN_HEAD_DIM},  # head-split KV row
         reads={"k_stage", "v_stage"}, writes={caches["k"], caches["v"]}))
 
     # -- flash attention: prep views fold into the decode args
@@ -533,8 +615,9 @@ def emit_attn_block(bi, pending_add):
     W(I("OP_FATTN_DECODE", fprep + fdec,
         {"q": "buf:fattn_q", "cache_k": "cache:" + caches["k"],
          "cache_v": "cache:" + caches["v"], "mask": "cell:mask_f16",
-         "n_kv": "sym:$n_kv", "q_heads": ATTN_Q_HEADS,
-         "kv_heads": ATTN_KV_HEADS, "gqa": ATTN_Q_HEADS // ATTN_KV_HEADS,
+         "n_kv": "sym:$n_kv", "q_heads": sp(ATTN_Q_HEADS),
+         "kv_heads": sp(ATTN_KV_HEADS),
+         "gqa": sp(ATTN_Q_HEADS) // sp(ATTN_KV_HEADS),
          "head_dim": ATTN_HEAD_DIM, "scale": 0.0625, "prec": "f32",
          "partials": "buf:fattn_partial",
          "partial_layout": "[split][q_head][256 vkq | max | sumexp]"},
@@ -543,22 +626,24 @@ def emit_attn_block(bi, pending_add):
         writes={"fattn_partial"}))
     i_red = I("OP_FATTN_REDUCE", [],
               {"partials": "buf:fattn_partial", "n_splits": GRID,
-               "q_heads": ATTN_Q_HEADS, "head_dim": ATTN_HEAD_DIM,
+               "q_heads": sp(ATTN_Q_HEADS), "head_dim": ATTN_HEAD_DIM,
                "dst": "buf:attn_out"},
               reads={"fattn_partial"}, writes={"attn_out"})
     PROG[i_red]["dbg_node"] = fa
     PROG[i_red]["inserted"] = True
     W(i_red)
 
-    # -- sigmoid(gate) * attn, o-projection, FFN
+    # -- sigmoid(gate) * attn, o-projection (col-split -> reduce), FFN
     W(I("OP_ATTN_GATE", ago,
         {"attn": "buf:attn_out", "gate_src": "buf:mixer_out", "gate_off": 256,
-         "gate_head_stride": 512, "heads": ATTN_Q_HEADS,
+         "gate_head_stride": 512, "heads": sp(ATTN_Q_HEADS),
          "head_dim": ATTN_HEAD_DIM, "dst": "buf:attn_out"},
         reads={"attn_out", "mixer_out"}, writes={"attn_out"}))
-    W(emit_quant("attn_out", 6144, og[0]))
-    W(emit_mmvq("OP_MMVQ_Q4_0", og, NODES[mulmats(og)[0]]["src"][0],
-                6144, "proj_out"))
+    W(emit_quant("attn_out", sp(6144), og[0]))
+    i_o = emit_mmvq("OP_MMVQ_Q4_0", og, NODES[mulmats(og)[0]]["src"][0],
+                    6144, "proj_out", axis="col")
+    W(i_o)
+    emit_col_reduce(PROG[i_o]["dbg_node"])
     W(emit_rmsnorm(rms[1], rmsnorm_weight(rms[1]), "residual", "xn",
                    "proj_out", extra_nodes=radd[0]))
     emit_ffn(ffn)
@@ -602,13 +687,15 @@ W(emit_rmsnorm(frms, rmsnorm_weight(frms), "residual", "xn", "proj_out",
                               "(batch-1: always row 0 of a 1-row trunk)"}))
 hg, = insts("post", "head_gemv", 1)
 head_w = NODES[hg[0]]["src"][0]
+# lm_head is row-split (vocab-split): each GPU produces its half of the 248320
+# logits; the harness concatenates the two halves for the full vector.
 W(I("OP_HEAD_GEMV_F16", hg,
     {"weight": "gguf:" + weight_name(head_w), "src": "buf:xn",
-     "row_lo": 0, "row_hi": N_VOCAB,   # FULL range: single-GPU binding
+     "row_lo": 0, "row_hi": sp(N_VOCAB), "split_axis": "row",
      "dst": "buf:logits"},
-    est=weight_bytes(head_w), reads={"xn"}, writes={"logits"}))
+    est=weight_bytes(head_w) / NGPU, reads={"xn"}, writes={"logits"}))
 i_emit = I("OP_LOGITS_EMIT", [],
-           {"src": "buf:logits", "elems": N_VOCAB,
+           {"src": "buf:logits", "elems": sp(N_VOCAB),
             "dst": "cell:result_output", "flag": "cell:done_flag"},
            reads={"logits"}, writes={"result_output", "done_flag"})
 PROG[i_emit]["dbg_node"] = hg[0]
@@ -728,9 +815,20 @@ program = {
         "source": "k0/schedule.csv + k0/leaves.csv (3704 nodes, 990 leaves); "
                   "compiled by k0/compile_schedule.py",
         "isa": "core/isa.cuh MacroKind; grid 72 blocks",
+        "split": ("dual-GPU tensor-parallel: NGPU=2, one program packed per "
+                  "GPU. Expand GEMVs (qkv/up|gate/lm_head) row-split (half "
+                  "output rows); contract GEMVs (attn_output/ffn_down/ssm_out) "
+                  "col-split (half input columns) + OP_XCHG_PUSH/BOUNDARY/"
+                  "OP_XCHG_REDUCE fold (%d sites); KV/state head-split; "
+                  "residual/norms/rope/gates/embed mirrored"
+                  % XCHG_SITE[0]) if SPLIT else "single GPU",
         "binding": {
-            "gpu": "single GPU: all GEMV row ranges are FULL [0, nrows); the "
-                   "dual-GPU compile later parameterizes rows by the meta split",
+            "gpu": ("dual GPU: this GPU computes its half of every split "
+                    "dimension; the harness slices each weight to this GPU's "
+                    "row/column/head range and patches $gpu_index + peer "
+                    "mailbox pointers at pack time") if SPLIT else
+                   ("single GPU: all GEMV row ranges are FULL [0, nrows); the "
+                    "dual-GPU compile parameterizes rows by the meta split"),
             "sequence": "single sequence (k=0): zero-extent clear chains and "
                         "the dead rs_index_setup views are dropped "
                         "(SCHEDULE-QUESTIONS items 14/15, a design decision "
@@ -801,6 +899,10 @@ program = {
                        "constant under the single-sequence binding but kept "
                        "symbolic)",
             "$out_row": "epilogue row select; always 0 at batch-1",
+            "$seqno": "(--split) monotonic per-site exchange seqno = pass "
+                      "number; host patches each OP_XCHG_REDUCE payload/pass",
+            "$gpu_index": "(--split) 0 or 1; selects the fixed p0+p1 fold "
+                          "order; pack-time constant per GPU",
         },
         "input_cells": {
             "token": "i32[1] token id",
@@ -839,7 +941,7 @@ program = {
     "instructions": instructions,
 }
 
-out_path = os.path.join(HERE, "program.json")
+out_path = os.path.join(HERE, "program-split.json" if SPLIT else "program.json")
 with open(out_path, "w") as f:
     json.dump(program, f, indent=1)
 

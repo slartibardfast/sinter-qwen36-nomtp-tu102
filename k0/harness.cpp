@@ -52,6 +52,7 @@
 //     uploaded: it is absent from the k=0 decode graph (BLOCKS.md, MTP off).
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -75,6 +76,7 @@
 #include "ops/gdn.cuh"
 #include "ops/gemv.cuh"
 #include "ops/attn.cuh"
+#include "ops/xchg.cuh"           // dual-GPU cross-GPU reduce Args structs
 #include "gguf.h"
 
 #define CUDA_CHECK(expr) do { \
@@ -520,6 +522,7 @@ struct Runtime {
         // Parity residual-stream buffer: row il = residual after block il
         // (l_out-il, blocks 0..62), written by each attn_norm RMSNORM's dbg.
         alloc(R, "dbg_lout", (size_t) N_LOUT * N_EMBD * 4);
+        alloc(R, "dbg_mid", (size_t) (N_LAYER + 1) * N_EMBD * 4); // mid + embed bisect
 
         if (program && program->get("buffers")) {
             const Jv &tbl = program->at("buffers");
@@ -624,6 +627,10 @@ struct PackCtx {
     const Resolver &R;
     const mk::Instr &proto;
     std::vector<size_t> &out_idx_fattn;  // indices (into `out`) of FATTN_DECODEs
+    // Dual-GPU (--tensor) extras; nullptr/-1 in the single-GPU path.
+    const std::map<std::string, void *> *mbox = nullptr;  // "peer_payload:0"->ptr
+    int gpu_index = -1;                  // 0/1, selects the p0+p1 fold order
+    std::vector<size_t> *out_idx_xchg = nullptr;  // OP_XCHG_REDUCE ($seqno patch)
 };
 
 template <class Args>
@@ -679,6 +686,19 @@ static void pack_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
     int il  = lout_index_of(a);
     r.dbg   = il >= 0 ? reinterpret_cast<float *>(c.R.resolve("dbg_lout")) + (size_t) il * N_EMBD
                       : nullptr;
+    // BISECT: post_attention_norm folds the mixer output -> capture the mid-block
+    // residual (embed + mixer, before the FFN) into dbg_mid[block]. And capture
+    // block-0's attn_norm INPUT (= the embedding, no add) into dbg_mid[N_LAYER].
+    {
+        const std::string w = arg_str(a, "weight");
+        size_t b = w.find("blk.");
+        float *mid = reinterpret_cast<float *>(c.R.resolve("dbg_mid"));
+        if (b != std::string::npos && arg_has(a, "add_src") &&
+            w.find(".post_attention_norm.weight") != std::string::npos)
+            r.dbg = mid + (size_t) atoi(w.c_str() + b + 4) * N_EMBD;
+        else if (w == "gguf:blk.0.attn_norm.weight")
+            r.dbg = mid + (size_t) N_LAYER * N_EMBD;   // = the embedding (no add)
+    }
     emit(out, c.proto, r);
 }
 
@@ -911,6 +931,35 @@ static void pack_LOGITS_EMIT(const Jv &a, PackCtx &c, std::vector<mk::Instr> &ou
     e.flag       = nullptr;   // multi-block copy: rely on the kernel's pass done
     emit(out, c.proto, e);
 }
+// mailbox arg "mbox:peer_payload:0" -> key "peer_payload:0" in the per-GPU table.
+static void *mbox_ptr(PackCtx &c, const Jv &a, const char *k) {
+    if (!c.mbox) throw std::runtime_error("XCHG op packed without a mailbox table (single-GPU?)");
+    std::string s = arg_str(a, k);                 // "mbox:peer_payload:0"
+    if (s.rfind("mbox:", 0) != 0) throw std::runtime_error("XCHG: bad mailbox spec " + s);
+    auto it = c.mbox->find(s.substr(5));
+    if (it == c.mbox->end()) throw std::runtime_error("XCHG: unknown mailbox " + s);
+    return it->second;
+}
+static void pack_XCHG_PUSH(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::XchgPushArgs x{};
+    x.local_partial = dev_f32(c.R, a, "local_partial");
+    x.peer_payload  = reinterpret_cast<float *>(mbox_ptr(c, a, "peer_payload"));
+    x.n_elems       = (int) arg_i(a, "n_elems");
+    emit(out, c.proto, x);
+}
+static void pack_XCHG_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
+    mk::XchgReduceArgs x{};
+    x.local_partial = dev_f32(c.R, a, "local_partial");
+    x.my_payload    = reinterpret_cast<const float *>(mbox_ptr(c, a, "my_payload"));
+    x.out           = dev_f32(c.R, a, "out");
+    x.peer_seqno    = reinterpret_cast<unsigned *>(mbox_ptr(c, a, "peer_seqno"));
+    x.my_seqno      = reinterpret_cast<const unsigned *>(mbox_ptr(c, a, "my_seqno"));
+    x.n_elems       = (int) arg_i(a, "n_elems");
+    x.seqno         = 0;                 // $seqno, patched per pass (= pass number)
+    x.gpu_index     = c.gpu_index;       // fixed p0+p1 fold order
+    if (c.out_idx_xchg) c.out_idx_xchg->push_back(out.size());
+    emit(out, c.proto, x);
+}
 [[noreturn]] static void pack_unsupported(const Jv &, PackCtx &c, std::vector<mk::Instr> &) {
     throw std::runtime_error(std::string("packer: kind ") +
         std::to_string(c.proto.kind) + " not supported at the single-GPU binding");
@@ -943,8 +992,8 @@ static const KindEntry KIND_TABLE[] = {
     { mk::OP_RESIDUAL_ADD,      "RESIDUAL_ADD",      pack_unsupported },
     { mk::OP_STATE_LOAD,        "STATE_LOAD",        pack_STATE_LOAD },
     { mk::OP_STATE_STORE,       "STATE_STORE",       pack_STATE_STORE },
-    { mk::OP_XCHG_PUSH,         "XCHG_PUSH",         pack_unsupported },
-    { mk::OP_XCHG_REDUCE,       "XCHG_REDUCE",       pack_unsupported },
+    { mk::OP_XCHG_PUSH,         "XCHG_PUSH",         pack_XCHG_PUSH },
+    { mk::OP_XCHG_REDUCE,       "XCHG_REDUCE",       pack_XCHG_REDUCE },
 };
 
 static const KindEntry *kind_by_name(const std::string &raw) {
@@ -956,13 +1005,16 @@ static const KindEntry *kind_by_name(const std::string &raw) {
 struct PackedProgram {
     std::vector<mk::Instr> instrs;
     std::vector<size_t> fattn_idx;     // FATTN_DECODE positions ($n_kv patch)
+    std::vector<size_t> xchg_idx;      // OP_XCHG_REDUCE positions ($seqno patch)
     uint32_t epoch_stride = 0;
     bool complete = false;
     std::string first_failure;
     size_t packed_before_failure = 0;
 };
 
-static PackedProgram pack_program(const Jv &pj, const Resolver &R) {
+static PackedProgram pack_program(const Jv &pj, const Resolver &R,
+                                  const std::map<std::string, void *> *mbox = nullptr,
+                                  int gpu_index = -1) {
     PackedProgram out;
     // epoch_stride lives under meta.per_pass (boundaries per pass); the kernel
     // crosses boundaries by counter, so this is informational (G15 accounting).
@@ -989,7 +1041,7 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R) {
                              ? (uint32_t) ij.at("dbg_node").as_i() : 0;
         static const Jv empty_args;
         const Jv *args = ij.get("args");
-        PackCtx ctx{R, proto, out.fattn_idx};
+        PackCtx ctx{R, proto, out.fattn_idx, mbox, gpu_index, &out.xchg_idx};
         try {
             ke->pack(args ? *args : empty_args, ctx, out.instrs);
         } catch (const std::exception &e) {
@@ -1288,6 +1340,542 @@ static int bench_run(Runtime &rt, Launcher &ln, int gpu, int64_t n_tokens) {
     return 0;
 }
 
+// ===========================================================================
+// DUAL-GPU tensor-parallel path (--parity-tensor / --bench-tensor)
+//
+// Two cooperative kernels (one per TU102), one split program packed per GPU.
+// The op implementations are the verified single-GPU ops UNCHANGED; the split
+// lives entirely in (1) the weight slice each GPU uploads, (2) the halved
+// ranges/counts the compiler emits, (3) the 128 cross-GPU reduce sites. See
+// core/DUAL-GPU-DESIGN.md, docs/INTEGRATION-FINDINGS.md (per-weight axis),
+// k0/PARITY-TENSOR.md.
+// ===========================================================================
+
+// -- per-weight split axis (docs/INTEGRATION-FINDINGS.md, section A) ----------
+//
+// Simple contiguous axes for the attention/FFN/norm weights, plus a STRIDED
+// mode for the DeltaNet head weights. The GDN step maps v-head h to q/k-head
+// (h % n_k_heads) — a MODULO grouping (k0/ops/gdn.cuh:256) — so a contiguous
+// v-head split would pair v-heads with k-heads on the wrong GPU. The v-head
+// dimension (and the fused qkv / conv1d that carry it) must instead be split
+// in blocks of n_k_heads(16) heads, taking this GPU's half of each block. In
+// row/channel units that is a period of 16*head_dim=2048; for the per-v-head
+// scalar params it is a period of 16. q and k (16 heads each, one block) fall
+// out as their contiguous first half under the same period-16 rule.
+enum WAxis { WA_MIRROR, WA_ROW, WA_COL };
+
+static bool name_ends(const std::string &name, const char *suf) {
+    size_t n = strlen(suf);
+    return name.size() >= n && name.compare(name.size() - n, n, suf) == 0;
+}
+
+// Strided DeltaNet split descriptor. dim: 0 none, 1 ROW(split ne[1]),
+// 2 COL(split ne[0]/input columns), 3 ROW1D(split the flat ne[0] vector).
+// period is in units of that dimension (heads*head_dim, or bare heads).
+struct DnStride { int dim; int64_t period; };
+static DnStride dn_stride(const std::string &name) {
+    if (name_ends(name, ".attn_qkv.weight"))  return { 1, 2048 };  // q|k|v rows
+    if (name_ends(name, ".ssm_conv1d.weight")) return { 1, 2048 }; // q|k|v channels
+    if (name_ends(name, ".attn_gate.weight"))  return { 1, 2048 }; // v-head z-gate rows
+    if (name_ends(name, ".ssm_alpha.weight"))  return { 1, 16 };   // per-v-head rows
+    if (name_ends(name, ".ssm_beta.weight"))   return { 1, 16 };
+    if (name_ends(name, ".ssm_a"))             return { 3, 16 };   // per-v-head vector
+    if (name_ends(name, ".ssm_dt.bias"))       return { 3, 16 };
+    if (name_ends(name, ".ssm_out.weight"))    return { 2, 2048 }; // v-head input cols
+    return { 0, 0 };
+}
+
+static WAxis weight_axis(const std::string &name) {
+    if (name == "token_embd.weight" || name == "output_norm.weight" ||
+        name_ends(name, ".attn_norm.weight") ||
+        name_ends(name, ".post_attention_norm.weight") ||
+        name_ends(name, ".attn_q_norm.weight") ||
+        name_ends(name, ".attn_k_norm.weight") ||
+        name_ends(name, ".ssm_norm.weight"))
+        return WA_MIRROR;
+    if (name_ends(name, ".attn_output.weight") || name_ends(name, ".ffn_down.weight"))
+        return WA_COL;                                   // attention/FFN contract
+    // ROW (AXIS_1): attention expand projections (contiguous head split).
+    if (name_ends(name, ".attn_q.weight") || name_ends(name, ".attn_k.weight") ||
+        name_ends(name, ".attn_v.weight") ||
+        name_ends(name, ".ffn_gate.weight") || name_ends(name, ".ffn_up.weight") ||
+        name == "output.weight")
+        return WA_ROW;
+    return WA_MIRROR;
+}
+
+// This GPU's slice of a weight into `stage` (or a direct pointer for the
+// contiguous cases); returns the local byte count.  NGPU==2 exact halves.
+static size_t weight_slice(const gguf::TensorInfo &t, int g,
+                           std::vector<uint8_t> &stage, const uint8_t *&src) {
+    const gguf::TypeTraits *tt = gguf::type_traits(t.type);
+    const size_t rowbytes = (size_t)(t.ne[0] / tt->block_elems) * tt->block_bytes;
+
+    // DeltaNet head weights: strided (period-block) split.
+    DnStride ds = dn_stride(t.name);
+    if (ds.dim == 1) {                 // split ne[1] rows in period blocks
+        const int64_t nblk = t.ne[1] / ds.period, half = ds.period / 2;
+        stage.resize((size_t)(nblk * half) * rowbytes);
+        size_t cur = 0;
+        for (int64_t b = 0; b < nblk; b++) {
+            const size_t off = (size_t)(b * ds.period + (int64_t) g * half) * rowbytes;
+            memcpy(stage.data() + cur, t.data + off, (size_t) half * rowbytes);
+            cur += (size_t) half * rowbytes;
+        }
+        src = stage.data();
+        return stage.size();
+    }
+    if (ds.dim == 3) {                 // split the flat ne[0] vector in period blocks
+        const size_t es = tt->block_bytes;             // f32 scalar per head
+        const int64_t nblk = t.ne[0] / ds.period, half = ds.period / 2;
+        stage.resize((size_t)(nblk * half) * es);
+        size_t cur = 0;
+        for (int64_t b = 0; b < nblk; b++) {
+            memcpy(stage.data() + cur, t.data + (size_t)(b * ds.period + (int64_t) g * half) * es,
+                   (size_t) half * es);
+            cur += (size_t) half * es;
+        }
+        src = stage.data();
+        return stage.size();
+    }
+    if (ds.dim == 2) {                 // COL: per row, strided input-column blocks
+        const size_t M = t.ne[1];
+        const size_t colblk = tt->block_bytes;         // bytes per block_elems columns
+        const int64_t nblk = t.ne[0] / ds.period, half = ds.period / 2;
+        const size_t runbytes = (size_t)(half / tt->block_elems) * colblk;   // per row-block
+        const size_t rowlocal = (size_t) nblk * runbytes;
+        stage.resize(M * rowlocal);
+        for (size_t r = 0; r < M; r++)
+            for (int64_t b = 0; b < nblk; b++) {
+                const size_t soff = r * rowbytes +
+                    (size_t)((b * ds.period + (int64_t) g * half) / tt->block_elems) * colblk;
+                memcpy(stage.data() + r * rowlocal + (size_t) b * runbytes,
+                       t.data + soff, runbytes);
+            }
+        src = stage.data();
+        return stage.size();
+    }
+
+    // Simple contiguous axes (attention / FFN / norms).
+    const WAxis ax = weight_axis(t.name);
+    if (ax == WA_MIRROR) { src = t.data; return t.nbytes; }
+    if (ax == WA_ROW) { src = t.data + (size_t) g * (t.nbytes / 2); return t.nbytes / 2; }
+    // WA_COL: each of ne[1] rows, this GPU's contiguous half of the columns.
+    const size_t M = t.ne[1], half = rowbytes / 2;
+    stage.resize(M * half);
+    for (size_t r = 0; r < M; r++)
+        memcpy(stage.data() + r * half, t.data + r * rowbytes + (size_t) g * half, half);
+    src = stage.data();
+    return stage.size();
+}
+
+// -- per-GPU context ---------------------------------------------------------
+struct GpuCtx {
+    int device = -1, gpu_index = -1;
+    Resolver R;
+    void *warena = nullptr;
+    size_t warena_bytes = 0;
+    std::map<std::string, DevBuf> bufs;
+    float    *mbox_payload = nullptr;   // my inbox payloads [n_sites][5120] f32
+    unsigned *mbox_seqno = nullptr;     // my inbox seqnos, one 128 B line/site
+    std::map<std::string, void *> mtab; // "peer_payload:0" -> ptr (for the packer)
+    Launcher ln;
+    std::vector<size_t> fattn_idx, xchg_idx;
+    int64_t n_ctx = 8192, mask_cap = 0, n_vocab_full = 0;
+    cudaStream_t pstream = nullptr;
+    // seqno field offset inside a packed OP_XCHG_REDUCE instruction.
+    static constexpr size_t SEQNO_OFF =
+        offsetof(mk::Instr, payload) + offsetof(mk::XchgReduceArgs, seqno);
+};
+
+static const int MBOX_PAYLOAD_ELEMS = 5120;   // full residual width
+static const int MBOX_SEQNO_STRIDE  = 32;      // u32 per 128 B line
+
+static void gpu_upload_weights(GpuCtx &c, gguf::File &gg) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    std::vector<uint8_t> stage;
+    const uint8_t *src;
+    size_t total = 0, n_mirror = 0, n_row = 0, n_col = 0, n_dn = 0;
+    for (auto &t : gg.tensors) {
+        if (t.name.rfind("blk.64.", 0) == 0) continue;
+        total += pad_up((int64_t) weight_slice(t, c.gpu_index, stage, src), 256);
+    }
+    CUDA_CHECK(cudaMalloc(&c.warena, total));
+    c.warena_bytes = total;
+    size_t cursor = 0;
+    for (auto &t : gg.tensors) {
+        if (t.name.rfind("blk.64.", 0) == 0) continue;
+        size_t lb = weight_slice(t, c.gpu_index, stage, src);
+        if (dn_stride(t.name).dim) n_dn++;
+        else switch (weight_axis(t.name)) {
+            case WA_MIRROR: n_mirror++; break; case WA_ROW: n_row++; break;
+            case WA_COL: n_col++; break;
+        }
+        void *dst = (char *) c.warena + cursor;
+        CUDA_CHECK(cudaMemcpy(dst, src, lb, cudaMemcpyHostToDevice));
+        c.R.add(t.name, dst, lb);
+        cursor += pad_up((int64_t) lb, 256);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    printf("  gpu %d (index %d): %.2f GB sliced weights "
+           "(mirror %zu, row %zu, col %zu, dn-strided %zu)\n",
+           c.device, c.gpu_index, c.warena_bytes / 1e9, n_mirror, n_row, n_col, n_dn);
+}
+
+static void gpu_alloc_buffers(GpuCtx &c, const Jv &program) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&c.pstream, cudaStreamNonBlocking));
+    auto alloc = [&](const std::string &nm, size_t bytes, bool zero = true) {
+        void *p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, bytes ? bytes : 4));
+        if (zero) CUDA_CHECK(cudaMemset(p, 0, bytes ? bytes : 4));
+        c.bufs[nm] = { p, bytes };
+        c.R.add(nm, p, bytes);
+        return p;
+    };
+    const size_t kv_row = (size_t)(N_EMBD_GQA / 2);       // 512 f16 elems (2 kv heads)
+    for (int il = 0; il < N_LAYER; il++) if (is_attn_layer(il)) {
+        size_t b = (size_t) c.n_ctx * kv_row * 2;
+        alloc("cache_k_l" + std::to_string(il), b);
+        alloc("cache_v_l" + std::to_string(il), b);
+    }
+    for (int il = 0; il < N_LAYER; il++) if (!is_attn_layer(il)) {
+        alloc("conv_state_l" + std::to_string(il), (size_t)(CONV_STATE_N / 2) * 4);
+        alloc("ssm_state_l" + std::to_string(il), (size_t)(SSM_STATE_N / 2) * 4);
+    }
+    alloc("positions", 16);
+    alloc("kv_row", 8);
+    alloc("rs_row", 8);
+    c.mask_cap = pad_up(c.n_ctx, 256);
+    alloc("mask_f16", (size_t) c.mask_cap * 2);
+    alloc("result_output", (size_t)(c.n_vocab_full / 2) * 4);  // this GPU's vocab half
+    alloc("done_flag", 4);
+    alloc("fattn_error", 4);
+    alloc("dbg_lout", (size_t) N_LOUT * N_EMBD * 4);           // mirrored residual
+    alloc("dbg_mid", (size_t) (N_LAYER + 1) * N_EMBD * 4);   // mid + embed bisect
+    const Jv &tbl = program.at("buffers");
+    for (auto &b : tbl.arr) alloc(b.at("name").str, (size_t) b.at("bytes").as_i());
+}
+
+static void gpu_alloc_mailboxes(GpuCtx &c, int n_sites) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    CUDA_CHECK(cudaMalloc(&c.mbox_payload, (size_t) n_sites * MBOX_PAYLOAD_ELEMS * 4));
+    CUDA_CHECK(cudaMemset(c.mbox_payload, 0, (size_t) n_sites * MBOX_PAYLOAD_ELEMS * 4));
+    CUDA_CHECK(cudaMalloc(&c.mbox_seqno, (size_t) n_sites * MBOX_SEQNO_STRIDE * 4));
+    CUDA_CHECK(cudaMemset(c.mbox_seqno, 0, (size_t) n_sites * MBOX_SEQNO_STRIDE * 4));
+}
+
+// Wire the packer's mailbox table: my inbox (peer writes here), and the peer's
+// inbox (I push/publish there). Peer access is enabled both ways beforehand.
+static void gpu_wire_mailboxes(GpuCtx &c, GpuCtx &peer, int n_sites) {
+    for (int s = 0; s < n_sites; s++) {
+        std::string ss = std::to_string(s);
+        c.mtab["my_payload:" + ss]   = c.mbox_payload + (size_t) s * MBOX_PAYLOAD_ELEMS;
+        c.mtab["my_seqno:" + ss]     = c.mbox_seqno + (size_t) s * MBOX_SEQNO_STRIDE;
+        c.mtab["peer_payload:" + ss] = peer.mbox_payload + (size_t) s * MBOX_PAYLOAD_ELEMS;
+        c.mtab["peer_seqno:" + ss]   = peer.mbox_seqno + (size_t) s * MBOX_SEQNO_STRIDE;
+    }
+}
+
+// Write positions / kv_row / mask / zero fattn_error for this token on GPU c.
+static int64_t gpu_set_inputs(GpuCtx &c, int64_t pos) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    int32_t p4[4] = { (int32_t) pos, (int32_t) pos, (int32_t) pos, (int32_t) pos };
+    int64_t row = pos, n_past = pos, n_kv = pad_up(n_past + 1, 256);
+    if (n_kv > c.mask_cap) throw std::runtime_error("mask: n_kv past n_ctx padding cap");
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["positions"].ptr, p4, 16, cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["kv_row"].ptr, &row, 8, cudaMemcpyHostToDevice, c.pstream));
+    static std::vector<uint16_t> mask;
+    mask.resize((size_t) n_kv);
+    for (int64_t j = 0; j < n_kv; j++) mask[(size_t) j] = j <= n_past ? F16_ZERO : F16_NEG_INF;
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["mask_f16"].ptr, mask.data(), (size_t) n_kv * 2,
+                               cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemsetAsync(c.bufs["fattn_error"].ptr, 0, 4, c.pstream));
+    CUDA_CHECK(cudaStreamSynchronize(c.pstream));
+    return n_kv;
+}
+
+static void gpu_read_f32(GpuCtx &c, const std::string &name, std::vector<float> &out,
+                         size_t n_elems, size_t byte_off = 0) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    out.resize(n_elems);
+    CUDA_CHECK(cudaMemcpy(out.data(), (char *) c.bufs[name].ptr + byte_off,
+                          n_elems * 4, cudaMemcpyDeviceToHost));
+}
+
+// Ring both doorbells, then wait both done (bounded; never kills).
+static bool dual_run_pass(GpuCtx g2[2], int32_t token, uint32_t n_kv, unsigned seqno,
+                          double timeout_ms) {
+    // Per-pass device patches ($n_kv, $seqno) and the token ride the copy
+    // stream ASYNC; one sync per GPU collapses what would be 288 blocking
+    // 4-byte copies/pass into 2 stream syncs. The persistent kernel spins at
+    // the doorbell between passes, so patching d_program in place is safe.
+    static thread_local unsigned s_nkv, s_seq;   // stable sources for async copies
+    s_nkv = n_kv;
+    s_seq = seqno;
+    for (int g = 0; g < 2; g++) {
+        GpuCtx &c = g2[g];
+        CUDA_CHECK(cudaSetDevice(c.device));
+        if (c.ln.h.h_err[0] != 0) {
+            fprintf(stderr, "gpu %d device error %u (aux %u) already set\n",
+                    c.device, c.ln.h.h_err[0], c.ln.h.h_err[1]);
+            return false;
+        }
+        for (size_t idx : c.fattn_idx)
+            CUDA_CHECK(cudaMemcpyAsync((char *) c.ln.h.d_program + idx * sizeof(mk::Instr) +
+                                       Launcher::N_KV_OFF, &s_nkv, 4, cudaMemcpyHostToDevice,
+                                       c.ln.h.cstream));
+        for (size_t idx : c.xchg_idx)
+            CUDA_CHECK(cudaMemcpyAsync((char *) c.ln.h.d_program + idx * sizeof(mk::Instr) +
+                                       GpuCtx::SEQNO_OFF, &s_seq, 4, cudaMemcpyHostToDevice,
+                                       c.ln.h.cstream));
+        c.ln.h.pass += 1;
+        CUDA_CHECK(cudaMemcpyAsync(c.ln.h.d_token, &token, 4, cudaMemcpyHostToDevice,
+                                   c.ln.h.cstream));
+    }
+    for (int g = 0; g < 2; g++) {
+        CUDA_CHECK(cudaSetDevice(g2[g].device));
+        CUDA_CHECK(cudaStreamSynchronize(g2[g].ln.h.cstream));
+        std::atomic_thread_fence(std::memory_order_release);
+        *g2[g].ln.h.h_doorbell = g2[g].ln.h.pass;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::duration<double, std::milli>(timeout_ms);
+    for (;;) {
+        for (int g = 0; g < 2; g++)
+            if (g2[g].ln.h.h_err[0] != 0) {
+                fprintf(stderr, "gpu %d device error %u (aux %u) on pass %u\n",
+                        g2[g].device, g2[g].ln.h.h_err[0], g2[g].ln.h.h_err[1], g2[g].ln.h.pass);
+                return false;
+            }
+        bool d0 = g2[0].ln.h.h_done[0] == g2[0].ln.h.pass;
+        bool d1 = g2[1].ln.h.h_done[0] == g2[1].ln.h.pass;
+        if (d0 && d1) return true;
+        if (std::chrono::steady_clock::now() > deadline) {
+            fprintf(stderr, "dual_run_pass TIMEOUT pass %u: done g0=%d g1=%d "
+                    "(not killing — context teardown at exit reclaims)\n",
+                    g2[0].ln.h.pass, d0, d1);
+            for (int g = 0; g < 2; g++) {
+                cudaSetDevice(g2[g].device);
+                cudaError_t q = cudaStreamQuery(g2[g].ln.h.kstream);
+                fprintf(stderr, "  gpu %d kstream %s\n", g2[g].device,
+                        q == cudaSuccess ? "idle" : q == cudaErrorNotReady ? "running"
+                                                    : cudaGetErrorString(q));
+            }
+            return false;
+        }
+    }
+}
+
+// Set up both GPUs from one mmap'd GGUF + the split program. n_sites from the
+// program (count of OP_XCHG_REDUCE == count of OP_XCHG_PUSH).
+static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t n_ctx,
+                       int64_t n_vocab_full) {
+    // peer access both ways (NVLink); tolerate already-enabled.
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 2; b++)
+            if (a != b) {
+                cudaSetDevice(a);
+                cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
+                if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled)
+                    throw std::runtime_error(std::string("enable peer ") +
+                                             std::to_string(a) + "->" + std::to_string(b) +
+                                             ": " + cudaGetErrorString(e));
+            }
+    int n_sites = 0;
+    for (auto &I : program.at("instructions").arr)
+        if (I.at("kind").str == "OP_XCHG_REDUCE") n_sites++;
+
+    for (int g = 0; g < 2; g++) {
+        g2[g].device = g;
+        g2[g].gpu_index = g;
+        g2[g].n_ctx = n_ctx;
+        g2[g].n_vocab_full = n_vocab_full;
+    }
+    printf("dual: %d cross-GPU reduce sites/pass; uploading sliced weights...\n", n_sites);
+    for (int g = 0; g < 2; g++) gpu_upload_weights(g2[g], gg);
+    for (int g = 0; g < 2; g++) gpu_alloc_mailboxes(g2[g], n_sites);
+    gpu_wire_mailboxes(g2[0], g2[1], n_sites);
+    gpu_wire_mailboxes(g2[1], g2[0], n_sites);
+
+    for (int g = 0; g < 2; g++) {
+        GpuCtx &c = g2[g];
+        c.ln.init(g);                                   // host_init on device g
+        c.R.add("token", c.ln.d_token(), 128);          // cell:token -> d_token
+        gpu_alloc_buffers(c, program);
+        PackedProgram p = pack_program(program, c.R, &c.mtab, c.gpu_index);
+        if (!p.complete)
+            throw std::runtime_error("gpu " + std::to_string(g) + " pack failed after " +
+                                     std::to_string(p.packed_before_failure) + ": " + p.first_failure);
+        c.fattn_idx = p.fattn_idx;
+        c.xchg_idx  = p.xchg_idx;
+        c.ln.upload_program(p);
+        printf("  gpu %d: packed %zu instrs (%zu FATTN, %zu XCHG_REDUCE), kernel launched\n",
+               g, p.instrs.size(), p.fattn_idx.size(), p.xchg_idx.size());
+    }
+}
+
+static void dual_shutdown(GpuCtx g2[2]) {
+    for (int g = 0; g < 2; g++) {
+        cudaSetDevice(g2[g].device);
+        if (g2[g].ln.program_uploaded) mk::host_shutdown(g2[g].ln.h, 5000.0);
+    }
+}
+
+// -- tensor parity: match the 2-GPU reference oracle -------------------------
+static int parity_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
+                             int64_t n_vocab, const std::string &ref_dir,
+                             const std::string &out_dir) {
+    Jv ref_idx = json_load(ref_dir + "/index.json");
+    if (ref_idx.at("format").str != "mk-oracle/v1")
+        throw std::runtime_error("ref tree is not mk-oracle/v1");
+    const Jv &cfg = ref_idx.at("config");
+    const Jv &prompt = ref_idx.at("prompt_tokens");
+    int steps = (int) cfg.at("steps").as_i();
+    if (cfg.at("n_vocab").as_i() != n_vocab)
+        throw std::runtime_error("ref n_vocab != model n_vocab");
+    if ((int64_t) prompt.arr.size() + steps > n_ctx)
+        throw std::runtime_error("prompt + steps exceed --n-ctx");
+    printf("parity-tensor: ref %s — %zu prompt tokens, %d greedy steps, n_vocab %lld\n",
+           ref_dir.c_str(), prompt.arr.size(), steps, (long long) n_vocab);
+
+    GpuCtx g2[2];
+    dual_setup(g2, gg, program, n_ctx, n_vocab);
+
+    DumpTree dump;
+    dump.open(out_dir, n_vocab);
+    const size_t HALF = (size_t) n_vocab / 2;
+
+    std::vector<float> lo0, lo1, logits(n_vocab), lout, rnorm, s0, s1, state;
+    std::vector<int32_t> emitted;
+    int64_t pos = 0;
+    unsigned pass = 0;
+
+    auto gather_logits = [&]() {
+        gpu_read_f32(g2[0], "logits", lo0, HALF);
+        gpu_read_f32(g2[1], "logits", lo1, HALF);
+        memcpy(logits.data(), lo0.data(), HALF * 4);
+        memcpy(logits.data() + HALF, lo1.data(), HALF * 4);
+    };
+
+    // prefill: one pass per prompt token
+    for (size_t i = 0; i < prompt.arr.size(); i++, pos++) {
+        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[1], pos);
+        ++pass;
+        if (!dual_run_pass(g2, (int32_t) prompt.arr[i].as_i(), (uint32_t) nkv, pass, 60000.0))
+            return 3;
+    }
+    gather_logits();
+    dump.add_logits_row(logits);
+
+    for (int s = 0; s < steps; s++, pos++) {
+        int32_t tok = argmax_f32_first(logits);
+        emitted.push_back(tok);
+        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[1], pos);
+        ++pass;
+        if (!dual_run_pass(g2, tok, (uint32_t) nkv, pass, 60000.0)) return 3;
+        gather_logits();
+        dump.add_logits_row(logits);
+
+        char rel[128], name[64];
+        gpu_read_f32(g2[0], "dbg_lout", lout, (size_t) N_LOUT * N_EMBD);  // mirrored
+        for (int il = 0; il < N_LOUT; il++) {
+            Stats st = stats_of(lout.data() + (size_t) il * N_EMBD, N_EMBD);
+            snprintf(name, sizeof(name), "l_out-%d", il);
+            snprintf(rel, sizeof(rel), "full/s%d/l_out-%d.bin", s, il);
+            dump.node_row(s, il, name, "ADD", N_EMBD, st);
+            dump.write_bin(s, "full", name, "ADD", rel, lout.data() + (size_t) il * N_EMBD, N_EMBD);
+        }
+        gpu_read_f32(g2[0], "xn", rnorm, N_EMBD);
+        dump.node_row(s, 3702, "result_norm", "MUL", N_EMBD, stats_of(rnorm.data(), N_EMBD));
+        dump.node_row(s, 3703, "result_output", "MUL_MAT", (size_t) n_vocab,
+                      stats_of(logits.data(), logits.size()));
+        // DeltaNet state: gather both GPUs' head halves to full size (bytes
+        // will not match the fork's fold — the state lane fails definitionally,
+        // as single-GPU; keys and sizes match so compare.py is not structural).
+        for (int il = 0; il < N_LAYER; il++) {
+            if (is_attn_layer(il)) continue;
+            gpu_read_f32(g2[0], "ssm_state_l" + std::to_string(il), s0, SSM_STATE_N / 2);
+            gpu_read_f32(g2[1], "ssm_state_l" + std::to_string(il), s1, SSM_STATE_N / 2);
+            state.resize(SSM_STATE_N);
+            memcpy(state.data(), s0.data(), (SSM_STATE_N / 2) * 4);
+            memcpy(state.data() + SSM_STATE_N / 2, s1.data(), (SSM_STATE_N / 2) * 4);
+            snprintf(name, sizeof(name), "cache_s_l%d", il);
+            snprintf(rel, sizeof(rel), "state/s%d/cache_s_l%d.bin", s, il);
+            dump.write_bin(s, "state", name, "CPY", rel, state.data(), SSM_STATE_N);
+            gpu_read_f32(g2[0], "conv_state_l" + std::to_string(il), s0, CONV_STATE_N / 2);
+            gpu_read_f32(g2[1], "conv_state_l" + std::to_string(il), s1, CONV_STATE_N / 2);
+            state.resize(CONV_STATE_N);
+            memcpy(state.data(), s0.data(), (CONV_STATE_N / 2) * 4);
+            memcpy(state.data() + CONV_STATE_N / 2, s1.data(), (CONV_STATE_N / 2) * 4);
+            snprintf(name, sizeof(name), "cache_r_l%d", il);
+            snprintf(rel, sizeof(rel), "state/s%d/cache_r_l%d.bin", s, il);
+            dump.write_bin(s, "state", name, "CPY", rel, state.data(), CONV_STATE_N);
+        }
+    }
+
+    dump.finish(ref_idx, n_ctx, emitted);
+    dual_shutdown(g2);
+    printf("parity-tensor: dump tree written to %s\n", out_dir.c_str());
+    printf("compare with:\n  python3 tests/oracle/compare.py %s %s --allow-config-mismatch --report %s/parity-report.json\n",
+           ref_dir.c_str(), out_dir.c_str(), out_dir.c_str());
+    return 0;
+}
+
+// -- tensor bench: the real dual-GPU decode floor ----------------------------
+static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
+                            int64_t n_vocab, int64_t n_tokens) {
+    GpuCtx g2[2];
+    dual_setup(g2, gg, program, n_ctx, n_vocab);
+    const int WARMUP = 32;
+    if ((int64_t) WARMUP + n_tokens > n_ctx)
+        throw std::runtime_error("warmup + N exceed --n-ctx");
+    printf("bench-tensor: %d warmup + %lld timed dual-GPU decode passes\n",
+           WARMUP, (long long) n_tokens);
+    int64_t pos = 0;
+    unsigned pass = 0;
+    for (int i = 0; i < WARMUP; i++, pos++) {
+        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[1], pos);
+        ++pass;
+        if (!dual_run_pass(g2, 11, (uint32_t) nkv, pass, 60000.0)) return 3;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int64_t i = 0; i < n_tokens; i++, pos++) {
+        int64_t nkv = gpu_set_inputs(g2[0], pos);
+        gpu_set_inputs(g2[1], pos);
+        ++pass;
+        if (!dual_run_pass(g2, 11, (uint32_t) nkv, pass, 60000.0)) return 3;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    printf("bench-tensor: %lld tokens in %.3f s = %.2f tok/s "
+           "[contended-indicative: host-coordinated 2-GPU]\n",
+           (long long) n_tokens, sec, n_tokens / sec);
+    // per-pass on-device clock64 from each GPU's block-0 G15 ring.
+    for (int g = 0; g < 2; g++) {
+        unsigned cap = g2[g].ln.h.pass_cycles_cap;
+        if (!cap || n_tokens <= 0) continue;
+        std::vector<long long> cyc(cap);
+        if (mk::host_read_pass_cycles(g2[g].ln.h, cyc.data(), cap)) {
+            unsigned cnt = (unsigned) std::min<int64_t>(n_tokens, cap);
+            double sum = 0; long long mn = cyc[0], mx = cyc[0];
+            for (unsigned k = 0; k < cnt; k++) {
+                long long v = cyc[(g2[g].ln.h.pass - 1 - k) % cap];
+                sum += (double) v; if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            const double gHz = 1.455;
+            printf("bench-tensor: gpu %d per-pass on-device clock64: mean %.3f ms, "
+                   "min %.3f, max %.3f (%u samples)\n",
+                   g, sum / cnt / gHz / 1e6, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
+        }
+    }
+    dual_shutdown(g2);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1301,11 +1889,11 @@ static std::string basename_of(const std::string &p) {
 
 int main(int argc, char **argv) {
     std::string model = "/opt/models/Qwen3.6-27B-Q4_0AR16-b9222.gguf";
-    std::string program_path = "k0/program.json";
-    std::string parity_ref, out_dir;
+    std::string program_path;
+    std::string parity_ref, out_dir, diag_out;
     int64_t n_ctx = 8192, bench_n = -1;
     int gpu = 0;
-    enum { M_VALIDATE, M_PARITY, M_BENCH } mode = M_VALIDATE;
+    enum { M_VALIDATE, M_PARITY, M_BENCH, M_PARITY_TENSOR, M_BENCH_TENSOR } mode = M_VALIDATE;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -1316,15 +1904,95 @@ int main(int argc, char **argv) {
         if (a == "--validate")     mode = M_VALIDATE;
         else if (a == "--parity")  { mode = M_PARITY; parity_ref = need("oracle ref dir"); }
         else if (a == "--bench")   { mode = M_BENCH; bench_n = strtoll(need("token count"), nullptr, 10); }
+        else if (a == "--parity-tensor") { mode = M_PARITY_TENSOR; parity_ref = need("oracle ref dir"); }
+        else if (a == "--bench-tensor")  { mode = M_BENCH_TENSOR; bench_n = strtoll(need("token count"), nullptr, 10); }
         else if (a == "--model")   model = need("gguf path");
         else if (a == "--program") program_path = need("program.json path");
         else if (a == "--out")     out_dir = need("dump dir");
+        else if (a == "--diag")    diag_out = need("diag out file");
         else if (a == "--n-ctx")   n_ctx = strtoll(need("context size"), nullptr, 10);
         else if (a == "--gpu")     gpu = atoi(need("device index"));
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
+    const bool tensor_mode = (mode == M_PARITY_TENSOR || mode == M_BENCH_TENSOR);
+    if (program_path.empty())
+        program_path = tensor_mode ? "k0/program-split.json" : "k0/program.json";
 
     try {
+        // ---- dual-GPU tensor-parallel path -------------------------------
+        if (tensor_mode) {
+            int ndev = 0;
+            CUDA_CHECK(cudaGetDeviceCount(&ndev));
+            if (ndev < 2) { fprintf(stderr, "tensor mode needs 2 GPUs, have %d\n", ndev); return 2; }
+
+            Residency res;
+            bool inventory_ok = res.enumerate_and_validate(model);
+            if (!inventory_ok) { fprintf(stderr, "loader validation failed; refusing tensor run\n"); return 1; }
+
+            std::string text;
+            if (!read_file(program_path, text)) {
+                struct stat st{};
+                if (stat("k0/compile_schedule.py", &st) == 0) {
+                    printf("program: %s absent — running python3 k0/compile_schedule.py --split\n",
+                           program_path.c_str());
+                    if (system("python3 k0/compile_schedule.py --split") != 0)
+                        printf("program: compile_schedule.py --split failed\n");
+                }
+            }
+            if (!read_file(program_path, text))
+                throw std::runtime_error("cannot read split program " + program_path +
+                                         " (run: python3 k0/compile_schedule.py --split)");
+            JsonParser jp(text);
+            Jv program = jp.value();
+
+            // per-GPU VRAM guard (weights half + full token_embd + KV/state/mailboxes).
+            for (int g = 0; g < 2; g++) {
+                CUDA_CHECK(cudaSetDevice(g));
+                size_t free_b = 0, total_b = 0;
+                CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+                printf("vram: GPU %d free %.2f / %.2f GB\n", g, free_b / 1e9, total_b / 1e9);
+                if (free_b < (10ull << 30)) {
+                    fprintf(stderr, "aborting: GPU %d has < 10 GB free (need the device mostly free)\n", g);
+                    return 2;
+                }
+            }
+
+            if (!diag_out.empty()) {   // 1-pass pos-0 residual bisect (dual)
+                GpuCtx g2[2];
+                dual_setup(g2, res.gg, program, n_ctx, res.n_vocab);
+                int64_t nkv = gpu_set_inputs(g2[0], 0);
+                gpu_set_inputs(g2[1], 0);
+                if (!dual_run_pass(g2, 11, (uint32_t) nkv, 1, 60000.0)) return 3;
+                std::vector<float> lout, lout1, lmid, lo0, lo1;
+                gpu_read_f32(g2[0], "dbg_lout", lout, (size_t) N_LOUT * N_EMBD);
+                gpu_read_f32(g2[1], "dbg_lout", lout1, (size_t) N_LOUT * N_EMBD);
+                gpu_read_f32(g2[0], "dbg_mid", lmid, (size_t) (N_LAYER + 1) * N_EMBD);
+                gpu_read_f32(g2[0], "logits", lo0, (size_t) res.n_vocab / 2);
+                gpu_read_f32(g2[1], "logits", lo1, (size_t) res.n_vocab / 2);
+                FILE *f = fopen(diag_out.c_str(), "wb");
+                fwrite(lout.data(), 4, lout.size(), f);   // gpu0 residual (l_out)
+                fwrite(lout1.data(), 4, lout1.size(), f); // gpu1 residual (mirror check)
+                fwrite(lmid.data(), 4, lmid.size(), f);   // gpu0 mid-block residual
+                fwrite(lo0.data(), 4, lo0.size(), f);
+                fwrite(lo1.data(), 4, lo1.size(), f);
+                fclose(f);
+                printf("diag(dual): wrote %s (dbg_lout %d x %d + logits halves)\n",
+                       diag_out.c_str(), N_LOUT, N_EMBD);
+                dual_shutdown(g2);
+                return 0;
+            }
+
+            int rc;
+            if (mode == M_PARITY_TENSOR) {
+                if (out_dir.empty())
+                    out_dir = "/var/tmp/mk-harness/cand-tensor-" + basename_of(parity_ref);
+                rc = parity_run_tensor(res.gg, program, n_ctx, res.n_vocab, parity_ref, out_dir);
+            } else {
+                rc = bench_run_tensor(res.gg, program, n_ctx, res.n_vocab, bench_n);
+            }
+            return rc;
+        }
+
         CUDA_CHECK(cudaSetDevice(gpu));
 
         Residency res;
@@ -1424,6 +2092,25 @@ int main(int argc, char **argv) {
             fprintf(stderr, "cannot run %s: no packed program (see pack status above)\n",
                     mode == M_PARITY ? "parity" : "bench");
             return 3;
+        }
+
+        if (!diag_out.empty()) {   // 1-pass pos-0 residual bisect (single GPU)
+            int64_t nkv = rt.set_pass_inputs(0);
+            ln.patch_n_kv((uint32_t) nkv);
+            if (!ln.run_pass(11)) return 3;
+            std::vector<float> lout, lmid, logits;
+            rt.read_f32("dbg_lout", lout, (size_t) N_LOUT * N_EMBD);
+            rt.read_f32("dbg_mid", lmid, (size_t) (N_LAYER + 1) * N_EMBD);
+            rt.read_f32("logits", logits, (size_t) res.n_vocab);
+            FILE *f = fopen(diag_out.c_str(), "wb");
+            fwrite(lout.data(), 4, lout.size(), f);
+            fwrite(lmid.data(), 4, lmid.size(), f);
+            fwrite(logits.data(), 4, logits.size(), f);
+            fclose(f);
+            printf("diag(single): wrote %s (dbg_lout %d x %d + logits %lld)\n",
+                   diag_out.c_str(), N_LOUT, N_EMBD, (long long) res.n_vocab);
+            ln.shutdown();
+            return 0;
         }
 
         int rc;
