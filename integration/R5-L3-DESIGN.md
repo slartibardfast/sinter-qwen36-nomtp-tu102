@@ -42,12 +42,19 @@ Replaces `dual_setup` + `gpu_upload_weights`:
    samples). The output tensor is a meta tensor -> write each half to its per-GPU
    simple tensor's data, or gather to the single output buffer llama reads.
 
-## Embed
-MK's graph is split-1 (transformer stack); llama does the CPU embed (split-0) and
-hands the residual as MK's graph input. So SKIP the schedule's OP_EMBED_LOOKUP and
-seed the megakernel residual from the graph's input tensor (the CPU-computed
-embed), OR (if token_embd is reachable per-GPU) let the megakernel do embed from
-d_token. Decide during L3; the input-seed path matches llama's split.
+## Embed  (RESOLVED 2026-07-13: seed from the CPU residual)
+CONFIRMED via probe: token_embd.weight is NOT in MK's graph, and node[0] is
+`norm-0` (RMS_NORM) reading `src0 = MK#model.input_embed#0`. So llama does the CPU
+embed (split-0) and MK's split-1 graph starts from that residual. The megakernel
+must NOT run OP_EMBED_LOOKUP; instead, each pass copy `MK#model.input_embed#0`'s
+per-GPU data into the megakernel's residual buffer (the embed op's output buffer),
+and make the schedule's leading embed a no-op (or overwrite its output post-embed).
+`MK#model.input_embed#0` is a meta tensor -> extract its 2 per-GPU pointers like
+any other; it is the per-pass INPUT (replaces `token`). Position still needed for
+RoPE/KV-write; read llama's decode position (inp_pos or the KV head cell).
+
+Implication for mk_dual_step: signature becomes (residual_seed_ptrs[2], pos,
+out0, out1) — no token. Copy seed -> residual buffer on each GPU, run, gather.
 
 ## Lifecycle
 Setup once on first hit (guarded static / per-backend-context). Kernels resident

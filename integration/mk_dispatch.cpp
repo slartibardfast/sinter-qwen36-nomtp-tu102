@@ -134,8 +134,24 @@ bool mk_dispatch(struct ggml_cgraph * cgraph) {
         // n_ctx x N_EMBD_GQA/2 f16; conv/ssm state; qkv/ssm_out/output slices).
         for (const char * nm : { "cache_k_l3", "cache_v_l3", "cache_r_l0", "cache_s_l0",
                                  "blk.0.attn_qkv.weight", "blk.0.ssm_out.weight",
-                                 "output.weight", "blk.0.ssm_in.weight" })
+                                 "output.weight", "blk.0.ssm_in.weight", "token_embd.weight" })
             log_geom(cgraph, nm);
+        // Embed-seed question: dump the leaves (inputs) and node[0..2] so we can
+        // see whether MK's graph starts from the token (embed inside) or the
+        // CPU-computed residual (embed excluded -> seed the residual).
+        fprintf(stderr, "[MK inputs] %d leafs:\n", cgraph->n_leafs);
+        for (int i = 0; i < cgraph->n_leafs && i < 40; ++i) {
+            const ggml_tensor * t = cgraph->leafs[i];
+            fprintf(stderr, "  leaf[%d] %-28s op=%d type=%d ne=[%lld,%lld] %s\n", i,
+                    t->name, (int) t->op, (int) t->type,
+                    (long long) t->ne[0], (long long) t->ne[1],
+                    (t->buffer && ggml_backend_buffer_is_meta(t->buffer)) ? "META" : "host?");
+        }
+        for (int i = 0; i < 3 && i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * t = cgraph->nodes[i];
+            fprintf(stderr, "[MK node%d] %-28s op=%d src0=%s src1=%s\n", i, t->name, (int) t->op,
+                    t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-");
+        }
         ++logged;
     }
 

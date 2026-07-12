@@ -1514,7 +1514,7 @@ static void gpu_upload_weights(GpuCtx &c, gguf::File &gg) {
            c.device, c.gpu_index, c.warena_bytes / 1e9, n_mirror, n_row, n_col, n_dn);
 }
 
-static void gpu_alloc_buffers(GpuCtx &c, const Jv &program) {
+static void gpu_alloc_buffers(GpuCtx &c, const Jv &program, bool skip_kv = false) {
     CUDA_CHECK(cudaSetDevice(c.device));
     CUDA_CHECK(cudaStreamCreateWithFlags(&c.pstream, cudaStreamNonBlocking));
     auto alloc = [&](const std::string &nm, size_t bytes, bool zero = true) {
@@ -1525,15 +1525,19 @@ static void gpu_alloc_buffers(GpuCtx &c, const Jv &program) {
         c.R.add(nm, p, bytes);
         return p;
     };
+    // skip_kv: the MK backend binds llama's KV/state pointers in place instead,
+    // so the cache_k/v/conv_state/ssm_state buffers are not MK-owned.
     const size_t kv_row = (size_t)(N_EMBD_GQA / 2);       // 512 f16 elems (2 kv heads)
-    for (int il = 0; il < N_LAYER; il++) if (is_attn_layer(il)) {
-        size_t b = (size_t) c.n_ctx * kv_row * 2;
-        alloc("cache_k_l" + std::to_string(il), b);
-        alloc("cache_v_l" + std::to_string(il), b);
-    }
-    for (int il = 0; il < N_LAYER; il++) if (!is_attn_layer(il)) {
-        alloc("conv_state_l" + std::to_string(il), (size_t)(CONV_STATE_N / 2) * 4);
-        alloc("ssm_state_l" + std::to_string(il), (size_t)(SSM_STATE_N / 2) * 4);
+    if (!skip_kv) {
+        for (int il = 0; il < N_LAYER; il++) if (is_attn_layer(il)) {
+            size_t b = (size_t) c.n_ctx * kv_row * 2;
+            alloc("cache_k_l" + std::to_string(il), b);
+            alloc("cache_v_l" + std::to_string(il), b);
+        }
+        for (int il = 0; il < N_LAYER; il++) if (!is_attn_layer(il)) {
+            alloc("conv_state_l" + std::to_string(il), (size_t)(CONV_STATE_N / 2) * 4);
+            alloc("ssm_state_l" + std::to_string(il), (size_t)(SSM_STATE_N / 2) * 4);
+        }
     }
     alloc("positions", 16);
     alloc("kv_row", 8);
@@ -1958,6 +1962,94 @@ static std::string basename_of(const std::string &p) {
     return slash == std::string::npos ? s : s.substr(slash + 1);
 }
 
+// ============================================================================
+// MK backend entry points (see integration/dual_core.h). Compiled into
+// libggml-mk.so with -DMK_NO_MAIN. Reuse the static dual core above verbatim;
+// only the weight/KV source changes: bind llama's extracted per-GPU pointers
+// (weights + KV/state, in place) into the Resolver, scratch stays MK-owned.
+// ============================================================================
+#include "../integration/dual_core.h"
+
+static GpuCtx   g_mk[2];
+static bool     g_mk_up = false;
+static int64_t  g_mk_nvocab = 0;
+static unsigned g_mk_seqno = 0;
+
+// Bind llama's per-GPU pointers into c's Resolver under the program's expected
+// names (name-map cache_r->conv_state, cache_s->ssm_state). Skip the view /
+// reshaped variants (names containing a space); bind each canonical name once.
+static void gpu_bind_llama(GpuCtx &c, const MkPtrMap &pm) {
+    for (auto &kv : pm.p) {
+        const std::string &n = kv.first;
+        if (n.find(' ') != std::string::npos) continue;
+        void *ptr = kv.second[c.gpu_index];
+        if (!ptr) continue;
+        std::string bind = n;
+        if      (n.rfind("cache_r_l", 0) == 0) bind = "conv_state_l" + n.substr(9);
+        else if (n.rfind("cache_s_l", 0) == 0) bind = "ssm_state_l"  + n.substr(9);
+        if (!c.R.table.count(bind)) c.R.add(bind, ptr, 0);
+    }
+}
+
+void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
+                   int64_t n_ctx, int64_t n_vocab) {
+    if (g_mk_up) return;
+    Jv program = json_load(program_path);
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 2; b++)
+            if (a != b) {
+                cudaSetDevice(a);
+                cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
+                if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled)
+                    throw std::runtime_error("mk enable peer access");
+            }
+    int n_sites = 0;
+    for (auto &I : program.at("instructions").arr)
+        if (I.at("kind").str == "OP_XCHG_REDUCE") n_sites++;
+    for (int g = 0; g < 2; g++) {
+        g_mk[g].device = g; g_mk[g].gpu_index = g;
+        g_mk[g].n_ctx = n_ctx; g_mk[g].n_vocab_full = n_vocab;
+    }
+    for (int g = 0; g < 2; g++) gpu_alloc_mailboxes(g_mk[g], n_sites);
+    gpu_wire_mailboxes(g_mk[0], g_mk[1], n_sites);
+    gpu_wire_mailboxes(g_mk[1], g_mk[0], n_sites);
+    for (int g = 0; g < 2; g++) {
+        GpuCtx &c = g_mk[g];
+        c.ln.init(g);
+        c.R.add("token", c.ln.d_token(), 128);
+        gpu_bind_llama(c, pm);
+        gpu_alloc_buffers(c, program, /*skip_kv=*/true);
+        PackedProgram p = pack_program(program, c.R, &c.mtab, c.gpu_index);
+        if (!p.complete)
+            throw std::runtime_error("mk gpu " + std::to_string(g) + " pack failed after " +
+                std::to_string(p.packed_before_failure) + ": " + p.first_failure);
+        c.xchg_idx = p.xchg_idx;
+        c.ln.upload_program(p);
+        fprintf(stderr, "[MK dual] gpu %d packed %zu instrs (%zu XCHG), kernel launched\n",
+                g, p.instrs.size(), p.xchg_idx.size());
+    }
+    g_mk_up = true; g_mk_nvocab = n_vocab;
+}
+
+bool mk_dual_step(int32_t token, int64_t pos, void *out0, void *out1) {
+    gpu_set_inputs(g_mk[0], pos);
+    gpu_set_inputs(g_mk[1], pos);
+    if (!dual_run_pass(g_mk, token, ++g_mk_seqno, 60000.0)) return false;
+    void *outs[2] = { out0, out1 };
+    size_t half = (size_t)(g_mk_nvocab / 2) * 4;
+    for (int g = 0; g < 2; g++) {
+        CUDA_CHECK(cudaSetDevice(g_mk[g].device));
+        CUDA_CHECK(cudaMemcpy(outs[g], g_mk[g].bufs["result_output"].ptr, half,
+                              cudaMemcpyDeviceToDevice));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return true;
+}
+
+bool mk_dual_ready() { return g_mk_up; }
+void mk_dual_shutdown() { if (g_mk_up) { dual_shutdown(g_mk); g_mk_up = false; } }
+
+#ifndef MK_NO_MAIN
 int main(int argc, char **argv) {
     std::string model = "/opt/models/Qwen3.6-27B-Q4_0AR16-b9222.gguf";
     std::string program_path;
@@ -2199,3 +2291,4 @@ int main(int argc, char **argv) {
         return 2;
     }
 }
+#endif // MK_NO_MAIN
