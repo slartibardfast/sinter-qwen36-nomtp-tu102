@@ -11,8 +11,7 @@
 #include "gdn.cuh"
 #include "gemv.cuh"
 #include "attn.cuh"
-// TODO(xchg family): #include "xchg.cuh"    + MK_OP lines for OP_XCHG_PUSH,
-//     OP_XCHG_REDUCE (dual-GPU milestone, core/EXCHANGE-DESIGN.md)
+#include "xchg.cuh"   // dual-GPU cross-GPU reduce; hardware-validated litmus
 
 namespace mk {
 
@@ -40,7 +39,9 @@ namespace mk {
     MK_OP(OP_KV_APPEND, op_kv_append)                  \
     MK_OP(OP_FATTN_DECODE, op_fattn_decode)            \
     MK_OP(OP_FATTN_REDUCE, op_fattn_reduce)            \
-    MK_OP(OP_ATTN_GATE, op_attn_gate)
+    MK_OP(OP_ATTN_GATE, op_attn_gate)                  \
+    MK_OP(OP_XCHG_PUSH, op_xchg_push)                  \
+    MK_OP(OP_XCHG_REDUCE, op_xchg_reduce)
 
 __device__ __forceinline__ bool op_wired(uint16_t kind) {
     switch (kind) {
