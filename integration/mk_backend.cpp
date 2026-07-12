@@ -37,6 +37,13 @@
 // bit-identical to stock. Declared here (external linkage), called below.
 ggml_backend_meta_split_state mk_split_state(const struct ggml_tensor * t, void * ud);
 
+// R5 megakernel dispatch (integration/mk_dispatch.cpp): on a k=0 decode-graph
+// fingerprint hit it runs the persistent megakernel over llama's raw per-GPU
+// pointers and returns true; otherwise false and the graph is forwarded (R3
+// degrade). Layer 1 is a no-op probe (returns false) that builds+logs the
+// pointer map.
+bool mk_dispatch(struct ggml_cgraph * cgraph);
+
 namespace {
 
 // ---- the two simple devices we sit on top of (looked up once) --------------
@@ -119,9 +126,10 @@ static void mk_backend_synchronize(ggml_backend_t backend) {
 }
 
 static enum ggml_status mk_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    // R3 degrade path: forward the whole cgraph verbatim to the genuine meta
-    // backend — stock subgraph fan-out + NCCL/AR allreduce, bit-identical.
-    // (c) will branch here on a fingerprint hit into the persistent megakernel.
+    // Fingerprint-hit k=0 decode graph -> persistent megakernel (R5). Miss /
+    // prefill / batch>1 -> forward the cgraph to the meta backend (R3 degrade,
+    // stock fan-out + NCCL/AR allreduce, bit-identical).
+    if (mk_dispatch(cgraph)) return GGML_STATUS_SUCCESS;
     return ggml_backend_graph_compute(mk_meta_backend(backend), cgraph);
 }
 
