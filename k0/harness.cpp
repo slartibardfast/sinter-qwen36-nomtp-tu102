@@ -2122,6 +2122,22 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
         fprintf(stderr, "[MK argmax] pos=%lld tok=%lld val=%.3f\n",
                 (long long) pos, (long long) (bg * (g_mk_nvocab / 2) + bi), bv);
     }
+    if (getenv("MK_DBGMID")) {   // per-layer residual L2 norm (localize divergence)
+        static bool once = false;
+        if (!once) { once = true;
+            size_t n = (size_t)(N_LAYER + 1) * N_EMBD;
+            std::vector<float> d(n); CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaMemcpyAsync(d.data(), g_mk[0].bufs["dbg_mid"].ptr, n * 4,
+                                       cudaMemcpyDeviceToHost, g_mk[0].pstream));
+            CUDA_CHECK(cudaStreamSynchronize(g_mk[0].pstream));
+            for (int il = 0; il <= N_LAYER; il++) {
+                double s = 0; int nnan = 0;
+                for (int j = 0; j < N_EMBD; j++) { float v = d[(size_t) il * N_EMBD + j];
+                    if (v != v) nnan++; else s += (double) v * v; }
+                fprintf(stderr, "[dbgmid] L%02d |x|=%.4f%s\n", il, sqrt(s), nnan ? " HAS-NAN" : "");
+            }
+        }
+    }
     return true;
 }
 
