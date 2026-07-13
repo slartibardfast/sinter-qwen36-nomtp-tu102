@@ -49,18 +49,31 @@ the MTP contest (draft acceptance, call/0020); the k=0 no-MTP megakernel is AR16
   set_rows aborts the meta backend). completion/cli/server default FA on.
 - `-sm none --device MK`: the one MK meta-device splits internally across CUDA0/1.
 
-## Verified
+## Verified — all four tools
 
 - **llama-bench** (tg32, AR16): MK dispatch **30.79 t/s** vs stock (MK-forward =
   -sm tensor) **29.73 t/s** shallow; **30.71 vs 29.70** at 16K depth.
 - **llama-completion / llama-cli**: greedy decode TOKEN-EXACT vs stock
   (271,248069,271,57590,248046 -> "...Paris").
-- **llama-server**: the megakernel dispatches on the served decode, but the
-  request currently hangs (a server thread/stream interaction with the persistent
-  kernel — the decode path itself is proven correct in completion). OPEN.
-- **llama-perplexity**: not built in the fork yet. OPEN.
+- **llama-server**: serves "Paris" via the megakernel (2 dispatches on the served
+  decode). Requires the shutdown-on-forward fix below.
+- **llama-perplexity** (`-b 1 -ub 1`): PPL **1.0881** vs stock **1.0873**
+  (output-preserving). The batched teacher-forcing eval forwards; MK dispatches on
+  the generation decodes.
 - **Deep 256K**: dispatches at 16K; a live 256K bench is dominated by the forward
   prefill; 256K split-KV parity + the deep floor were validated separately (t#31).
+
+## The shutdown-on-forward invariant (load-bearing)
+
+The persistent megakernel is a GRID-RESIDENT cooperative kernel: once launched it
+occupies every SM and spins until shut down. Any `graph_compute` FORWARD (prefill,
+batch>1, a non-decode graph) launched while it spins can never get SM time and
+hangs. So `mk_backend` shuts the kernel down (full teardown: host_shutdown +
+host_destroy + free MK scratch/mailboxes/streams + reset the GpuCtx) before every
+forward; the next single-token decode relaunches it. Pure-decode tools
+(bench tg, completion) never trip this after setup; prefill-interleaved tools
+(server, perplexity) rely on it. A per-prefill setup cost is the trade; a future
+optimization is to keep the resident buffers and only re-arm the kernel.
 
 ## Diagnostic env knobs (all env-gated, in the .so)
 
