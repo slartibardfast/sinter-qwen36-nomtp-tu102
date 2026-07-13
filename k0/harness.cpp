@@ -2079,6 +2079,20 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
     // kernel that never exits and deadlock.
     const void *seeds[2] = { seed0, seed1 };
     void *outs[2] = { out0, out1 };
+    if (getenv("MK_ZERO_STATE")) {   // diagnostic: zero the MK-read KV/state (pstream)
+        for (int g = 0; g < 2; g++) {
+            CUDA_CHECK(cudaSetDevice(g_mk[g].device));
+            for (auto &e : g_mk[g].R.table) {
+                const std::string &n = e.first; size_t b = 0;
+                if      (n.rfind("conv_state_l", 0) == 0) b = (size_t)(CONV_STATE_N / 2) * 4;
+                else if (n.rfind("ssm_state_l", 0) == 0)  b = (size_t)(SSM_STATE_N / 2) * 4;
+                else if (n.rfind("cache_k_l", 0) == 0 || n.rfind("cache_v_l", 0) == 0)
+                    b = (size_t) g_mk[g].n_ctx * (N_EMBD_GQA / 2) * 2;
+                if (b) CUDA_CHECK(cudaMemsetAsync(e.second.ptr, 0, b, g_mk[g].pstream));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
+        }
+    }
     for (int g = 0; g < 2; g++) {
         CUDA_CHECK(cudaSetDevice(g_mk[g].device));
         // seed the mirrored residual trunk (5120 f32) from the CPU embed output

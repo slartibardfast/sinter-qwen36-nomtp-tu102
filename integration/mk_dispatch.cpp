@@ -131,6 +131,35 @@ static int64_t read_index0(const ggml_tensor * t) {
 
 } // namespace
 
+// Diagnostic (MK_ZERO_STATE): zero llama's cache_k/v/r/s so a decode starts from
+// genuinely zero recurrent state (isolates the meta-prefill->MK state handoff).
+// Default stream — safe only with no resident MK kernel (the stock/compare path).
+void mk_zero_state(struct ggml_cgraph * cgraph) {
+    std::map<std::string, const ggml_tensor *> caches;
+    auto consider = [&](const ggml_tensor * t) {
+        if (!t || !t->name[0]) return;
+        std::string n = t->name;
+        if (n.find(' ') != std::string::npos) return;
+        if (n.rfind("cache_k_l", 0) == 0 || n.rfind("cache_v_l", 0) == 0 ||
+            n.rfind("cache_r_l", 0) == 0 || n.rfind("cache_s_l", 0) == 0)
+            caches.emplace(n, t);
+    };
+    for (int i = 0; i < cgraph->n_leafs; ++i) consider(cgraph->leafs[i]);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        consider(cgraph->nodes[i]);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) consider(cgraph->nodes[i]->src[s]);
+    }
+    size_t n = 0;
+    for (auto & kv : caches) {
+        const ggml_tensor * s[2];
+        if (!simple_pair(kv.second, s)) continue;
+        for (int g = 0; g < 2; g++) { cudaSetDevice(g); cudaMemset(s[g]->data, 0, ggml_nbytes(s[g])); }
+        n++;
+    }
+    cudaDeviceSynchronize();
+    fprintf(stderr, "[MK zero-state] zeroed %zu cache tensors\n", n);
+}
+
 // Diagnostic: after a STOCK forward, read result_output's two vocab halves and
 // print the global argmax, so it can be compared to the MK argmax on the same
 // decode. Safe on the default stream (no resident MK kernel in compare mode).

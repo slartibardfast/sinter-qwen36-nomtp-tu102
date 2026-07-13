@@ -44,6 +44,7 @@ ggml_backend_meta_split_state mk_split_state(const struct ggml_tensor * t, void 
 // pointer map.
 bool mk_dispatch(struct ggml_cgraph * cgraph);
 void mk_stock_argmax(struct ggml_cgraph * cgraph);   // diagnostic (MK_COMPARE)
+void mk_zero_state(struct ggml_cgraph * cgraph);     // diagnostic (MK_ZERO_STATE)
 
 namespace {
 
@@ -130,6 +131,9 @@ static enum ggml_status mk_backend_graph_compute(ggml_backend_t backend, struct 
     // Fingerprint-hit k=0 decode graph -> persistent megakernel (R5). Miss /
     // prefill / batch>1 -> forward the cgraph to the meta backend (R3 degrade,
     // stock fan-out + NCCL/AR allreduce, bit-identical).
+    // Stock/compare path zeroes here (no resident MK kernel); the MK path zeroes
+    // inside mk_dual_step on its private stream to avoid the resident-kernel hang.
+    if (getenv("MK_ZERO_STATE") && !getenv("MK_DISPATCH_RUN")) mk_zero_state(cgraph);
     if (mk_dispatch(cgraph)) return GGML_STATUS_SUCCESS;
     enum ggml_status s = ggml_backend_graph_compute(mk_meta_backend(backend), cgraph);
     if (getenv("MK_COMPARE")) mk_stock_argmax(cgraph);
