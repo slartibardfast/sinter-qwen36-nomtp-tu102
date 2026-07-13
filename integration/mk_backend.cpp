@@ -43,6 +43,7 @@ ggml_backend_meta_split_state mk_split_state(const struct ggml_tensor * t, void 
 // degrade). Layer 1 is a no-op probe (returns false) that builds+logs the
 // pointer map.
 bool mk_dispatch(struct ggml_cgraph * cgraph);
+void mk_stock_argmax(struct ggml_cgraph * cgraph);   // diagnostic (MK_COMPARE)
 
 namespace {
 
@@ -130,7 +131,9 @@ static enum ggml_status mk_backend_graph_compute(ggml_backend_t backend, struct 
     // prefill / batch>1 -> forward the cgraph to the meta backend (R3 degrade,
     // stock fan-out + NCCL/AR allreduce, bit-identical).
     if (mk_dispatch(cgraph)) return GGML_STATUS_SUCCESS;
-    return ggml_backend_graph_compute(mk_meta_backend(backend), cgraph);
+    enum ggml_status s = ggml_backend_graph_compute(mk_meta_backend(backend), cgraph);
+    if (getenv("MK_COMPARE")) mk_stock_argmax(cgraph);
+    return s;
 }
 
 static ggml_guid_t mk_backend_guid() {

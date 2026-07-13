@@ -131,6 +131,29 @@ static int64_t read_index0(const ggml_tensor * t) {
 
 } // namespace
 
+// Diagnostic: after a STOCK forward, read result_output's two vocab halves and
+// print the global argmax, so it can be compared to the MK argmax on the same
+// decode. Safe on the default stream (no resident MK kernel in compare mode).
+void mk_stock_argmax(struct ggml_cgraph * cgraph) {
+    if (cgraph->n_nodes < 3000) return;
+    const ggml_tensor * st = find_named(cgraph, "MK#model.input_embed#0");
+    if (!st || st->ne[1] != 1) return;
+    int64_t pos = -1;
+    for (int i = 0; i < cgraph->n_nodes; ++i)
+        if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS) { pos = read_index0(cgraph->nodes[i]->src[1]); break; }
+    const ggml_tensor * out = cgraph->nodes[cgraph->n_nodes - 1];
+    dev_ptrs od; if (!extract(out, od)) return;
+    int64_t nv = out->ne[0], half = nv / 2;
+    std::vector<float> h0(half), h1(half);
+    if (cudaMemcpy(h0.data(), od.p[0], half * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    if (cudaMemcpy(h1.data(), od.p[1], half * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    int bg = 0; int64_t bi = 0; float bv = -1e30f;
+    for (int64_t i = 0; i < half; i++) if (h0[i] > bv) { bv = h0[i]; bi = i; bg = 0; }
+    for (int64_t i = 0; i < half; i++) if (h1[i] > bv) { bv = h1[i]; bi = i; bg = 1; }
+    fprintf(stderr, "[stock argmax] pos=%lld tok=%lld val=%.3f\n",
+            (long long) pos, (long long) (bg * half + bi), bv);
+}
+
 // R5 dispatch entry. Returns true iff it ran the megakernel (then the caller
 // skips the forward). Layer 1: probe + log the pointer map, return false.
 bool mk_dispatch(struct ggml_cgraph * cgraph) {

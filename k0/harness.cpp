@@ -2040,6 +2040,25 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
         c.ln.init(g);
         c.R.add("token", c.ln.d_token(), 128);
         gpu_bind_llama(c, pm);
+        // Layout diagnostic (MK_WCHECK=<model>): compare llama's bound per-GPU
+        // weight bytes against the harness weight_slice for the same tensor. Runs
+        // before upload_program (no resident kernel -> D2H is safe).
+        if (const char *mp = getenv("MK_WCHECK")) {
+            gguf::File gg; gg.open(mp);
+            for (auto &ti : gg.tensors) {
+                // check every blk.0.* (DeltaNet layer 0) + blk.3.* (first attn) tensor
+                if (ti.name.rfind("blk.0.", 0) != 0 && ti.name.rfind("blk.3.", 0) != 0) continue;
+                if (!c.R.table.count(ti.name)) { fprintf(stderr, "[wcheck g%d] %s NOT BOUND\n", g, ti.name.c_str()); continue; }
+                std::vector<uint8_t> stage; const uint8_t *src;
+                size_t lb = weight_slice(ti, g, stage, src);
+                std::vector<uint8_t> got(lb);
+                CUDA_CHECK(cudaMemcpy(got.data(), c.R.table[ti.name].ptr, lb, cudaMemcpyDeviceToHost));
+                size_t nd = 0, first = lb; for (size_t i = 0; i < lb; i++) if (src[i] != got[i]) { if (nd == 0) first = i; nd++; }
+                if (nd) fprintf(stderr, "[MK wcheck g%d] %-28s %zu B, %zu DIFFER (%.1f%%) first@%zu\n",
+                                g, ti.name.c_str(), lb, nd, 100.0 * nd / lb, first);
+            }
+            if (g == 1) fprintf(stderr, "[MK wcheck] blk.0 + blk.3 scan done\n");
+        }
         gpu_alloc_buffers(c, program, /*skip_kv=*/true);
         PackedProgram p = pack_program(program, c.R, &c.mtab, c.gpu_index);
         if (!p.complete)
@@ -2069,6 +2088,17 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
         CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
         gpu_set_inputs(g_mk[g], pos);
     }
+    if (getenv("MK_ARGMAX")) {   // one-time seed-content sanity (before the pass runs)
+        static bool once = false;
+        if (!once) { once = true;
+            float r[8]; CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaMemcpyAsync(r, g_mk[0].bufs["residual"].ptr, 32,
+                                       cudaMemcpyDeviceToHost, g_mk[0].pstream));
+            CUDA_CHECK(cudaStreamSynchronize(g_mk[0].pstream));
+            fprintf(stderr, "[MK seed] buf:residual[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+        }
+    }
     if (!dual_run_pass(g_mk, 0, ++g_mk_seqno, 60000.0)) return false;
     size_t half = (size_t)(g_mk_nvocab / 2) * 4;
     for (int g = 0; g < 2; g++) {
@@ -2076,6 +2106,21 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
         CUDA_CHECK(cudaMemcpyAsync(outs[g], g_mk[g].bufs["result_output"].ptr, half,
                                    cudaMemcpyDeviceToDevice, g_mk[g].pstream));
         CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
+    }
+    if (getenv("MK_ARGMAX")) {   // global argmax over the two vocab halves
+        static std::vector<float> h0, h1;
+        h0.resize(g_mk_nvocab / 2); h1.resize(g_mk_nvocab / 2);
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaMemcpyAsync(h0.data(), g_mk[0].bufs["result_output"].ptr, half, cudaMemcpyDeviceToHost, g_mk[0].pstream));
+        CUDA_CHECK(cudaStreamSynchronize(g_mk[0].pstream));
+        CUDA_CHECK(cudaSetDevice(1));
+        CUDA_CHECK(cudaMemcpyAsync(h1.data(), g_mk[1].bufs["result_output"].ptr, half, cudaMemcpyDeviceToHost, g_mk[1].pstream));
+        CUDA_CHECK(cudaStreamSynchronize(g_mk[1].pstream));
+        int bg = 0; size_t bi = 0; float bv = -1e30f;
+        for (size_t i = 0; i < h0.size(); i++) if (h0[i] > bv) { bv = h0[i]; bi = i; bg = 0; }
+        for (size_t i = 0; i < h1.size(); i++) if (h1[i] > bv) { bv = h1[i]; bi = i; bg = 1; }
+        fprintf(stderr, "[MK argmax] pos=%lld tok=%lld val=%.3f\n",
+                (long long) pos, (long long) (bg * (g_mk_nvocab / 2) + bi), bv);
     }
     return true;
 }
