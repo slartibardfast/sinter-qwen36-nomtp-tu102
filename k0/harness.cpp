@@ -2176,7 +2176,27 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
 }
 
 bool mk_dual_ready() { return g_mk_up; }
-void mk_dual_shutdown() { if (g_mk_up) { dual_shutdown(g_mk); g_mk_up = false; } }
+
+// Full teardown so the next mk_dual_setup starts clean (mk_backend calls this
+// before any forward, to free the SMs the resident kernel hogs). Frees MK-owned
+// scratch + mailboxes + streams and destroys the Host; llama's weight/KV pointers
+// live in the Resolver with bytes=0 and are NOT freed (they are llama's).
+void mk_dual_shutdown() {
+    if (!g_mk_up) return;
+    for (int g = 0; g < 2; g++) {
+        GpuCtx &c = g_mk[g];
+        cudaSetDevice(c.device);
+        if (c.ln.program_uploaded) mk::host_shutdown(c.ln.h, 5000.0);
+        mk::host_destroy(c.ln.h);
+        for (auto &e : c.bufs) cudaFree(e.second.ptr);   // MK scratch only
+        if (c.mbox_payload) cudaFree(c.mbox_payload);
+        if (c.mbox_seqno)   cudaFree(c.mbox_seqno);
+        if (c.pstream) cudaStreamDestroy(c.pstream);
+        c = GpuCtx{};   // reset R.table / bufs / mtab / xchg_idx / ln to fresh
+    }
+    g_mk_up = false;
+    g_mk_seqno = 0;
+}
 
 #ifndef MK_NO_MAIN
 int main(int argc, char **argv) {

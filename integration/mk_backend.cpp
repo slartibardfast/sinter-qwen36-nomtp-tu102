@@ -45,6 +45,8 @@ ggml_backend_meta_split_state mk_split_state(const struct ggml_tensor * t, void 
 bool mk_dispatch(struct ggml_cgraph * cgraph);
 void mk_stock_argmax(struct ggml_cgraph * cgraph);   // diagnostic (MK_COMPARE)
 void mk_zero_state(struct ggml_cgraph * cgraph);     // diagnostic (MK_ZERO_STATE)
+bool mk_dual_ready();      // persistent kernel resident?
+void mk_dual_shutdown();   // stop the resident kernel (free the SMs) before a forward
 
 namespace {
 
@@ -135,6 +137,12 @@ static enum ggml_status mk_backend_graph_compute(ggml_backend_t backend, struct 
     // inside mk_dual_step on its private stream to avoid the resident-kernel hang.
     if (getenv("MK_ZERO_STATE") && !getenv("MK_DISPATCH_RUN")) mk_zero_state(cgraph);
     if (mk_dispatch(cgraph)) return GGML_STATUS_SUCCESS;
+    // Forward path (prefill / batch>1 / non-decode). The persistent megakernel is
+    // grid-resident and hogs every SM, so a forward launched while it spins would
+    // hang. Shut it down first; the next single-token decode relaunches it. This
+    // makes MK correct under prefill-interleaved tools (llama-server, -perplexity),
+    // at the cost of a setup on each prefill->decode transition.
+    if (mk_dual_ready()) mk_dual_shutdown();
     enum ggml_status s = ggml_backend_graph_compute(mk_meta_backend(backend), cgraph);
     if (getenv("MK_COMPARE")) mk_stock_argmax(cgraph);
     return s;
