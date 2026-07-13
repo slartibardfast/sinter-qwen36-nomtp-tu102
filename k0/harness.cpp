@@ -2007,7 +2007,10 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
     // Strip the leading OP_EMBED_LOOKUP: token_embd is not in MK's split-1 graph
     // (llama does the embed on the CPU side), so pack would fail on it. MK seeds
     // buf:residual from MK#model.input_embed#0 each pass instead.
-    for (auto &kv : program.obj)
+    // MK_OWNEMBED: keep the embed op (bind token_embd below) to test the seed/strip
+    // path; default strips it and seeds buf:residual from MK#model.input_embed#0.
+    if (!getenv("MK_OWNEMBED"))
+      for (auto &kv : program.obj)
         if (kv.first == "instructions" && !kv.second.arr.empty()) {
             const Jv *knd = kv.second.arr.front().get("kind");
             if (knd && knd->str == "OP_EMBED_LOOKUP") {
@@ -2040,6 +2043,14 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
         c.ln.init(g);
         c.R.add("token", c.ln.d_token(), 128);
         gpu_bind_llama(c, pm);
+        if (const char *mp = getenv("MK_OWNEMBED")) {   // bind the full mirrored token_embd
+            gguf::File gg; gg.open(mp);
+            const gguf::TensorInfo *te = gg.find("token_embd.weight");
+            void *dev = nullptr; CUDA_CHECK(cudaMalloc(&dev, te->nbytes));
+            CUDA_CHECK(cudaMemcpy(dev, te->data, te->nbytes, cudaMemcpyHostToDevice));
+            if (!c.R.table.count("token_embd.weight")) c.R.add("token_embd.weight", dev, te->nbytes);
+            fprintf(stderr, "[MK ownembed] bound token_embd %.2f GB on gpu %d\n", te->nbytes / 1e9, g);
+        }
         // Layout diagnostic (MK_WCHECK=<model>): compare llama's bound per-GPU
         // weight bytes against the harness weight_slice for the same tensor. Runs
         // before upload_program (no resident kernel -> D2H is safe).
@@ -2093,12 +2104,15 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
             CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
         }
     }
+    const char *oe = getenv("MK_OWNEMBED");
     for (int g = 0; g < 2; g++) {
         CUDA_CHECK(cudaSetDevice(g_mk[g].device));
         // seed the mirrored residual trunk (5120 f32) from the CPU embed output
-        CUDA_CHECK(cudaMemcpyAsync(g_mk[g].bufs["residual"].ptr, seeds[g],
-                                   (size_t) N_EMBD * 4, cudaMemcpyDeviceToDevice,
-                                   g_mk[g].pstream));
+        // (skipped under MK_OWNEMBED: the kept embed op writes buf:residual itself)
+        if (!oe)
+            CUDA_CHECK(cudaMemcpyAsync(g_mk[g].bufs["residual"].ptr, seeds[g],
+                                       (size_t) N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                       g_mk[g].pstream));
         CUDA_CHECK(cudaStreamSynchronize(g_mk[g].pstream));
         gpu_set_inputs(g_mk[g], pos);
     }
@@ -2113,7 +2127,8 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
                     r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
         }
     }
-    if (!dual_run_pass(g_mk, 0, ++g_mk_seqno, 60000.0)) return false;
+    int32_t tok = oe ? (int32_t) atoi(getenv("MK_TOKEN") ? getenv("MK_TOKEN") : "0") : 0;
+    if (!dual_run_pass(g_mk, tok, ++g_mk_seqno, 60000.0)) return false;
     size_t half = (size_t)(g_mk_nvocab / 2) * 4;
     for (int g = 0; g < 2; g++) {
         CUDA_CHECK(cudaSetDevice(g_mk[g].device));
@@ -2136,19 +2151,24 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
         fprintf(stderr, "[MK argmax] pos=%lld tok=%lld val=%.3f\n",
                 (long long) pos, (long long) (bg * (g_mk_nvocab / 2) + bi), bv);
     }
-    if (getenv("MK_DBGMID")) {   // per-layer residual L2 norm (localize divergence)
+    if (getenv("MK_DBGMID")) {   // per-layer residual L2 norm + GPU0-vs-GPU1 mirror diff
         static bool once = false;
         if (!once) { once = true;
             size_t n = (size_t)(N_LAYER + 1) * N_EMBD;
-            std::vector<float> d(n); CUDA_CHECK(cudaSetDevice(0));
-            CUDA_CHECK(cudaMemcpyAsync(d.data(), g_mk[0].bufs["dbg_mid"].ptr, n * 4,
-                                       cudaMemcpyDeviceToHost, g_mk[0].pstream));
+            std::vector<float> d0(n), d1(n);
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaMemcpyAsync(d0.data(), g_mk[0].bufs["dbg_mid"].ptr, n * 4, cudaMemcpyDeviceToHost, g_mk[0].pstream));
             CUDA_CHECK(cudaStreamSynchronize(g_mk[0].pstream));
+            CUDA_CHECK(cudaSetDevice(1));
+            CUDA_CHECK(cudaMemcpyAsync(d1.data(), g_mk[1].bufs["dbg_mid"].ptr, n * 4, cudaMemcpyDeviceToHost, g_mk[1].pstream));
+            CUDA_CHECK(cudaStreamSynchronize(g_mk[1].pstream));
             for (int il = 0; il <= N_LAYER; il++) {
-                double s = 0; int nnan = 0;
-                for (int j = 0; j < N_EMBD; j++) { float v = d[(size_t) il * N_EMBD + j];
-                    if (v != v) nnan++; else s += (double) v * v; }
-                fprintf(stderr, "[dbgmid] L%02d |x|=%.4f%s\n", il, sqrt(s), nnan ? " HAS-NAN" : "");
+                double s = 0, md = 0; int nnan = 0;
+                for (int j = 0; j < N_EMBD; j++) { float v = d0[(size_t) il * N_EMBD + j];
+                    if (v != v) nnan++; else s += (double) v * v;
+                    double diff = fabs((double) v - d1[(size_t) il * N_EMBD + j]); if (diff > md) md = diff; }
+                fprintf(stderr, "[dbgmid] L%02d |x0|=%.4f  max|x0-x1|=%.5f%s\n",
+                        il, sqrt(s), md, nnan ? " HAS-NAN" : "");
             }
         }
     }
