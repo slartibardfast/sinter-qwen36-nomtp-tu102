@@ -89,6 +89,7 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
 #endif
 
         // ---- the instruction loop -----------------------------------------
+#ifndef MK_SPECIALIZED
         for (uint32_t i = 0; i < hdr.n_instr; ++i) {
             const Instr &in = program[i]; // immutable: plain cached loads
             const uint16_t kind = in.kind;
@@ -121,6 +122,15 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
 #endif
             }
         }
+#else
+        // GENERATED straight-line dispatch (k0/specialize.py, call/0023 D2):
+        // the 27-way switch, the kind-validity guard, and the per-instruction
+        // header decode vanish by construction; each op is a direct call and
+        // block ranges are compile-time literals. Fingerprint-matched programs
+        // only (miss -> the interpreter above). Spike 3: ~0.76 ms/pass reclaimed.
+        (void)hdr; (void)program;
+#include "../k0/mk_specialized_body.inc"
+#endif
 
         // ---- pass epilogue ------------------------------------------------
         // One boundary so block 0 knows every block finished (and their

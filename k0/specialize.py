@@ -61,9 +61,12 @@ def emit(prog_path, out_path):
         lo, hi = insn["block_lo"], insn["block_hi"]
         # block range as compile-time literals; the guard is folded, no switch.
         if lo == 0 and hi >= 72:
-            lines.append("    %s(prog[%d], mk_smem);" % (fn, i))     # whole grid
+            lines.append("    %s(program[%d], mk_smem);" % (fn, i))          # whole grid
+        elif lo == 0:
+            lines.append("    if (blockIdx.x < %d) %s(program[%d], mk_smem);"  # unsigned: no >=0
+                         % (hi, fn, i))
         else:
-            lines.append("    if (blockIdx.x >= %d && blockIdx.x < %d) %s(prog[%d], mk_smem);"
+            lines.append("    if (blockIdx.x >= %d && blockIdx.x < %d) %s(program[%d], mk_smem);"
                          % (lo, hi, fn, i))
         n_op += 1
     body = "\n".join(lines) + "\n"
