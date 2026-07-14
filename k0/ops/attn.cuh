@@ -116,7 +116,7 @@ struct QkNormRopeArgs {
 };
 static_assert(sizeof(QkNormRopeArgs) <= 112, "payload overflow");
 
-__device__ inline void op_qk_norm_rope(const Instr &ins, char *) {
+__device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
     const QkNormRopeArgs a = *reinterpret_cast<const QkNormRopeArgs *>(ins.payload);
     const int warps_per_block = blockDim.x / 32;
     const int lane = threadIdx.x % 32;
@@ -196,7 +196,7 @@ struct KvAppendArgs {
 };
 static_assert(sizeof(KvAppendArgs) <= 112, "payload overflow");
 
-__device__ inline void op_kv_append(const Instr &ins, char *) {
+__device__ MK_OPFN void op_kv_append(const Instr &ins, char *) {
     const KvAppendArgs a = *reinterpret_cast<const KvAppendArgs *>(ins.payload);
     const long long row = ld_cg_i64(a.row_idx);
     half *d = a.cache + (size_t) row * a.row_width;
@@ -280,7 +280,7 @@ __device__ inline void mk_load_kv_slice(const half *cache, half *tile, uint32_t 
     }
 }
 
-__device__ inline void op_fattn_decode(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
     const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
     // n_kv changes every 256 tokens at deep context; the persistent kernel's L1
     // is incoherent across passes, so a plain read of a per-pass-patched payload
@@ -421,7 +421,7 @@ struct FattnReduceArgs {
 };
 static_assert(sizeof(FattnReduceArgs) <= 112, "payload overflow");
 
-__device__ inline void op_fattn_reduce(const Instr &ins, char *) {
+__device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *) {
     const FattnReduceArgs a = *reinterpret_cast<const FattnReduceArgs *>(ins.payload);
     const int nb  = ins.block_hi - ins.block_lo;
     const int rel = blockIdx.x - ins.block_lo;
@@ -473,7 +473,7 @@ struct AttnGateArgs {
 };
 static_assert(sizeof(AttnGateArgs) <= 112, "payload overflow");
 
-__device__ inline void op_attn_gate(const Instr &ins, char *) {
+__device__ MK_OPFN void op_attn_gate(const Instr &ins, char *) {
     const AttnGateArgs a = *reinterpret_cast<const AttnGateArgs *>(ins.payload);
     const uint32_t total = a.n_q * MK_ATTN_HD;
     const uint32_t nthr  = (ins.block_hi - ins.block_lo) * blockDim.x;

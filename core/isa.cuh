@@ -27,6 +27,17 @@
 #pragma once
 #include <cstdint>
 
+// Op-function inline attribute (call/0023 D2). The interpreter folds ops into
+// op_dispatch's switch (__forceinline__); the SPECIALIZED straight-line kernel
+// must NOT inline (1540 inlined op bodies blow the Turing L1I -- the naive
+// specialized build measured 229,704 SASS instrs, ~28x the ~8K-instr L1I).
+// __noinline__ makes the body 1540 CALLs to 24 op bodies emitted once.
+#if defined(MK_SPECIALIZED)
+#define MK_OPFN __noinline__
+#else
+#define MK_OPFN __forceinline__
+#endif
+
 namespace mk {
 
 enum MacroKind : uint16_t {

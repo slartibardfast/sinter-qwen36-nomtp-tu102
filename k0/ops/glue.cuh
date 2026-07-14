@@ -53,7 +53,7 @@ struct RmsnormArgs {
 };
 static_assert(sizeof(RmsnormArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_rmsnorm(const Instr &in, char *smem) {
+__device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
     const RmsnormArgs &a = *reinterpret_cast<const RmsnormArgs *>(in.payload);
     const unsigned nblk = in.block_hi - in.block_lo;
     float *red = reinterpret_cast<float *>(smem); // one partial per warp
@@ -163,7 +163,7 @@ struct ResidualAddArgs {
 };
 static_assert(sizeof(ResidualAddArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_residual_add(const Instr &in, char *) {
+__device__ MK_OPFN void op_residual_add(const Instr &in, char *) {
     const ResidualAddArgs &a =
         *reinterpret_cast<const ResidualAddArgs *>(in.payload);
     const unsigned nblk = in.block_hi - in.block_lo;
@@ -199,7 +199,7 @@ struct EmbedLookupArgs {
 };
 static_assert(sizeof(EmbedLookupArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_embed_lookup(const Instr &in, char *smem) {
+__device__ MK_OPFN void op_embed_lookup(const Instr &in, char *smem) {
     const EmbedLookupArgs &a =
         *reinterpret_cast<const EmbedLookupArgs *>(in.payload);
     int *bc = reinterpret_cast<int *>(smem);
@@ -246,7 +246,7 @@ struct LogitsEmitArgs {
 };
 static_assert(sizeof(LogitsEmitArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_logits_emit(const Instr &in, char *) {
+__device__ MK_OPFN void op_logits_emit(const Instr &in, char *) {
     const LogitsEmitArgs &a =
         *reinterpret_cast<const LogitsEmitArgs *>(in.payload);
     const unsigned nblk = in.block_hi - in.block_lo;

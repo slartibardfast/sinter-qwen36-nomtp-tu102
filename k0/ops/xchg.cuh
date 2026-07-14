@@ -64,7 +64,7 @@ static_assert(sizeof(XchgReduceArgs) <= sizeof(((Instr *)0)->payload),
 // Vectorized peer store: float4 in linear order (line-filling v4). The store
 // pattern is load-bearing (measured 2.4-2.5x visibility vs strided), not
 // stylistic. Tail handled scalar.
-static __device__ void op_xchg_push(const Instr &in, char *) {
+static __device__ MK_OPFN void op_xchg_push(const Instr &in, char *) {
     XchgPushArgs a;
     __builtin_memcpy(&a, in.payload, sizeof(a));
 
@@ -89,7 +89,7 @@ static __device__ void op_xchg_push(const Instr &in, char *) {
 }
 
 // Signal + consume + fold. Runs after the boundary that followed PUSH.
-static __device__ void op_xchg_reduce(const Instr &in, char *) {
+static __device__ MK_OPFN void op_xchg_reduce(const Instr &in, char *) {
     XchgReduceArgs a;
     __builtin_memcpy(&a, in.payload, sizeof(a));
 

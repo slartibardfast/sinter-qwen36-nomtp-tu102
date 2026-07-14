@@ -210,7 +210,7 @@ static __device__ __forceinline__ WarpSlice warp_slice(const Instr &I) {
 // Fold order: amax and sum are butterfly __shfl_xor reduces over the 32
 // lanes, identical to the fork's warp_reduce_max/sum<32>.
 // smem: 0 bytes.
-static __device__ void op_quant_q8_1(const Instr &I, char *smem) {
+static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
     (void)smem;
     const QuantQ8_1Args &a = *reinterpret_cast<const QuantQ8_1Args *>(I.payload);
     const WarpSlice ws = warp_slice(I);
@@ -302,7 +302,7 @@ static __device__ __forceinline__ float mmvq_q40_row(
 }
 
 // OP_MMVQ_Q4_0. smem: (ncols/32)*36 B staged q8_1.
-static __device__ void op_mmvq_q4_0(const Instr &I, char *smem) {
+static __device__ MK_OPFN void op_mmvq_q4_0(const Instr &I, char *smem) {
     const MmvqQ40Args &a = *reinterpret_cast<const MmvqQ40Args *>(I.payload);
     const int nblk = (int)(a.ncols / 32u);
     const int npair = nblk / 2;
@@ -324,7 +324,7 @@ static __device__ void op_mmvq_q4_0(const Instr &I, char *smem) {
 // staged y, then the SwiGLU epilogue dst[r] = up * silu(gate)
 // (mmvq.cu:572-575). Fold order per stream identical to OP_MMVQ_Q4_0.
 // smem: (ncols/32)*36 B.
-static __device__ void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
+static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
     const MmvqQ40FusedArgs &a = *reinterpret_cast<const MmvqQ40FusedArgs *>(I.payload);
     const int nblk = (int)(a.ncols / 32u);
     const int npair = nblk / 2;
@@ -411,7 +411,7 @@ static __device__ __forceinline__ float mmvq_ar16_row(
 }
 
 // smem: (ncols/32)*36 B staged q8_1.
-static __device__ void op_mmvq_ar16(const Instr &I, char *smem) {
+static __device__ MK_OPFN void op_mmvq_ar16(const Instr &I, char *smem) {
     const MmvqAr16Args &a = *reinterpret_cast<const MmvqAr16Args *>(I.payload);
     const int nblk = (int)(a.ncols / 16u);
     const int npair = nblk / 2;
@@ -480,14 +480,14 @@ static __device__ __forceinline__ void gemv_f16_common(const Instr &I, char *sme
 }
 
 // smem: ncols*4 B staged x.
-static __device__ void op_gemv_f16(const Instr &I, char *smem) {
+static __device__ MK_OPFN void op_gemv_f16(const Instr &I, char *smem) {
     gemv_f16_common(I, smem);
 }
 
 // smem: ncols*4 B staged x. Same inner loop as op_gemv_f16 (see the
 // HeadGemvF16Args note); the big-row stream needs no extra tuning: the
 // warp-per-row uint4 pattern is the bench's 97-99.6%-of-peak f16 twin.
-static __device__ void op_head_gemv_f16(const Instr &I, char *smem) {
+static __device__ MK_OPFN void op_head_gemv_f16(const Instr &I, char *smem) {
     gemv_f16_common(I, smem);
 }
 

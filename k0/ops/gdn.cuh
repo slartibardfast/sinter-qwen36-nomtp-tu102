@@ -81,7 +81,7 @@ struct StateLoadArgs {
 };
 static_assert(sizeof(StateLoadArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_state_load(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_state_load(const Instr &ins, char *smem) {
     (void) smem;
     const StateLoadArgs &a = *reinterpret_cast<const StateLoadArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
@@ -121,7 +121,7 @@ struct ConvShiftConcatArgs {
 };
 static_assert(sizeof(ConvShiftConcatArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_conv_shift_concat(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_conv_shift_concat(const Instr &ins, char *smem) {
     (void) smem;
     const ConvShiftConcatArgs &a = *reinterpret_cast<const ConvShiftConcatArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
@@ -153,7 +153,7 @@ struct SsmConvSiluArgs {
 };
 static_assert(sizeof(SsmConvSiluArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_ssm_conv_silu(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_ssm_conv_silu(const Instr &ins, char *smem) {
     (void) smem;
     const SsmConvSiluArgs &a = *reinterpret_cast<const SsmConvSiluArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
@@ -184,7 +184,7 @@ struct QkL2NormArgs {
 };
 static_assert(sizeof(QkL2NormArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_qk_l2norm(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_qk_l2norm(const Instr &ins, char *smem) {
     (void) smem;
     const QkL2NormArgs &a = *reinterpret_cast<const QkL2NormArgs *>(ins.payload);
     constexpr int rows_per_lane = GDN_SV / 32;
@@ -231,7 +231,7 @@ struct GdnGatesArgs {
 };
 static_assert(sizeof(GdnGatesArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_gdn_gates(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_gdn_gates(const Instr &ins, char *smem) {
     (void) smem;
     const GdnGatesArgs &a = *reinterpret_cast<const GdnGatesArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
@@ -272,7 +272,7 @@ struct GdnStepArgs {
 };
 static_assert(sizeof(GdnStepArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_gdn_step(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_gdn_step(const Instr &ins, char *smem) {
     (void) smem;
     const GdnStepArgs &a = *reinterpret_cast<const GdnStepArgs *>(ins.payload);
     constexpr int rows_per_lane = GDN_SV / 32;
@@ -353,7 +353,7 @@ struct GatedRmsNormArgs {
 };
 static_assert(sizeof(GatedRmsNormArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_gated_rmsnorm(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_gated_rmsnorm(const Instr &ins, char *smem) {
     (void) smem;
     const GatedRmsNormArgs &a = *reinterpret_cast<const GatedRmsNormArgs *>(ins.payload);
     constexpr int rows_per_lane = GDN_SV / 32;
@@ -395,7 +395,7 @@ struct StateStoreArgs {
 };
 static_assert(sizeof(StateStoreArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ inline void op_state_store(const Instr &ins, char *smem) {
+__device__ MK_OPFN void op_state_store(const Instr &ins, char *smem) {
     (void) smem;
     const StateStoreArgs &a = *reinterpret_cast<const StateStoreArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
