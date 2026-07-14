@@ -575,10 +575,10 @@
    }
   ],
   "per_pass": {
-   "instructions_total": 2248,
-   "instructions_compute": 1284,
-   "boundaries_per_pass": 964,
-   "epoch_stride": 964,
+   "instructions_total": 2152,
+   "instructions_compute": 1236,
+   "boundaries_per_pass": 916,
+   "epoch_stride": 916,
    "g15_budget": 500,
    "dram_bytes": {
     "formula": "16695695360 + 65568 * n_kv",
@@ -1076,28 +1076,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 57,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 57,
@@ -1107,13 +1086,11 @@
    ],
    "args": {
     "weight": "gguf:blk.0.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -1592,28 +1569,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 121,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 121,
@@ -1623,13 +1579,11 @@
    ],
    "args": {
     "weight": "gguf:blk.1.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -2108,28 +2062,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 185,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 185,
@@ -2139,13 +2072,11 @@
    ],
    "args": {
     "weight": "gguf:blk.2.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -3089,28 +3020,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 289,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 289,
@@ -3120,13 +3030,11 @@
    ],
    "args": {
     "weight": "gguf:blk.4.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -3605,28 +3513,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 353,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 353,
@@ -3636,13 +3523,11 @@
    ],
    "args": {
     "weight": "gguf:blk.5.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -4121,28 +4006,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 417,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 417,
@@ -4152,13 +4016,11 @@
    ],
    "args": {
     "weight": "gguf:blk.6.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -5102,28 +4964,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 520,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 520,
@@ -5133,13 +4974,11 @@
    ],
    "args": {
     "weight": "gguf:blk.8.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -5618,28 +5457,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 584,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 584,
@@ -5649,13 +5467,11 @@
    ],
    "args": {
     "weight": "gguf:blk.9.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -6134,28 +5950,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 648,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 648,
@@ -6165,13 +5960,11 @@
    ],
    "args": {
     "weight": "gguf:blk.10.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -7115,28 +6908,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 751,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 751,
@@ -7146,13 +6918,11 @@
    ],
    "args": {
     "weight": "gguf:blk.12.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -7631,28 +7401,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 815,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 815,
@@ -7662,13 +7411,11 @@
    ],
    "args": {
     "weight": "gguf:blk.13.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -8147,28 +7894,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 879,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 879,
@@ -8178,13 +7904,11 @@
    ],
    "args": {
     "weight": "gguf:blk.14.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -9128,28 +8852,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 982,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 982,
@@ -9159,13 +8862,11 @@
    ],
    "args": {
     "weight": "gguf:blk.16.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -9644,28 +9345,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1046,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1046,
@@ -9675,13 +9355,11 @@
    ],
    "args": {
     "weight": "gguf:blk.17.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -10160,28 +9838,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1110,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1110,
@@ -10191,13 +9848,11 @@
    ],
    "args": {
     "weight": "gguf:blk.18.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -11141,28 +10796,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1213,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1213,
@@ -11172,13 +10806,11 @@
    ],
    "args": {
     "weight": "gguf:blk.20.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -11657,28 +11289,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1277,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1277,
@@ -11688,13 +11299,11 @@
    ],
    "args": {
     "weight": "gguf:blk.21.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -12173,28 +11782,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1341,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1341,
@@ -12204,13 +11792,11 @@
    ],
    "args": {
     "weight": "gguf:blk.22.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -13154,28 +12740,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1444,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1444,
@@ -13185,13 +12750,11 @@
    ],
    "args": {
     "weight": "gguf:blk.24.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -13670,28 +13233,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1508,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1508,
@@ -13701,13 +13243,11 @@
    ],
    "args": {
     "weight": "gguf:blk.25.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -14186,28 +13726,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1572,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1572,
@@ -14217,13 +13736,11 @@
    ],
    "args": {
     "weight": "gguf:blk.26.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -15167,28 +14684,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1675,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1675,
@@ -15198,13 +14694,11 @@
    ],
    "args": {
     "weight": "gguf:blk.28.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -15683,28 +15177,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1739,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1739,
@@ -15714,13 +15187,11 @@
    ],
    "args": {
     "weight": "gguf:blk.29.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -16199,28 +15670,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1803,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1803,
@@ -16230,13 +15680,11 @@
    ],
    "args": {
     "weight": "gguf:blk.30.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -17180,28 +16628,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1906,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1906,
@@ -17211,13 +16638,11 @@
    ],
    "args": {
     "weight": "gguf:blk.32.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -17696,28 +17121,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 1970,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 1970,
@@ -17727,13 +17131,11 @@
    ],
    "args": {
     "weight": "gguf:blk.33.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -18212,28 +17614,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2034,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2034,
@@ -18243,13 +17624,11 @@
    ],
    "args": {
     "weight": "gguf:blk.34.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -19193,28 +18572,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2137,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2137,
@@ -19224,13 +18582,11 @@
    ],
    "args": {
     "weight": "gguf:blk.36.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -19709,28 +19065,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2201,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2201,
@@ -19740,13 +19075,11 @@
    ],
    "args": {
     "weight": "gguf:blk.37.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -20225,28 +19558,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2265,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2265,
@@ -20256,13 +19568,11 @@
    ],
    "args": {
     "weight": "gguf:blk.38.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -21206,28 +20516,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2368,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2368,
@@ -21237,13 +20526,11 @@
    ],
    "args": {
     "weight": "gguf:blk.40.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -21722,28 +21009,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2432,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2432,
@@ -21753,13 +21019,11 @@
    ],
    "args": {
     "weight": "gguf:blk.41.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -22238,28 +21502,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2496,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2496,
@@ -22269,13 +21512,11 @@
    ],
    "args": {
     "weight": "gguf:blk.42.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -23219,28 +22460,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2599,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2599,
@@ -23250,13 +22470,11 @@
    ],
    "args": {
     "weight": "gguf:blk.44.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -23735,28 +22953,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2663,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2663,
@@ -23766,13 +22963,11 @@
    ],
    "args": {
     "weight": "gguf:blk.45.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -24251,28 +23446,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2727,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2727,
@@ -24282,13 +23456,11 @@
    ],
    "args": {
     "weight": "gguf:blk.46.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -25232,28 +24404,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2830,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2830,
@@ -25263,13 +24414,11 @@
    ],
    "args": {
     "weight": "gguf:blk.48.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -25748,28 +24897,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2894,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2894,
@@ -25779,13 +24907,11 @@
    ],
    "args": {
     "weight": "gguf:blk.49.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -26264,28 +25390,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 2958,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 2958,
@@ -26295,13 +25400,11 @@
    ],
    "args": {
     "weight": "gguf:blk.50.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -27245,28 +26348,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3061,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3061,
@@ -27276,13 +26358,11 @@
    ],
    "args": {
     "weight": "gguf:blk.52.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -27761,28 +26841,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3125,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3125,
@@ -27792,13 +26851,11 @@
    ],
    "args": {
     "weight": "gguf:blk.53.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -28277,28 +27334,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3189,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3189,
@@ -28308,13 +27344,11 @@
    ],
    "args": {
     "weight": "gguf:blk.54.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -29258,28 +28292,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3292,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3292,
@@ -29289,13 +28302,11 @@
    ],
    "args": {
     "weight": "gguf:blk.56.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -29774,28 +28785,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3356,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3356,
@@ -29805,13 +28795,11 @@
    ],
    "args": {
     "weight": "gguf:blk.57.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -30290,28 +29278,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3420,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3420,
@@ -30321,13 +29288,11 @@
    ],
    "args": {
     "weight": "gguf:blk.58.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -31271,28 +30236,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3523,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3523,
@@ -31302,13 +30246,11 @@
    ],
    "args": {
     "weight": "gguf:blk.60.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -31787,28 +30729,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3587,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3587,
@@ -31818,13 +30739,11 @@
    ],
    "args": {
     "weight": "gguf:blk.61.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {
@@ -32303,28 +31222,7 @@
    "args": {}
   },
   {
-   "kind": "OP_QUANT_Q8_1",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": 3651,
-   "nodes": [],
-   "args": {
-    "src": "buf:attn_out",
-    "elems": 6144,
-    "dst": "buf:q8_act"
-   },
-   "inserted": true
-  },
-  {
-   "kind": "OP_BOUNDARY",
-   "block_lo": 0,
-   "block_hi": 72,
-   "dbg_node": null,
-   "nodes": [],
-   "args": {}
-  },
-  {
-   "kind": "OP_MMVQ_AR16",
+   "kind": "OP_GEMV_F16",
    "block_lo": 0,
    "block_hi": 72,
    "dbg_node": 3651,
@@ -32334,13 +31232,11 @@
    ],
    "args": {
     "weight": "gguf:blk.62.ssm_out.weight",
-    "src": "buf:q8_act",
+    "src": "buf:attn_out",
     "src_elems": 6144,
-    "dst": "buf:proj_out",
-    "dst_off": 0,
     "row_lo": 0,
     "row_hi": 5120,
-    "split_axis": "col"
+    "dst": "buf:proj_out"
    }
   },
   {

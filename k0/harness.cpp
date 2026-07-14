@@ -10,7 +10,7 @@
 //   mk-harness --parity REF_DIR        decode-only parity vs an oracle tree
 //                                      (e.g. /var/tmp/mk-oracle/ref-tensor-ctx64)
 //   mk-harness --bench N               sustained decode of N tokens, tok/s
-// Options: --model PATH (default /opt/models/Qwen3.6-27B-Q4_0AR16-b9222.gguf)
+// Options: --model PATH (default /opt/models/Qwen3.6-27B-AR16asF16-probe.gguf, the F16-ssm_out base)
 //          --n-ctx N (default 8192)  --gpu I (default 0)
 //          --program PATH (default k0/program.json)  --out DIR (parity dump)
 // Run from the repo root (relative defaults assume it).
@@ -108,12 +108,15 @@ static bool is_attn_layer(int il) { return il % 4 == 3; }
 // match the briefed figures exactly at 866; the 851 non-blk.64 tensors
 // also exactly match the 851 distinct weight names k0/leaves.csv
 // references. 866 is the verified ground truth.
+// Ground truth for the DEFAULT base = the F16-ssm_out file (call/0020): the 48
+// ssm_out projections are F16, not Q4_0_AR16, so f16 rises 5237.64 -> 8257.54 MB
+// (+~3020 the ssm_out weights) and q4_0_ar16 is absent. The AR16 file (943.72 MB
+// ar16, 5237.64 f16) is the flagged case -> run it with --allow-inventory-mismatch.
 static const uint64_t EXPECT_N_TENSORS = 866;
 struct ExpectTotal { uint32_t type; double mb; };
 static const ExpectTotal EXPECT_TOTALS[] = {
     { gguf::T_Q4_0,      13043.96 },
-    { gguf::T_Q4_0_AR16,   943.72 },
-    { gguf::T_F16,        5237.64 },
+    { gguf::T_F16,        8257.54 },
     { gguf::T_F32,          10.69 },
 };
 
@@ -2200,7 +2203,7 @@ void mk_dual_shutdown() {
 
 #ifndef MK_NO_MAIN
 int main(int argc, char **argv) {
-    std::string model = "/opt/models/Qwen3.6-27B-Q4_0AR16-b9222.gguf";
+    std::string model = "/opt/models/Qwen3.6-27B-AR16asF16-probe.gguf";  // F16-ssm_out base (call/0020)
     std::string program_path;
     std::string parity_ref, out_dir, diag_out;
     int64_t n_ctx = 8192, bench_n = -1, bench_pos0 = 0;

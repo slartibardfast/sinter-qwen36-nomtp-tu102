@@ -40,14 +40,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # order) and the peer mailbox pointers.
 SPLIT = "--split" in sys.argv
 NGPU = 2 if SPLIT else 1
-# --ssm-out-f16: the face-off base stores ssm_out in F16 (not AR16) -- F16 ssm_out
-# buys ~3 pts of MTP draft acceptance (0.795 vs 0.767), the reason it is the locked
-# base (call/0020). Emit the 48 ssm_out projections as OP_GEMV_F16 over the f32
-# mixer output (no q8 quant), fp32-accumulate (MORE precise than the fork's fp16 --
-# precision is the point). Col-split contract like AR16: op_gemv_f16 makes the
-# local partial, emit_col_reduce folds cross-GPU; weight_slice col-slices F16
-# generically. Works single- and dual-GPU.
-F16_SSM_OUT = "--ssm-out-f16" in sys.argv
+# F16 ssm_out is the DEFAULT base (operator-locked, call/0020): it buys ~3 pts of
+# MTP draft acceptance (0.795 vs 0.767), and the face-off is MTP, so an AR16 base
+# handicaps every contestant. Emit the 48 ssm_out projections as OP_GEMV_F16 over
+# the f32 mixer output (no q8 quant), fp32-accumulate (MORE precise than the fork's
+# fp16 -- precision is the point). Col-split contract like AR16: op_gemv_f16 makes
+# the local partial, emit_col_reduce folds cross-GPU; weight_slice col-slices F16
+# generically. Single- and dual-GPU. `--ssm-out-ar16` opts back to the legacy AR16
+# schedule (k=0/plain instrument + the AR16 parity chain).
+F16_SSM_OUT = "--ssm-out-ar16" not in sys.argv
 
 
 def sp(n):
