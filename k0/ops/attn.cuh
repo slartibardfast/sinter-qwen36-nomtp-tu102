@@ -280,8 +280,123 @@ __device__ inline void mk_load_kv_slice(const half *cache, half *tile, uint32_t 
     }
 }
 
+// Contiguous full-row cooperative load: the WHOLE cache row (all local kv heads,
+// `row_width` f16) for rows [t0,t0+32) into the tile at pitch `rowp`. Coalesced
+// (no per-head stride) -- the plan/0143 FATTN lever: the per-head slice load
+// reads KV at ~33% of roofline (strided by row_width); reading the full row once
+// and slicing in smem is the fix.
+__device__ inline void mk_load_full_row(const half *cache, half *tile, uint32_t t0,
+                                        uint32_t limit, uint32_t row_width, uint32_t rowp) {
+    const uint32_t nv4 = row_width / 8;   // uint4 per full row
+    for (uint32_t i = threadIdx.x; i < MK_FATTN_TILE * nv4; i += blockDim.x) {
+        const uint32_t t = i / nv4, c = i % nv4;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (t0 + t < limit)
+            v = ld_cg(reinterpret_cast<const uint4 *>(cache + (size_t)(t0 + t) * row_width) + c);
+        unsigned *d = reinterpret_cast<unsigned *>(tile + (size_t)t * rowp + c * 8);
+        d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+    }
+}
+
 __device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
     const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
+    // Dual-GPU (row_width<=512) fits the full-row tile in the 60 KiB slab -> the
+    // contiguous-load path (plan/0143: FATTN reads coalesced; measured ~7% deep,
+    // bit-identical). Single-GPU (row_width 1024) overflows the slab -> per-head.
+    if ((size_t) MK_FATTN_TILE * (a.row_width + 2) * 2 + (size_t) a.n_q * MK_ATTN_HD * 4 + 64
+            <= (size_t) SMEM_BYTES) {
+    // ---- contiguous-load variant (plan/0143 primary lever) --------------------
+    // One warp = one q head (12 warps = 12 q heads dual-GPU). Full row loaded once
+    // per tile (coalesced); each warp slices its kv head's 256-wide window in smem.
+    // Math is IDENTICAL to the per-head path below (t0 ascending, same fold) ->
+    // bit-identical output; only the DRAM read pattern changes.
+    const uint32_t n_kv = ld_cg(reinterpret_cast<const unsigned *>(a.n_kv_cell));
+    const int nchunks = ins.block_hi - ins.block_lo;
+    const int chunk   = blockIdx.x - ins.block_lo;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const uint32_t gqa = a.n_q / a.n_kv_heads;
+    const uint32_t rw  = a.row_width;
+    const uint32_t rowp = rw + 2;               // full-row pitch (bank pad)
+    float *q_s   = reinterpret_cast<float *>(smem);
+    half  *tile  = reinterpret_cast<half *>(q_s + a.n_q * MK_ATTN_HD);
+    half  *mask_t = tile + (size_t)MK_FATTN_TILE * rowp;
+
+    uint32_t clen = (n_kv + nchunks - 1) / nchunks;
+    clen = (clen + MK_FATTN_TILE - 1) / MK_FATTN_TILE * MK_FATTN_TILE;
+    const uint32_t kv0 = min((uint32_t)(chunk * clen), n_kv);
+    const uint32_t kv1 = min(kv0 + clen, n_kv);
+
+    for (uint32_t i = threadIdx.x; i < a.n_q * MK_ATTN_HD; i += blockDim.x)
+        q_s[i] = MK_ATTN_SCALE * ld_cg(a.q + i);
+    __syncthreads();
+
+    const uint32_t qh = (uint32_t) warp;        // this warp's global q head
+    const bool active = qh < a.n_q;
+    const uint32_t head_off = (qh / gqa) * MK_ATTN_HD;   // its kv head's slice
+    float m = -FLT_MAX / 2.0f, s = 0.0f;
+    float vacc[MK_ATTN_HD / 32] = {0.0f};
+
+    for (uint32_t t0 = kv0; t0 < kv1; t0 += MK_FATTN_TILE) {
+        mk_load_full_row(a.k_cache, tile, t0, kv1, rw, rowp);
+        if (threadIdx.x < MK_FATTN_TILE / 2) {
+            const uint32_t j = t0 + 2 * threadIdx.x;
+            unsigned w = 0;
+            if (j < kv1) w = ld_cg(reinterpret_cast<const unsigned *>(a.mask + j));
+            reinterpret_cast<unsigned *>(mask_t)[threadIdx.x] = w;
+        }
+        __syncthreads();
+        float p = 0.0f, f = 1.0f;
+        if (active) {
+            const uint32_t j = t0 + lane;
+            float score = -INFINITY;
+            if (j < kv1) {
+                const half  *kr = tile + (size_t)lane * rowp + head_off;
+                const float *qh_p = q_s + qh * MK_ATTN_HD;
+                float dot = 0.0f;
+#pragma unroll
+                for (int c = 0; c < MK_ATTN_HD; c += 2) {
+                    const half2 kk = *reinterpret_cast<const half2 *>(kr + c);
+                    dot += qh_p[c] * __low2float(kk) + qh_p[c + 1] * __high2float(kk);
+                }
+                score = dot + __half2float(mask_t[lane]);
+            }
+            const float m_new = fmaxf(m, warp_max_f32(score));
+            f = expf(m - m_new);
+            p = (j < kv1) ? expf(score - m_new) : 0.0f;
+            s = s * f + warp_sum_f32(p);
+            m = m_new;
+        }
+        __syncthreads();
+        mk_load_full_row(a.v_cache, tile, t0, kv1, rw, rowp);
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (int i = 0; i < MK_ATTN_HD / 32; i++) vacc[i] *= f;
+            const half *vb = tile + head_off + lane * 8;
+            for (int t = 0; t < MK_FATTN_TILE; t++) {
+                const float pt = __shfl_sync(0xffffffffu, p, t);
+                if (pt != 0.0f) {
+                    const half *vr = vb + (size_t)t * rowp;
+#pragma unroll
+                    for (int i = 0; i < MK_ATTN_HD / 32; i += 2) {
+                        const half2 vv = *reinterpret_cast<const half2 *>(vr + i);
+                        vacc[i]     += pt * __low2float(vv);
+                        vacc[i + 1] += pt * __high2float(vv);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        float *rec = a.partials + ((size_t) qh * nchunks + chunk) * MK_FATTN_PSTRIDE;
+#pragma unroll
+        for (int i = 0; i < MK_ATTN_HD / 32; i++) rec[lane * 8 + i] = vacc[i];
+        if (lane == 0) { rec[MK_ATTN_HD] = m; rec[MK_ATTN_HD + 1] = s; }
+    }
+    return;
+    }
+    // ---- per-head slice path (single-GPU, or any row_width that overflows) ----
     // n_kv changes every 256 tokens at deep context; the persistent kernel's L1
     // is incoherent across passes, so a plain read of a per-pass-patched payload
     // could return a stale window. Read it STRONG from the host-written cell.
