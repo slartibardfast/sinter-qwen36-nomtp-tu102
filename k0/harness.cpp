@@ -2205,6 +2205,10 @@ int main(int argc, char **argv) {
     std::string parity_ref, out_dir, diag_out;
     int64_t n_ctx = 8192, bench_n = -1, bench_pos0 = 0;
     int gpu = 0;
+    bool allow_inv_mismatch = false;   // per-type inventory totals are hardcoded for
+                                       // the AR16 base; the F16-ssm_out base has a
+                                       // legit different type mix. Checksums stay the
+                                       // hard gate; this only downgrades inventory.
     enum { M_VALIDATE, M_PARITY, M_BENCH, M_PARITY_TENSOR, M_BENCH_TENSOR } mode = M_VALIDATE;
 
     for (int i = 1; i < argc; i++) {
@@ -2225,6 +2229,7 @@ int main(int argc, char **argv) {
         else if (a == "--n-ctx")   n_ctx = strtoll(need("context size"), nullptr, 10);
         else if (a == "--pos0")    bench_pos0 = strtoll(need("start decode position"), nullptr, 10);
         else if (a == "--gpu")     gpu = atoi(need("device index"));
+        else if (a == "--allow-inventory-mismatch") allow_inv_mismatch = true;
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     const bool tensor_mode = (mode == M_PARITY_TENSOR || mode == M_BENCH_TENSOR);
@@ -2240,7 +2245,9 @@ int main(int argc, char **argv) {
 
             Residency res;
             bool inventory_ok = res.enumerate_and_validate(model);
-            if (!inventory_ok) { fprintf(stderr, "loader validation failed; refusing tensor run\n"); return 1; }
+            if (!inventory_ok && !allow_inv_mismatch) { fprintf(stderr, "loader validation failed; refusing tensor run\n"); return 1; }
+            if (!inventory_ok) fprintf(stderr, "note: inventory MISMATCH accepted (--allow-inventory-mismatch); "
+                                               "the F16-ssm_out base has a legit different type mix\n");
 
             std::string text;
             if (!read_file(program_path, text)) {
@@ -2396,11 +2403,14 @@ int main(int argc, char **argv) {
         if (mode == M_VALIDATE)
             return (inventory_ok && checksums_ok) ? 0 : 1;
 
-        if (!inventory_ok || !checksums_ok) {
+        if ((!inventory_ok && !allow_inv_mismatch) || !checksums_ok) {
             fprintf(stderr, "refusing to run %s: loader validation failed\n",
                     mode == M_PARITY ? "parity" : "bench");
             return 1;
         }
+        if (!inventory_ok && allow_inv_mismatch)
+            fprintf(stderr, "note: inventory MISMATCH accepted (--allow-inventory-mismatch); "
+                            "checksums OK is the binding gate\n");
         if (!have_program || !packed.complete) {
             fprintf(stderr, "cannot run %s: no packed program (see pack status above)\n",
                     mode == M_PARITY ? "parity" : "bench");

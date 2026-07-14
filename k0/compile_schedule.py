@@ -40,6 +40,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # order) and the peer mailbox pointers.
 SPLIT = "--split" in sys.argv
 NGPU = 2 if SPLIT else 1
+# --ssm-out-f16: the face-off base stores ssm_out in F16 (not AR16) -- F16 ssm_out
+# buys ~3 pts of MTP draft acceptance (0.795 vs 0.767), the reason it is the locked
+# base (call/0020). Emit the 48 ssm_out projections as OP_GEMV_F16 over the f32
+# mixer output (no q8 quant), fp32-accumulate (MORE precise than the fork's fp16 --
+# precision is the point). Col-split contract like AR16: op_gemv_f16 makes the
+# local partial, emit_col_reduce folds cross-GPU; weight_slice col-slices F16
+# generically. Works single- and dual-GPU.
+F16_SSM_OUT = "--ssm-out-f16" in sys.argv
 
 
 def sp(n):
@@ -489,12 +497,26 @@ def emit_dn_block(bi, pending_add):
                 est=49152, reads={"attn_out", "gate_out"}, writes={"attn_out"})
     W(i_gated, i_store)
 
-    # -- output projection (AR16, col-split -> cross-GPU reduce) and FFN
-    W(emit_quant("attn_out", sp(6144), opr[0]))
-    i_op = emit_mmvq("OP_MMVQ_AR16", opr, NODES[mulmats(opr)[0]]["src"][0],
-                     6144, "proj_out", axis="col")
-    W(i_op)
-    emit_col_reduce(PROG[i_op]["dbg_node"])
+    # -- output projection and FFN
+    wref = NODES[mulmats(opr)[0]]["src"][0]           # blk.<bi>.ssm_out.weight
+    if F16_SSM_OUT:
+        # F16 ssm_out: GEMV over the f32 mixer output (no q8 quant), fp32-accumulate.
+        # Col-split contract: this GPU dots its local sp(6144) input columns over all
+        # N_EMBD rows into a partial; emit_col_reduce folds cross-GPU (no-op 1-GPU).
+        # weight_slice col-slices the F16 weight generically (dn_stride ssm_out = COL).
+        i_op = I("OP_GEMV_F16", opr,
+                 {"weight": "gguf:" + weight_name(wref), "src": "buf:attn_out",
+                  "src_elems": sp(6144), "row_lo": 0, "row_hi": N_EMBD,
+                  "dst": "buf:proj_out"},
+                 est=weight_bytes(wref) / NGPU, reads={"attn_out"}, writes={"proj_out"})
+        W(i_op)
+        emit_col_reduce(PROG[i_op]["dbg_node"])
+    else:
+        # AR16, col-split -> cross-GPU reduce
+        W(emit_quant("attn_out", sp(6144), opr[0]))
+        i_op = emit_mmvq("OP_MMVQ_AR16", opr, wref, 6144, "proj_out", axis="col")
+        W(i_op)
+        emit_col_reduce(PROG[i_op]["dbg_node"])
     W(emit_rmsnorm(rms[1], rmsnorm_weight(rms[1]), "residual", "xn",
                    "proj_out", extra_nodes=radd[0]))
     emit_ffn(ffn)
