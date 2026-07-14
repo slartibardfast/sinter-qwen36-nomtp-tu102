@@ -46,42 +46,60 @@ def emit(prog_path, out_path):
     lines.append("// Straight-line dispatch body (call/0023 D2). Included inside the")
     lines.append("// pass loop of the generated kernel; `prog`, `smem`, `bid`, `epoch`,")
     lines.append("// `bar` are in scope (same names as core/interp.cu).")
+    # The harness packer EXPANDS two kinds 1 JSON node -> 2 packed mk::Instr:
+    # pack_QK_NORM_ROPE (q then k) and pack_KV_APPEND (K then V) (harness.cpp
+    # :862-899). Every other kind (incl OP_BOUNDARY, OP_NOP) packs 1:1. So the
+    # UPLOADED Instr[] the kernel walks is longer than the JSON node list, and
+    # program[idx] must index the PACKED array, not the JSON position -- and the
+    # two expanded kinds need TWO op calls (the interpreter dispatches both
+    # packed instrs by kind). Track `packed` and emit accordingly.
+    EXPAND2 = {"OP_QK_NORM_ROPE", "OP_KV_APPEND"}
+
+    def emit_call(fn, idx, lo, hi):
+        # block range as compile-time literals; the guard is folded, no switch.
+        if lo == 0 and hi >= 72:
+            lines.append("    %s(program[%d], mk_smem);" % (fn, idx))          # whole grid
+        elif lo == 0:
+            lines.append("    if (blockIdx.x < %d) %s(program[%d], mk_smem);"  # unsigned: no >=0
+                         % (hi, fn, idx))
+        else:
+            lines.append("    if (blockIdx.x >= %d && blockIdx.x < %d) %s(program[%d], mk_smem);"
+                         % (lo, hi, fn, idx))
+
     n_boundary = n_op = 0
+    packed = 0
     for i, insn in enumerate(ins):
         k = insn["kind"]
         if k == "OP_BOUNDARY":
             lines.append("    bar.cross(epoch);")
             n_boundary += 1
+            packed += 1                # pack_BOUNDARY emits one instr
             continue
         if k == "OP_NOP":
+            packed += 1                # pack_NOP emits one instr; no op call
             continue
         fn = OP_FN.get(k)
         if fn is None:
             sys.exit("unwired kind %s at instr %d (add to OP_FN / registry.cuh)" % (k, i))
         lo, hi = insn["block_lo"], insn["block_hi"]
-        # block range as compile-time literals; the guard is folded, no switch.
-        if lo == 0 and hi >= 72:
-            lines.append("    %s(program[%d], mk_smem);" % (fn, i))          # whole grid
-        elif lo == 0:
-            lines.append("    if (blockIdx.x < %d) %s(program[%d], mk_smem);"  # unsigned: no >=0
-                         % (hi, fn, i))
-        else:
-            lines.append("    if (blockIdx.x >= %d && blockIdx.x < %d) %s(program[%d], mk_smem);"
-                         % (lo, hi, fn, i))
-        n_op += 1
+        for _ in range(2 if k in EXPAND2 else 1):
+            emit_call(fn, packed, lo, hi)
+            packed += 1
+            n_op += 1
     body = "\n".join(lines) + "\n"
+    n_packed = packed
     open(out_path, "w").write(body)
     kinds = sorted({i["kind"] for i in ins if i["kind"] not in ("OP_BOUNDARY", "OP_NOP")})
-    return len(ins), n_op, n_boundary, kinds
+    return len(ins), n_op, n_boundary, kinds, n_packed
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("program", nargs="?", default="program-split.json")
     ap.add_argument("-o", "--out", default="mk_specialized_body.inc")
     a = ap.parse_args()
-    total, nop, nb, kinds = emit(a.program, a.out)
-    print("specialized %s: %d instrs -> %d op calls + %d boundaries -> %s" %
-          (a.program, total, nop, nb, a.out))
+    total, nop, nb, kinds, n_packed = emit(a.program, a.out)
+    print("specialized %s: %d JSON nodes -> %d packed instrs (%d op calls + %d "
+          "boundaries) -> %s" % (a.program, total, n_packed, nop, nb, a.out))
     print("op kinds wired:", len(kinds), "of", len(OP_FN))
     unwired = [k for k in kinds if k not in OP_FN]
     if unwired:

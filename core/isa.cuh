@@ -32,8 +32,13 @@
 // must NOT inline (1540 inlined op bodies blow the Turing L1I -- the naive
 // specialized build measured 229,704 SASS instrs, ~28x the ~8K-instr L1I).
 // __noinline__ makes the body 1540 CALLs to 24 op bodies emitted once.
+// `inline` gives the (header-defined) op bodies COMDAT/weak linkage so both
+// TUs that include this header -- interp.cu (the kernel) and harness.cpp (the
+// packer) -- may each emit a copy and the linker folds them to one; without it
+// __noinline__'s external symbols collide (ODR) at link. `inline` is a linkage
+// attribute, orthogonal to __noinline__'s no-inline-at-callsite codegen.
 #if defined(MK_SPECIALIZED)
-#define MK_OPFN __noinline__
+#define MK_OPFN __noinline__ inline
 #else
 #define MK_OPFN __forceinline__
 #endif
