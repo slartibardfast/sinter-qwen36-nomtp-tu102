@@ -366,7 +366,7 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             reinterpret_cast<unsigned *>(mask_t)[threadIdx.x] = w;
         }
         __syncthreads();
-        half  pv_p0[NT], pv_p1[NT];
+        half  pv_p0[NT], pv_p1[NT], pv_p0lo[NT], pv_p1lo[NT];  // 2-limb split of f32 P
         float pv_f = 1.0f;
         // ALL 32 lanes of a computing warp run the mma + quad-shfl (both are
         // warp-synchronous -- guarding by q_gid<gqa would diverge and deadlock).
@@ -376,22 +376,37 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;   // safe idx; padding discarded
             const uint32_t kvoff = kvh * MK_ATTN_HD;
             const float *qrow = a.q + (size_t) qg * MK_ATTN_HD;    // global, .cg
+            // Independent accumulator fragments (TU102 paper tab:tensor: dependent
+            // HMMA latency 14 cyc vs 2 cyc/inst throughput -> 7x). The NT position-
+            // tiles are independent chains; the ks-outer loop interleaves their HMMAs
+            // so the 14-cyc latency of one hides under the others -> throughput-bound.
+            // q is shared across nt per d-slice, so it is read + 2-limb-split ONCE per
+            // ks (was NT-times redundant): cuts the .cg q traffic and the split math 4x.
+            float dd[NT][4] = {};
+            for (int ks = 0; ks < MK_ATTN_HD / 8; ks++) {
+                const int db = ks * 8;
+                const float qs0 = MK_ATTN_SCALE * ld_cg(qrow + db + 2 * q_tid);
+                const float qs1 = MK_ATTN_SCALE * ld_cg(qrow + db + 2 * q_tid + 1);
+                const half qh0 = __float2half(qs0), qh1 = __float2half(qs1);
+                const unsigned a_hi = mk_pk(qh0, qh1);              // f32-q recovery:
+                const unsigned a_lo = mk_pk(__float2half(qs0 - __half2float(qh0)),
+                                            __float2half(qs1 - __half2float(qh1)));
+#pragma unroll
+                for (int nt = 0; nt < NT; nt++) {
+                    const half *krow = tile + (size_t)(nt * 8 + q_gid) * rowp + kvoff;
+                    const unsigned b0 = mk_pk(krow[db + 2 * q_tid], krow[db + 2 * q_tid + 1]);
+                    mk_hmma_f32(dd[nt][0], dd[nt][1], dd[nt][2], dd[nt][3], a_hi, 0u, b0);
+                    mk_hmma_f32(dd[nt][0], dd[nt][1], dd[nt][2], dd[nt][3], a_lo, 0u, b0);
+                }
+            }
             float sc0[NT], sc1[NT];
+#pragma unroll
             for (int nt = 0; nt < NT; nt++) {
                 const int pb = nt * 8;
-                float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-                const half *krow = tile + (size_t)(pb + q_gid) * rowp + kvoff;
-                for (int ks = 0; ks < MK_ATTN_HD / 8; ks++) {
-                    const int db = ks * 8;
-                    unsigned a0 = mk_pk(__float2half(MK_ATTN_SCALE * ld_cg(qrow + db + 2 * q_tid)),
-                                        __float2half(MK_ATTN_SCALE * ld_cg(qrow + db + 2 * q_tid + 1)));
-                    unsigned b0 = mk_pk(krow[db + 2 * q_tid], krow[db + 2 * q_tid + 1]);
-                    mk_hmma_f32(d0, d1, d2, d3, a0, 0u, b0);
-                }
                 const bool ok0 = (t0 + pb + 2 * q_tid) < kv1;
                 const bool ok1 = (t0 + pb + 2 * q_tid + 1) < kv1;
-                sc0[nt] = ok0 ? d0 + __half2float(mask_t[pb + 2 * q_tid]) : -INFINITY;
-                sc1[nt] = ok1 ? d1 + __half2float(mask_t[pb + 2 * q_tid + 1]) : -INFINITY;
+                sc0[nt] = ok0 ? dd[nt][0] + __half2float(mask_t[pb + 2 * q_tid]) : -INFINITY;
+                sc1[nt] = ok1 ? dd[nt][1] + __half2float(mask_t[pb + 2 * q_tid + 1]) : -INFINITY;
             }
             float ml = -INFINITY;
             for (int nt = 0; nt < NT; nt++) ml = fmaxf(ml, fmaxf(sc0[nt], sc1[nt]));
@@ -403,7 +418,10 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             for (int nt = 0; nt < NT; nt++) {
                 const float e0 = sc0[nt] > -INFINITY ? expf(sc0[nt] - m_new) : 0.0f;
                 const float e1 = sc1[nt] > -INFINITY ? expf(sc1[nt] - m_new) : 0.0f;
-                sl += e0 + e1; pv_p0[nt] = __float2half(e0); pv_p1[nt] = __float2half(e1);
+                sl += e0 + e1;
+                pv_p0[nt] = __float2half(e0); pv_p1[nt] = __float2half(e1);
+                pv_p0lo[nt] = __float2half(e0 - __half2float(pv_p0[nt]));  // f32-P recovery
+                pv_p1lo[nt] = __float2half(e1 - __half2float(pv_p1[nt]));
             }
             const float s_new = pv_f * ms[qg * 2 + 1] + mk_qsum(sl);
             if (real && q_tid == 0) { ms[qg * 2] = m_new; ms[qg * 2 + 1] = s_new; }
@@ -416,17 +434,33 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;
             const uint32_t kvoff = kvh * MK_ATTN_HD;
             float *oa = out_acc + (size_t) qg * MK_ATTN_HD;
-            for (int dt = 0; dt < MK_ATTN_HD / 8; dt++) {
-                float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+            // Same independent-accumulator technique for P.V: the output d-tiles are
+            // independent chains, interleaved G at a time to hide the 14-cyc HMMA
+            // latency; the P fragment (p_hi,p_lo) is shared across d-tiles per ks.
+            constexpr int G = 4;
+            for (int dg = 0; dg < MK_ATTN_HD / 8; dg += G) {
+                float oo[G][4] = {};
                 for (int ks = 0; ks < NT; ks++) {
                     const int pb = ks * 8;
-                    const half *vr0 = tile + (size_t)(pb + 2 * q_tid) * rowp + kvoff + dt * 8 + q_gid;
-                    const half *vr1 = tile + (size_t)(pb + 2 * q_tid + 1) * rowp + kvoff + dt * 8 + q_gid;
-                    mk_hmma_f32(o0, o1, o2, o3, mk_pk(pv_p0[ks], pv_p1[ks]), 0u, mk_pk(vr0[0], vr1[0]));
+                    const unsigned p_hi = mk_pk(pv_p0[ks], pv_p1[ks]);
+                    const unsigned p_lo = mk_pk(pv_p0lo[ks], pv_p1lo[ks]);
+                    const half *vrow0 = tile + (size_t)(pb + 2 * q_tid) * rowp + kvoff;
+                    const half *vrow1 = tile + (size_t)(pb + 2 * q_tid + 1) * rowp + kvoff;
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        const int dcol = (dg + g) * 8 + q_gid;
+                        const unsigned vb = mk_pk(vrow0[dcol], vrow1[dcol]);  // V single f16
+                        mk_hmma_f32(oo[g][0], oo[g][1], oo[g][2], oo[g][3], p_hi, 0u, vb);
+                        mk_hmma_f32(oo[g][0], oo[g][1], oo[g][2], oo[g][3], p_lo, 0u, vb);
+                    }
                 }
                 if (real) {
-                    oa[dt * 8 + 2 * q_tid]     = pv_f * oa[dt * 8 + 2 * q_tid]     + o0;
-                    oa[dt * 8 + 2 * q_tid + 1] = pv_f * oa[dt * 8 + 2 * q_tid + 1] + o1;
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        const int dt = dg + g;
+                        oa[dt * 8 + 2 * q_tid]     = pv_f * oa[dt * 8 + 2 * q_tid]     + oo[g][0];
+                        oa[dt * 8 + 2 * q_tid + 1] = pv_f * oa[dt * 8 + 2 * q_tid + 1] + oo[g][1];
+                    }
                 }
             }
         }
