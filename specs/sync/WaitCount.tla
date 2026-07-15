@@ -50,7 +50,15 @@ Notify(p) ==
 
 NotifyAny == \E p \in Producers : Notify(p)
 
-Next == WriteInit \/ NotifyAny
+(* The fan-in has drained: init landed and every producer notified. An        *)
+(* explicit stuttering step at that terminal state so protocol completion is   *)
+(* not reported as a spurious deadlock (keeps deadlock-checking meaningful for  *)
+(* a genuine stall, e.g. the lost-decrement negative where this never holds).  *)
+Done == /\ initDone
+        /\ notified = Producers
+        /\ UNCHANGED vars
+
+Next == WriteInit \/ NotifyAny \/ Done
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(WriteInit) /\ WF_vars(NotifyAny)
 

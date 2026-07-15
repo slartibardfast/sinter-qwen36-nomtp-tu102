@@ -1,0 +1,39 @@
+name: specula (TLC model-checking)
+
+# The specula verification lane for the co-located megakernel sync specs
+# (specs/sync/*.tla). Runs TLC (tla2tools) over every config: positives must
+# model-check clean, must-fail negatives must produce their counterexample.
+# host-lifecycle `software --check` requires this lane to exist in CI once the
+# software carries a .tla spec (plan/0012 #12, specs co-locate with software).
+
+on:
+  push:
+    paths:
+      - 'specs/sync/**'
+      - '.github/workflows/specula.yml'
+  pull_request:
+    paths:
+      - 'specs/sync/**'
+  workflow_dispatch:
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch tla2tools.jar
+        run: |
+          mkdir -p .tla-tools
+          curl -fsSL -o .tla-tools/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+      - name: Model-check the sync suite (tlc2.TLC via run-tlc.sh)
+        env:
+          TLA_TOOLS: ${{ github.workspace }}/.tla-tools/tla2tools.jar
+        run: |
+          chmod +x specs/sync/run-tlc.sh specs/sync/ci-check.sh
+          ./specs/sync/ci-check.sh
