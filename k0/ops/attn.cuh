@@ -335,16 +335,16 @@ __device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const uint32_t gqa = a.n_q / a.n_kv_heads;
     const uint32_t rw = a.row_width, rowp = rw + 2;
-    float *q_s   = reinterpret_cast<float *>(smem);
-    half  *tile  = reinterpret_cast<half *>(q_s + a.n_q * MK_ATTN_HD);
+    // No q_s smem copy: q is read STRONG (.cg) from global in the QK pack below --
+    // the roped q is tiny (n_q*HD f32), L2-hot, and re-reading it per tile keeps the
+    // slab small enough to co-reside (full-row tile + out_acc alone are ~45 KiB;
+    // adding q_s pushed 57.6 KiB, which the co-residency gate rejects).
+    half  *tile  = reinterpret_cast<half *>(smem);
     half  *mask_t = tile + (size_t) MK_FATTN_TILE * rowp;
     uint32_t clen = (n_kv + nchunks - 1) / nchunks;
     clen = (clen + MK_FATTN_TILE - 1) / MK_FATTN_TILE * MK_FATTN_TILE;
     const uint32_t kv0 = min((uint32_t)(chunk * clen), n_kv);
     const uint32_t kv1 = min(kv0 + clen, n_kv);
-    for (uint32_t i = threadIdx.x; i < a.n_q * MK_ATTN_HD; i += blockDim.x)
-        q_s[i] = MK_ATTN_SCALE * ld_cg(a.q + i);
-    __syncthreads();
 
     const int q_gid = lane >> 2, q_tid = lane & 3;
     const uint32_t kvh = (uint32_t) warp;
@@ -368,9 +368,14 @@ __device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *
         __syncthreads();
         half  pv_p0[NT], pv_p1[NT];
         float pv_f = 1.0f;
-        if (wcompute && q_gid < (int) gqa) {
+        // ALL 32 lanes of a computing warp run the mma + quad-shfl (both are
+        // warp-synchronous -- guarding by q_gid<gqa would diverge and deadlock).
+        // Padding rows (q_gid >= gqa) use a safe dummy head index and never store.
+        if (wcompute) {
+            const bool real = q_gid < (int) gqa;
+            const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;   // safe idx; padding discarded
             const uint32_t kvoff = kvh * MK_ATTN_HD;
-            const float *qrow = q_s + (size_t)(kvh * gqa + q_gid) * MK_ATTN_HD;
+            const float *qrow = a.q + (size_t) qg * MK_ATTN_HD;    // global, .cg
             float sc0[NT], sc1[NT];
             for (int nt = 0; nt < NT; nt++) {
                 const int pb = nt * 8;
@@ -378,8 +383,8 @@ __device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *
                 const half *krow = tile + (size_t)(pb + q_gid) * rowp + kvoff;
                 for (int ks = 0; ks < MK_ATTN_HD / 8; ks++) {
                     const int db = ks * 8;
-                    unsigned a0 = mk_pk(__float2half(qrow[db + 2 * q_tid]),
-                                        __float2half(qrow[db + 2 * q_tid + 1]));
+                    unsigned a0 = mk_pk(__float2half(MK_ATTN_SCALE * ld_cg(qrow + db + 2 * q_tid)),
+                                        __float2half(MK_ATTN_SCALE * ld_cg(qrow + db + 2 * q_tid + 1)));
                     unsigned b0 = mk_pk(krow[db + 2 * q_tid], krow[db + 2 * q_tid + 1]);
                     mk_hmma_f32(d0, d1, d2, d3, a0, 0u, b0);
                 }
@@ -391,7 +396,6 @@ __device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *
             float ml = -INFINITY;
             for (int nt = 0; nt < NT; nt++) ml = fmaxf(ml, fmaxf(sc0[nt], sc1[nt]));
             ml = mk_qmax(ml);
-            const uint32_t qg = kvh * gqa + q_gid;
             const float m_old = ms[qg * 2];
             const float m_new = fmaxf(m_old, ml);
             pv_f = expf(m_old - m_new);
@@ -402,14 +406,15 @@ __device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *
                 sl += e0 + e1; pv_p0[nt] = __float2half(e0); pv_p1[nt] = __float2half(e1);
             }
             const float s_new = pv_f * ms[qg * 2 + 1] + mk_qsum(sl);
-            if (q_tid == 0) { ms[qg * 2] = m_new; ms[qg * 2 + 1] = s_new; }
+            if (real && q_tid == 0) { ms[qg * 2] = m_new; ms[qg * 2 + 1] = s_new; }
         }
         __syncthreads();
         mk_load_full_row(a.v_cache, tile, t0, kv1, rw, rowp);
         __syncthreads();
-        if (wcompute && q_gid < (int) gqa) {
+        if (wcompute) {   // all 32 lanes run the P.V mma; only real rows store
+            const bool real = q_gid < (int) gqa;
+            const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;
             const uint32_t kvoff = kvh * MK_ATTN_HD;
-            const uint32_t qg = kvh * gqa + q_gid;
             float *oa = out_acc + (size_t) qg * MK_ATTN_HD;
             for (int dt = 0; dt < MK_ATTN_HD / 8; dt++) {
                 float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
@@ -419,8 +424,10 @@ __device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *
                     const half *vr1 = tile + (size_t)(pb + 2 * q_tid + 1) * rowp + kvoff + dt * 8 + q_gid;
                     mk_hmma_f32(o0, o1, o2, o3, mk_pk(pv_p0[ks], pv_p1[ks]), 0u, mk_pk(vr0[0], vr1[0]));
                 }
-                oa[dt * 8 + 2 * q_tid]     = pv_f * oa[dt * 8 + 2 * q_tid]     + o0;
-                oa[dt * 8 + 2 * q_tid + 1] = pv_f * oa[dt * 8 + 2 * q_tid + 1] + o1;
+                if (real) {
+                    oa[dt * 8 + 2 * q_tid]     = pv_f * oa[dt * 8 + 2 * q_tid]     + o0;
+                    oa[dt * 8 + 2 * q_tid + 1] = pv_f * oa[dt * 8 + 2 * q_tid + 1] + o1;
+                }
             }
         }
         __syncthreads();

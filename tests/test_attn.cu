@@ -53,6 +53,7 @@
 
 #include "../core/isa.cuh"
 #include "../core/sync.cuh"
+#include "../core/interp.cuh"   // SMEM_BYTES (the op's contiguous-path guard reads it)
 #include "../k0/ops/attn.cuh"
 
 #define CUDA_CHECK(call)                                                            \
@@ -376,13 +377,25 @@ static void test_kv_append() {
 // OP_FATTN_DECODE + OP_FATTN_REDUCE: direct flash-attention reference in
 // double over the shared f16 K/V. q pre-scaled by MK_ATTN_SCALE, mask added
 // (0 attend / -inf masked), stable softmax, rowsum divide.
-static unsigned fattn_smem_bytes(uint32_t n_q, uint32_t /*row_width*/) {
+static unsigned fattn_smem_bytes(uint32_t n_q, uint32_t row_width) {
+#ifdef MK_FATTN_HMMA
+    // The HMMA path takes the dual-GPU CONTIGUOUS branch: full-row tile (pitch
+    // row_width+2) + mask + the smem out-accumulator [n_q][HD] and per-q (max,sum)
+    // [n_q][2] the flash body carries. NO q_s copy (q is read .cg from global), so
+    // the footprint stays <= 48 KiB and co-resides with no opt-in.
+    return (unsigned)(mk::MK_FATTN_TILE * (row_width + 2) * sizeof(__half) // full-row tile
+                      + mk::MK_FATTN_TILE * sizeof(__half)              // mask tile
+                      + n_q * HD * sizeof(float)                        // out_acc
+                      + n_q * 2 * sizeof(float));                       // ms
+#else
+    (void) row_width;
     // tile is one kv head's 256-wide slice (HD+2 pitch), independent of the
     // physical cache row_width (the op loops kv heads on the outer axis).
     const uint32_t row_p = HD + 2;
     return (unsigned)(n_q * HD * sizeof(float)          // q_s (all heads)
                       + mk::MK_FATTN_TILE * row_p * sizeof(__half) // KV slice tile
                       + mk::MK_FATTN_TILE * sizeof(__half));       // mask tile
+#endif
 }
 
 static void ref_fattn(const std::vector<__half> &kc, const std::vector<__half> &vc,
