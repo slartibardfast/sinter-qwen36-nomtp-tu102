@@ -330,7 +330,7 @@ __device__ inline void mk_load_full_row(const half *cache, half *tile, uint32_t 
 // specialized kernel) register count -- the G11 72-block co-residency gate.
 // Recomputes the dual-GPU pointers from (smem, a); the caller's guard has already
 // established the contiguous full-row tile fits the 60 KiB slab.
-__device__ __noinline__ void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *smem,
+__device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a, char *smem,
         uint32_t n_kv, int nchunks, int chunk) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const uint32_t gqa = a.n_q / a.n_kv_heads;
