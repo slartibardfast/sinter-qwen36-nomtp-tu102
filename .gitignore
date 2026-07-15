@@ -6,3 +6,6 @@ build/
 __pycache__/
 /tmp-build/
 tests/oracle/oracle
+
+# TLC model-checking scratch (state files, checkpoints)
+specs/**/states/
