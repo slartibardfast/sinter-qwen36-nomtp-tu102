@@ -45,6 +45,10 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
         g_err_dev = ctl.err_dev;
         g_err_host = ctl.err_host;
     }
+#ifdef MK_PROFILE
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        g_fattn_phase = ctl.op_cycles ? ctl.op_cycles + OP_KIND_COUNT : nullptr;
+#endif
     __syncthreads();
 
     GridBoundary bar{hdr.y02_counter};

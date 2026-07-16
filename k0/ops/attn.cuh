@@ -351,10 +351,23 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
     const bool wcompute = kvh < a.n_kv_heads;
     float *out_acc = reinterpret_cast<float *>(mask_t + MK_FATTN_TILE);  // [n_q][HD]
     float *ms      = out_acc + (size_t) a.n_q * MK_ATTN_HD;              // [n_q][2]
+    // FATTN sub-phase profiler (MK_PROFILE only): block-0 thread-0 accrues
+    // clock64 deltas per phase into g_fattn_phase[]. thread-0 (warp 0) is always
+    // a compute thread (kvh 0 < n_kv_heads), so it traverses every phase. Only
+    // one thread reads the counter -> negligible perturbation of the other 383.
+#ifdef MK_PROFILE
+    const bool mkp = (blockIdx.x == 0 && threadIdx.x == 0 && g_fattn_phase);
+    long long _pt = mkp ? clock64() : 0;
+    #define MKP_LAP(ph) do { if (mkp) { long long _n = clock64(); \
+        g_fattn_phase[ph] += _n - _pt; _pt = _n; } } while (0)
+#else
+    #define MKP_LAP(ph) do {} while (0)
+#endif
     for (uint32_t i = threadIdx.x; i < a.n_q * MK_ATTN_HD; i += blockDim.x) out_acc[i] = 0.0f;
     for (uint32_t i = threadIdx.x; i < a.n_q * 2; i += blockDim.x)
         ms[i] = (i & 1) ? 0.0f : -FLT_MAX / 2.0f;
     __syncthreads();
+    MKP_LAP(FATTN_PH_SETUP);
 
     constexpr int NT = MK_FATTN_TILE / 8;
     for (uint32_t t0 = kv0; t0 < kv1; t0 += MK_FATTN_TILE) {
@@ -366,6 +379,7 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             reinterpret_cast<unsigned *>(mask_t)[threadIdx.x] = w;
         }
         __syncthreads();
+        MKP_LAP(FATTN_PH_KLOAD);
         half  pv_p0[NT], pv_p1[NT], pv_p0lo[NT], pv_p1lo[NT];  // 2-limb split of f32 P
         float pv_f = 1.0f;
         // ALL 32 lanes of a computing warp run the mma + quad-shfl (both are
@@ -399,6 +413,7 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
                     mk_hmma_f32(dd[nt][0], dd[nt][1], dd[nt][2], dd[nt][3], a_lo, 0u, b0);
                 }
             }
+            MKP_LAP(FATTN_PH_QK);
             float sc0[NT], sc1[NT];
 #pragma unroll
             for (int nt = 0; nt < NT; nt++) {
@@ -425,10 +440,12 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             }
             const float s_new = pv_f * ms[qg * 2 + 1] + mk_qsum(sl);
             if (real && q_tid == 0) { ms[qg * 2] = m_new; ms[qg * 2 + 1] = s_new; }
+            MKP_LAP(FATTN_PH_SOFTMAX);
         }
         __syncthreads();
         mk_load_full_row(a.v_cache, tile, t0, kv1, rw, rowp);
         __syncthreads();
+        MKP_LAP(FATTN_PH_VLOAD);
         if (wcompute) {   // all 32 lanes run the P.V mma; only real rows store
             const bool real = q_gid < (int) gqa;
             const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;
@@ -465,6 +482,7 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
             }
         }
         __syncthreads();
+        MKP_LAP(FATTN_PH_PV);
     }
     if (wcompute && q_gid < (int) gqa) {
         const uint32_t qg = kvh * gqa + q_gid;
@@ -476,6 +494,8 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
         }
         if (q_tid == 0) { rec[MK_ATTN_HD] = ms[qg * 2]; rec[MK_ATTN_HD + 1] = ms[qg * 2 + 1]; }
     }
+    MKP_LAP(FATTN_PH_SETUP);   // fold the tail partials store into setup
+#undef MKP_LAP
 }
 #endif
 

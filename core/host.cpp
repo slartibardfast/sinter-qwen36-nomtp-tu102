@@ -79,11 +79,12 @@ bool host_init(Host &h, int device, unsigned pass_cycles_cap) {
     h.ctl.pass_cycles = h.d_pass_cycles;
     h.ctl.pass_cycles_cap = pass_cycles_cap;
 
-    // REDLINE per-kind cycle accumulator (OP_KIND_COUNT longs). Always
-    // allocated (tiny); only an MK_PROFILE-built kernel writes it.
-    if (!ck(cudaMalloc(&h.d_op_cycles, (size_t)OP_KIND_COUNT * 8), "d_op_cycles"))
+    // REDLINE per-kind cycle accumulator (OP_KIND_COUNT longs) plus the FATTN
+    // sub-phase slots (MK_OP_CYCLES_LEN total). Always allocated (tiny); only an
+    // MK_PROFILE-built kernel writes it.
+    if (!ck(cudaMalloc(&h.d_op_cycles, (size_t)MK_OP_CYCLES_LEN * 8), "d_op_cycles"))
         return false;
-    cudaMemset(h.d_op_cycles, 0, (size_t)OP_KIND_COUNT * 8);
+    cudaMemset(h.d_op_cycles, 0, (size_t)MK_OP_CYCLES_LEN * 8);
     h.ctl.op_cycles = h.d_op_cycles;
     return true;
 }
@@ -229,14 +230,14 @@ bool host_read_pass_cycles(Host &h, long long *out, unsigned count) {
 bool host_reset_op_cycles(Host &h) {
     if (!h.d_op_cycles)
         return false;
-    return ck(cudaMemsetAsync(h.d_op_cycles, 0, (size_t)OP_KIND_COUNT * 8,
+    return ck(cudaMemsetAsync(h.d_op_cycles, 0, (size_t)MK_OP_CYCLES_LEN * 8,
                               h.cstream),
               "op_cycles reset") &&
            ck(cudaStreamSynchronize(h.cstream), "op_cycles reset sync");
 }
 
 bool host_read_op_cycles(Host &h, long long *out, unsigned count) {
-    if (!h.d_op_cycles || count > (unsigned)OP_KIND_COUNT)
+    if (!h.d_op_cycles || count > (unsigned)MK_OP_CYCLES_LEN)
         return false;
     return ck(cudaMemcpyAsync(out, h.d_op_cycles, (size_t)count * 8,
                               cudaMemcpyDeviceToHost, h.cstream),

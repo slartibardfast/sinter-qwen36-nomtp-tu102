@@ -82,6 +82,31 @@ enum MacroKind : uint16_t {
     OP_KIND_COUNT
 };
 
+// FATTN sub-phase profiler (MK_PROFILE builds only). op_fattn_decode splits its
+// per-tile work into these phases; block-0 thread-0 clock64 deltas accumulate
+// into op_cycles[OP_KIND_COUNT + phase], so the whole-op FATTN_DECODE total
+// (op_cycles[OP_FATTN_DECODE]) decomposes without perturbing the kernel. The
+// buffer is widened to MK_OP_CYCLES_LEN; a non-profile kernel leaves it zero.
+enum FattnPhase {
+    FATTN_PH_KLOAD = 0,   // K tile load + mask + arrival barrier
+    FATTN_PH_QK,          // QK m16n8k8 HMMA (2-limb), the interleaved ks loop
+    FATTN_PH_SOFTMAX,     // online-softmax max/exp/sum + P 2-limb split
+    FATTN_PH_VLOAD,       // post-QK barrier + V tile load + arrival barrier
+    FATTN_PH_PV,          // P.V HMMA + rescale-accumulate + closing barrier
+    FATTN_PH_SETUP,       // one-time out_acc/ms init + tail partials store
+    FATTN_PH_COUNT
+};
+constexpr int MK_FATTN_NPHASE = FATTN_PH_COUNT;
+constexpr int MK_OP_CYCLES_LEN = (int) OP_KIND_COUNT + MK_FATTN_NPHASE;
+
+#if defined(__CUDACC__) && defined(MK_PROFILE)
+// Set once at kernel entry to op_cycles + OP_KIND_COUNT (nullptr if unprofiled).
+// Only block-0 thread-0 writes/reads it, so no cross-thread visibility concern.
+// Internal linkage (like g_err_dev): interp.cu and the ops it #includes share
+// one TU, so this needs no -rdc device linking.
+static __device__ long long *g_fattn_phase = nullptr;
+#endif
+
 // One instruction, 128 bytes, kind-specific payload. The offline compiler
 // packs the payload struct for the kind; ops cast payload to their own
 // args type (static_assert(sizeof(Args) <= sizeof(Instr::payload))).

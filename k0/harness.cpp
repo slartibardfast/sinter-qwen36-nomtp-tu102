@@ -1856,10 +1856,13 @@ static const char *KIND_NAME[mk::OP_KIND_COUNT] = {
     "KV_APPEND", "FATTN_DECODE", "FATTN_REDUCE", "ATTN_GATE", "RESIDUAL_ADD",
     "STATE_LOAD", "STATE_STORE", "XCHG_PUSH", "XCHG_REDUCE"};
 
+static const char *FATTN_PHASE_NAME[mk::MK_FATTN_NPHASE] = {
+    "KLOAD", "QK_HMMA", "SOFTMAX", "VLOAD", "PV_HMMA", "SETUP+TAIL"};
+
 static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
                                double pass_ms) {
-    long long oc[mk::OP_KIND_COUNT] = {0};
-    if (!mk::host_read_op_cycles(h, oc, mk::OP_KIND_COUNT)) return;
+    long long oc[mk::MK_OP_CYCLES_LEN] = {0};
+    if (!mk::host_read_op_cycles(h, oc, mk::MK_OP_CYCLES_LEN)) return;
     long long sum = 0;
     for (int k = 0; k < mk::OP_KIND_COUNT; k++) sum += oc[k];
     if (sum == 0) return;  // non-profile kernel: nothing recorded
@@ -1887,6 +1890,22 @@ static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
            "%.4f ms (%.2f%%)\n",
            ms(oc[mk::OP_BOUNDARY]), 100.0 * oc[mk::OP_BOUNDARY] / sum,
            reduce_ms, 100.0 * (oc[mk::OP_XCHG_PUSH] + oc[mk::OP_XCHG_REDUCE]) / sum);
+    // FATTN_DECODE sub-phase decomposition (block-0 thread-0 clock64 laps in
+    // op_fattn_decode; slots OP_KIND_COUNT..). % is of the FATTN_DECODE total so
+    // it reads as "where the dominant op's time goes". Sums to ~FATTN_DECODE
+    // modulo the one-thread sample vs whole-op-wrapper timing.
+    long long fsum = 0;
+    for (int p = 0; p < mk::MK_FATTN_NPHASE; p++) fsum += oc[mk::OP_KIND_COUNT + p];
+    if (fsum > 0) {
+        long long fdec = oc[mk::OP_FATTN_DECODE];
+        printf("  FATTN_DECODE sub-phases (thread-0 laps; %% of FATTN_DECODE %.4f ms):\n",
+               ms(fdec));
+        for (int p = 0; p < mk::MK_FATTN_NPHASE; p++) {
+            long long c = oc[mk::OP_KIND_COUNT + p];
+            printf("    %-12s %10.4f %7.2f%%\n", FATTN_PHASE_NAME[p], ms(c),
+                   fdec > 0 ? 100.0 * c / fdec : 0.0);
+        }
+    }
     fflush(stdout);
 }
 
