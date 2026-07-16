@@ -1015,6 +1015,9 @@ static const KindEntry *kind_by_name(const std::string &raw) {
 
 struct PackedProgram {
     std::vector<mk::Instr> instrs;
+    std::vector<uint32_t> src_json;    // packed idx -> originating program.json instr idx
+                                       // (one json op expands to >=1 packed instrs; plan/0144
+                                       // telemetry maps a packed op back to its schedule entry)
     std::vector<size_t> fattn_idx;     // FATTN_DECODE positions (reporting count)
     std::vector<size_t> xchg_idx;      // OP_XCHG_REDUCE positions ($seqno patch)
     uint32_t epoch_stride = 0;
@@ -1053,6 +1056,7 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R,
         static const Jv empty_args;
         const Jv *args = ij.get("args");
         PackCtx ctx{R, proto, out.fattn_idx, mbox, gpu_index, &out.xchg_idx};
+        size_t before = out.instrs.size();
         try {
             ke->pack(args ? *args : empty_args, ctx, out.instrs);
         } catch (const std::exception &e) {
@@ -1060,6 +1064,8 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R,
             out.packed_before_failure = i;
             return out;
         }
+        for (size_t k = before; k < out.instrs.size(); k++)
+            out.src_json.push_back((uint32_t) i);  // align packed -> json origin
     }
     out.complete = true;
     out.packed_before_failure = out.instrs.size();
@@ -1942,13 +1948,53 @@ static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
     fflush(stdout);
 }
 
+// plan/0144 milestone 2: per-op schedule-known DRAM bytes + compute ops, attached
+// host-side (the spec keeps rates out of the device record). Covers the DRAM-dominant
+// ops: weight matmuls (weight tensor size from GGUF, scaled by the row split) and
+// FATTN_DECODE (KV read = kv_heads*head_dim*n_kv*2(K+V)*2(f16); ops = QK+PV MACs).
+// Other ops return 0 = "column absent" (the ingest emits no MemoryBw/Pipe demand).
+static std::pair<uint64_t, uint64_t> op_bytes_ops(const Jv &in, const gguf::File &gg,
+                                                  int64_t n_kv) {
+    const Jv *ka = in.get("args");
+    if (!ka) return {0, 0};
+    const Jv &a = *ka;
+    const std::string &kind = in.at("kind").str;
+    auto ai = [&](const char *k, int64_t d) -> int64_t {
+        const Jv *v = a.get(k);
+        return v && v->k == Jv::NUM ? (int64_t) v->num : d;
+    };
+    if (kind == "OP_MMVQ_Q4_0" || kind == "OP_MMVQ_Q4_0_FUSED" ||
+        kind == "OP_GEMV_F16" || kind == "OP_HEAD_GEMV_F16") {
+        const Jv *w = a.get("weight");
+        if (!w || w->k != Jv::STR) return {0, 0};
+        std::string name = w->str;
+        auto c = name.find(':');
+        if (c != std::string::npos) name = name.substr(c + 1);  // strip "gguf:"
+        const gguf::TensorInfo *t = gg.find(name);
+        if (!t) return {0, 0};
+        int64_t rl = ai("row_lo", -1), rh = ai("row_hi", -1);
+        uint64_t bytes = t->nbytes;
+        if (rl >= 0 && rh > rl && t->ne[1] > 0)  // per-GPU row slice
+            bytes = (uint64_t)((double) t->nbytes * (double)(rh - rl) / (double) t->ne[1]);
+        return {bytes, 0};
+    }
+    if (kind == "OP_FATTN_DECODE") {
+        int64_t kvh = ai("kv_heads", 0), qh = ai("q_heads", 0), hd = ai("head_dim", 0);
+        uint64_t kv_bytes = (uint64_t) kvh * hd * (uint64_t) n_kv * 2ull * 2ull;
+        uint64_t ops = 2ull * (uint64_t) qh * hd * (uint64_t) n_kv;  // QK + PV MACs
+        return {kv_bytes, ops};
+    }
+    return {0, 0};
+}
+
 // plan/0144 primitive telemetry dump: the last timed pass's per-op {gt_start_ns,
 // gt_end_ns, cycles} (block 0) + the block->SM residency census. Writes two TSV
 // files at $MK_TELE.gpu<g>.{tele,smid}; calx-mill's `telemetry` mode ingests them
 // as measured-SteadyState anchors. bytes/ops are attached in a later pass (0 here =
 // "column absent", which the ingest treats as no MemoryBw/Pipe demand). op_kind and
 // lane come from the packed program; op_index keys the record to the schedule.
-static void dump_telemetry(GpuCtx &c, int gpu, const char *prefix) {
+static void dump_telemetry(GpuCtx &c, int gpu, const char *prefix, const Jv &program,
+                           const gguf::File &gg, int64_t n_kv) {
     mk::Host &h = c.ln.h;
     unsigned n = h.op_tele_cap;
     if (!n) return;
@@ -1956,6 +2002,12 @@ static void dump_telemetry(GpuCtx &c, int gpu, const char *prefix) {
     if (!mk::host_read_op_tele(h, te.data(), n)) return;
     std::vector<unsigned> smid(mk::GRID_BLOCKS, 0xffffffffu);
     mk::host_read_smid_census(h, smid.data(), mk::GRID_BLOCKS);
+    const Jv &pins = program.at("instructions");
+    // A json op expands to >=1 packed instrs (splits). Share its bytes/ops evenly
+    // across the packed instrs that came from it, so each packed record gets its slice.
+    const auto &src = c.staged.src_json;
+    std::map<uint32_t, uint32_t> share;
+    for (uint32_t s : src) share[s]++;
 
     char path[600];
     snprintf(path, sizeof path, "%s.gpu%d.tele", prefix, gpu);
@@ -1972,7 +2024,16 @@ static void dump_telemetry(GpuCtx &c, int gpu, const char *prefix) {
         unsigned kind = i < instrs.size() ? instrs[i].kind : 0xffffu;
         const char *kn = kind < mk::OP_KIND_COUNT ? KIND_NAME[kind] : "?";
         const char *lane = (kind == mk::OP_FATTN_DECODE) ? "compute" : "mem";
-        fprintf(f, "%u\t%s\t%s\t%lld\t%lld\t%lld\t0\t0\n", i, kn, lane, gs, ge, cy);
+        uint64_t bytes = 0, ops = 0;
+        if (i < src.size() && src[i] < pins.arr.size()) {
+            uint32_t j = src[i];
+            auto bo = op_bytes_ops(pins.arr[j], gg, n_kv);
+            uint32_t sh = share[j] ? share[j] : 1;
+            bytes = bo.first / sh;  // this packed instr's slice of the json op
+            ops = bo.second / sh;
+        }
+        fprintf(f, "%u\t%s\t%s\t%lld\t%lld\t%lld\t%llu\t%llu\n", i, kn, lane, gs, ge, cy,
+                (unsigned long long) bytes, (unsigned long long) ops);
         emitted++;
         tele_cyc_sum += cy;
     }
@@ -2055,7 +2116,8 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
                    g, pass_ms, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
         }
         print_op_breakdown(g2[g].ln.h, g, n_tokens, pass_ms);
-        if (const char *tp = getenv("MK_TELE")) dump_telemetry(g2[g], g, tp);
+        if (const char *tp = getenv("MK_TELE"))
+            dump_telemetry(g2[g], g, tp, program, gg, pos0);  // n_kv ~= pos0 at deep decode
     }
     dual_shutdown(g2);
     return 0;
