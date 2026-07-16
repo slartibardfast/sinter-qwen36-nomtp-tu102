@@ -70,6 +70,10 @@
 #include <unistd.h>                 // sysconf(_SC_PAGESIZE) for the soak RSS watermark
 
 #include <cuda_runtime.h>
+#include <cudaProfiler.h>        // DRIVER cuProfilerStart/Stop: the RANGE markers ncu
+                                 // intercepts (it does NOT hook the runtime variants) for
+                                 // --replay-mode app-range on the persistent cooperative
+                                 // megakernel (per-kernel replay can't profile it).
 
 #include "../core/isa.cuh"
 #include "../core/host.h"          // mk::Host control-plane API (the launcher)
@@ -1697,6 +1701,11 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
     gpu_wire_mailboxes(g2[0], g2[1], n_sites);
     gpu_wire_mailboxes(g2[1], g2[0], n_sites);
 
+    // ncu RANGE start: AFTER the 21 GB weight upload (so range capture stays small) but
+    // BEFORE the cooperative mk_interp launch below, so the persistent kernel is INSIDE the
+    // profiled range (a range excluding the launch is empty). Driver API = the variant ncu
+    // intercepts. Inert without a profiler. Closed by cuProfilerStop() after the timed loop.
+    cuProfilerStart();
     for (int g = 0; g < 2; g++) {
         GpuCtx &c = g2[g];
         c.ln.init(g);                                   // host_init on device g
@@ -1916,7 +1925,7 @@ static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
 static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
                             int64_t n_vocab, int64_t n_tokens, int64_t pos0) {
     GpuCtx g2[2];
-    dual_setup(g2, gg, program, n_ctx, n_vocab);
+    dual_setup(g2, gg, program, n_ctx, n_vocab);  // opens the ncu range internally (post-upload, pre-launch)
     const int WARMUP = 32;
     if (pos0 + (int64_t) WARMUP + n_tokens > n_ctx)
         throw std::runtime_error("pos0 + warmup + N exceed --n-ctx");
@@ -1944,6 +1953,7 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         if ((i + 1) % sample_every == 0) watermark(g2, "soak", pos);
     }
     auto t1 = std::chrono::steady_clock::now();
+    cuProfilerStop();   // close the ncu range
     double sec = std::chrono::duration<double>(t1 - t0).count();
     printf("bench-tensor: %lld tokens in %.3f s = %.2f tok/s "
            "[contended-indicative: host-coordinated 2-GPU]\n",
