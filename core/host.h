@@ -57,11 +57,19 @@ struct Host {
                                          // against the persistent kernel)
     unsigned pass = 0;                   // last pass issued
     bool launched = false;
+    bool smem_optin_done = false;        // dynamic-smem opt-in already set on this
+                                         // device (host_launch then skips it; lets a
+                                         // caller hoist the cuFuncSetAttribute out of
+                                         // an ncu profiler range, which forbids it)
 };
 
 bool host_init(Host &h, int device, unsigned pass_cycles_cap);
 bool host_upload(Host &h, const Instr *prog, uint32_t n_instr,
                  uint32_t epoch_stride);
+// Set the 60 KiB dynamic-smem opt-in on mk_interp for h's current device context and
+// mark it done, so a later host_launch skips the cuFuncSetAttribute. Call this BEFORE
+// opening an ncu range (cuKernelSetAttribute is an unsupported API inside a range).
+bool host_smem_optin(Host &h);
 bool host_launch(Host &h);
 RunStatus host_run_pass(Host &h, int32_t token, double timeout_ms);
 // HALT doorbell + bounded wait for kernel exit; false (with a report) if the

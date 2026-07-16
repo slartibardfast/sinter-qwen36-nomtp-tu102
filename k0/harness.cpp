@@ -1087,12 +1087,23 @@ struct Launcher {
     // d_token is valid only after host_init; the resolver binds cell:token to it.
     int32_t *d_token() { return h.d_token; }
 
-    void upload_program(const PackedProgram &p) {
+    // Upload the packed program and set the dynamic-smem opt-in, but do NOT launch.
+    // Split out so a caller can hoist the cuFuncSetAttribute out of an ncu profiler
+    // range (which forbids it) and place only launch() inside the range.
+    void stage_program(const PackedProgram &p) {
         if (!mk::host_upload(h, p.instrs.data(), (uint32_t) p.instrs.size(), p.epoch_stride))
             throw std::runtime_error("mk::host_upload failed");
+        if (!mk::host_smem_optin(h))
+            throw std::runtime_error("mk::host_smem_optin failed");
+    }
+    void launch() {
         if (!mk::host_launch(h))
             throw std::runtime_error("mk::host_launch failed (cooperative launch)");
         program_uploaded = true;
+    }
+    void upload_program(const PackedProgram &p) {
+        stage_program(p);
+        launch();
     }
 
     bool run_pass(int32_t token) {
@@ -1479,6 +1490,7 @@ struct GpuCtx {
     unsigned *mbox_seqno = nullptr;     // my inbox seqnos, one 128 B line/site
     std::map<std::string, void *> mtab; // "peer_payload:0" -> ptr (for the packer)
     Launcher ln;
+    PackedProgram staged;              // packed program held between stage_program and launch
     std::vector<size_t> xchg_idx;      // OP_XCHG_REDUCE positions ($seqno patch)
     int64_t n_ctx = 8192, mask_cap = 0, n_vocab_full = 0;
     cudaStream_t pstream = nullptr;
@@ -1701,11 +1713,10 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
     gpu_wire_mailboxes(g2[0], g2[1], n_sites);
     gpu_wire_mailboxes(g2[1], g2[0], n_sites);
 
-    // ncu RANGE start: AFTER the 21 GB weight upload (so range capture stays small) but
-    // BEFORE the cooperative mk_interp launch below, so the persistent kernel is INSIDE the
-    // profiled range (a range excluding the launch is empty). Driver API = the variant ncu
-    // intercepts. Inert without a profiler. Closed by cuProfilerStop() after the timed loop.
-    cuProfilerStart();
+    // Phase 1 (BEFORE the ncu range): init, allocate, pack, upload the program, and set
+    // the dynamic-smem opt-in on each device. Everything but the launch. The smem opt-in
+    // (cuFuncSetAttribute) is an API ncu forbids inside a profiler range, so it must land
+    // here; stage_program() sets it, launch() below then skips it.
     for (int g = 0; g < 2; g++) {
         GpuCtx &c = g2[g];
         c.ln.init(g);                                   // host_init on device g
@@ -1716,9 +1727,22 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
             throw std::runtime_error("gpu " + std::to_string(g) + " pack failed after " +
                                      std::to_string(p.packed_before_failure) + ": " + p.first_failure);
         c.xchg_idx  = p.xchg_idx;
-        c.ln.upload_program(p);
+        c.staged    = p;
+        c.ln.stage_program(p);
+    }
+
+    // ncu RANGE start: after the 21 GB upload + smem opt-in, BEFORE the cooperative
+    // mk_interp launch, so the persistent kernel is INSIDE the profiled range (a range
+    // excluding the launch is empty; an opt-in inside it is rejected). Driver API = the
+    // variant ncu intercepts. Inert without a profiler. Closed by cuProfilerStop() after
+    // the timed loop.
+    cuProfilerStart();
+    for (int g = 0; g < 2; g++) {
+        GpuCtx &c = g2[g];
+        cudaSetDevice(c.device);                        // launch() targets the current device
+        c.ln.launch();
         printf("  gpu %d: packed %zu instrs (%zu FATTN, %zu XCHG_REDUCE), kernel launched\n",
-               g, p.instrs.size(), p.fattn_idx.size(), p.xchg_idx.size());
+               g, c.staged.instrs.size(), c.staged.fattn_idx.size(), c.staged.xchg_idx.size());
     }
 }
 

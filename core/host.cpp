@@ -102,17 +102,25 @@ bool host_upload(Host &h, const Instr *prog, uint32_t n_instr,
     return true;
 }
 
-bool host_launch(Host &h) {
-    const void *func = mk_interp_func();
-    if (!ck(cudaFuncSetAttribute(func,
+bool host_smem_optin(Host &h) {
+    if (h.smem_optin_done)
+        return true;
+    if (!ck(cudaFuncSetAttribute(mk_interp_func(),
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  SMEM_BYTES),
             "smem opt-in"))
         return false;
+    h.smem_optin_done = true;
+    return true;
+}
+
+bool host_launch(Host &h) {
+    if (!host_smem_optin(h))   // no-op if already hoisted before an ncu range
+        return false;
 
     const Instr *prog = h.d_program;
     void *args[] = {(void *)&prog, (void *)&h.hdr, (void *)&h.ctl};
-    if (!ck(cudaLaunchCooperativeKernel(func, dim3(GRID_BLOCKS),
+    if (!ck(cudaLaunchCooperativeKernel(mk_interp_func(), dim3(GRID_BLOCKS),
                                         dim3(BLOCK_THREADS), args, SMEM_BYTES,
                                         h.kstream),
             "cooperative launch"))
