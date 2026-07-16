@@ -386,7 +386,11 @@ static unsigned fattn_smem_bytes(uint32_t n_q, uint32_t row_width) {
     return (unsigned)(mk::MK_FATTN_TILE * (row_width + 2) * sizeof(__half) // full-row tile
                       + mk::MK_FATTN_TILE * sizeof(__half)              // mask tile
                       + n_q * HD * sizeof(float)                        // out_acc
-                      + n_q * 2 * sizeof(float));                       // ms
+                      + n_q * 2 * sizeof(float)                         // ms
+#ifdef MK_FATTN_DBUF
+                      + n_q * HD * sizeof(float)                        // q_s (double-buffer stages q)
+#endif
+                      );
 #else
     (void) row_width;
     // tile is one kv head's 256-wide slice (HD+2 pitch), independent of the
@@ -695,6 +699,12 @@ int main() {
     // the fattn program crosses one Y02 boundary: all NBLK blocks must be
     // co-resident at the decode slab size.
     const unsigned max_smem = fattn_smem_bytes(12, 512);
+    // Opt in past the 48 KiB default when the op needs it (the dbuf stages q ->
+    // 57.6 KiB); the interp harness sets the same on its slab. Harmless when small.
+    cudaFuncSetAttribute((const void *) mk_run,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem);
+    cudaFuncSetAttribute((const void *) probe_fattn_decode,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem);
     int bps = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, mk_run, NTHR, max_smem));
     if (bps * prop.multiProcessorCount < NBLK) {

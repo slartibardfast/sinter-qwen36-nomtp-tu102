@@ -497,6 +497,214 @@ __device__ __noinline__ inline void mk_fattn_hmma_dual(const FattnDecodeArgs &a,
     MKP_LAP(FATTN_PH_SETUP);   // fold the tail partials store into setup
 #undef MKP_LAP
 }
+
+#ifdef MK_FATTN_DBUF
+// tile-16 warp-specialized smem DOUBLE-BUFFER (plan/0143 LEAD, call/0033).
+// Compute warps (< n_kv_heads) run QK/PV HMMA on the resident tile; mover warps
+// (>= n_kv_heads) load the NEXT tile into the sibling buffer, so the K/V load
+// overlaps the compute instead of serializing behind it (measured 42% of the op
+// was serial load: capture/fattn-phase-analysis.md). Two 16-row buffers (tileK,
+// tileV) occupy the same slab a single 32-row buffer did. QK keeps C=4 independent
+// accumulator chains via a 2-way k-split (NT=2 position tiles x DS=2 half-sums) so
+// the 16-row tile does not halve the latency hiding. Math is the both-split
+// kernel's, re-associated -> FOLD parity (KL <= 0.02, call/0030), not bit-exact.
+constexpr int MK_TILE16 = 16;
+constexpr int MK_NT16   = MK_TILE16 / 8;   // 2 position tiles
+constexpr int MK_DS16   = 2;               // k-split: NT*DS = 4 chains (== tile-32)
+
+// Sub-block full-row load: threads [sub0, blockDim) cooperatively load MK_TILE16
+// rows of `cache` into `dst` (pitch rowp). sub0=0 uses all threads (prologue);
+// sub0=n_kv_heads*32 uses the mover warps only (overlap phases).
+__device__ inline void mk_dbuf_load(const half *cache, half *dst, uint32_t t0, uint32_t limit,
+                                    uint32_t row_width, uint32_t rowp, uint32_t sub0) {
+    const uint32_t nv4 = row_width / 8;
+    const uint32_t n = blockDim.x - sub0, tid = threadIdx.x - sub0;
+    for (uint32_t i = tid; i < (uint32_t) MK_TILE16 * nv4; i += n) {
+        const uint32_t t = i / nv4, c = i % nv4;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (t0 + t < limit)
+            v = ld_cg(reinterpret_cast<const uint4 *>(cache + (size_t)(t0 + t) * row_width) + c);
+        unsigned *d = reinterpret_cast<unsigned *>(dst + (size_t) t * rowp + c * 8);
+        d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = v.w;
+    }
+}
+__device__ inline void mk_dbuf_mask(const half *mask, half *dst, uint32_t t0,
+                                    uint32_t limit, uint32_t sub0) {
+    const uint32_t tid = threadIdx.x - sub0;
+    if (tid < MK_TILE16 / 2) {   // 8 threads load 16 mask f16 as packed unsigned
+        const uint32_t j = t0 + 2 * tid;
+        unsigned w = 0;
+        if (j < limit) w = ld_cg(reinterpret_cast<const unsigned *>(mask + j));
+        reinterpret_cast<unsigned *>(dst)[tid] = w;
+    }
+}
+
+__device__ __noinline__ inline void mk_fattn_hmma_dbuf(const FattnDecodeArgs &a, char *smem,
+        uint32_t n_kv, int nchunks, int chunk) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const uint32_t gqa = a.n_q / a.n_kv_heads;
+    const uint32_t rw = a.row_width, rowp = rw + 2;
+    // q staged in smem ONCE (tile-16 leaves slab room the tile-32 path lacked):
+    // the overlap exposes QK's per-tile global q re-reads to contention with the
+    // movers' K/V DRAM traffic, so read q from smem instead (measured: QK balloons
+    // 10.5 -> ~20 ms without this).
+    float *q_s   = reinterpret_cast<float *>(smem);
+    half  *tileK  = reinterpret_cast<half *>(q_s + (size_t) a.n_q * MK_ATTN_HD);
+    half  *tileV  = tileK + (size_t) MK_TILE16 * rowp;
+    half  *mask_t = tileV + (size_t) MK_TILE16 * rowp;
+    uint32_t clen = (n_kv + nchunks - 1) / nchunks;
+    clen = (clen + MK_FATTN_TILE - 1) / MK_FATTN_TILE * MK_FATTN_TILE;   // mult of 32 -> mult of 16
+    const uint32_t kv0 = min((uint32_t)(chunk * clen), n_kv);
+    const uint32_t kv1 = min(kv0 + clen, n_kv);
+
+    const int q_gid = lane >> 2, q_tid = lane & 3;
+    const uint32_t kvh = (uint32_t) warp;
+    const bool wcompute = kvh < a.n_kv_heads;
+    const uint32_t sub0 = a.n_kv_heads * 32;   // mover threads begin here
+    float *out_acc = reinterpret_cast<float *>(mask_t + MK_TILE16);   // [n_q][HD]
+    float *ms      = out_acc + (size_t) a.n_q * MK_ATTN_HD;           // [n_q][2]
+    // Sub-phase profiler (MK_PROFILE): thread-0 (a compute thread) laps QK/SOFTMAX/PV
+    // on compute, and the post-phase BARRIER WAITS into VLOAD/KLOAD -- a large wait
+    // means the mover load did NOT hide under compute (the overlap failed).
+#ifdef MK_PROFILE
+    const bool mkp = (blockIdx.x == 0 && threadIdx.x == 0 && g_fattn_phase);
+    long long _pt = mkp ? clock64() : 0;
+    #define MKP_LAP(ph) do { if (mkp) { long long _n = clock64(); \
+        g_fattn_phase[ph] += _n - _pt; _pt = _n; } } while (0)
+#else
+    #define MKP_LAP(ph) do {} while (0)
+#endif
+    for (uint32_t i = threadIdx.x; i < a.n_q * MK_ATTN_HD; i += blockDim.x) {
+        out_acc[i] = 0.0f;
+        q_s[i] = MK_ATTN_SCALE * ld_cg(a.q + i);   // pre-scaled, read once from global
+    }
+    for (uint32_t i = threadIdx.x; i < a.n_q * 2; i += blockDim.x)
+        ms[i] = (i & 1) ? 0.0f : -FLT_MAX / 2.0f;
+    // Prologue: load K[0] + mask[0] with all threads (nothing to overlap yet).
+    mk_dbuf_load(a.k_cache, tileK, kv0, kv1, rw, rowp, 0);
+    mk_dbuf_mask(a.mask, mask_t, kv0, kv1, 0);
+    __syncthreads();
+    MKP_LAP(FATTN_PH_SETUP);
+
+    for (uint32_t t0 = kv0; t0 < kv1; t0 += MK_TILE16) {
+        half  pv_p0[MK_NT16], pv_p1[MK_NT16], pv_p0lo[MK_NT16], pv_p1lo[MK_NT16];
+        float pv_f = 1.0f;
+        // ---- phase A: QK on tileK(=K[t]) || movers load V[t] into tileV --------
+        if (wcompute) {
+            const bool real = q_gid < (int) gqa;
+            const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;
+            const uint32_t kvoff = kvh * MK_ATTN_HD;
+            const float *qrow = q_s + (size_t) qg * MK_ATTN_HD;   // smem, pre-scaled
+            float dd[MK_NT16][MK_DS16][4] = {};
+            const int KSH = (MK_ATTN_HD / 8) / MK_DS16;   // 16 ks per half
+            for (int ds = 0; ds < MK_DS16; ds++)
+                for (int kk = 0; kk < KSH; kk++) {
+                    const int ks = ds * KSH + kk, db = ks * 8;
+                    const float qs0 = qrow[db + 2 * q_tid];
+                    const float qs1 = qrow[db + 2 * q_tid + 1];
+                    const half qh0 = __float2half(qs0), qh1 = __float2half(qs1);
+                    const unsigned a_hi = mk_pk(qh0, qh1);
+                    const unsigned a_lo = mk_pk(__float2half(qs0 - __half2float(qh0)),
+                                                __float2half(qs1 - __half2float(qh1)));
+#pragma unroll
+                    for (int nt = 0; nt < MK_NT16; nt++) {
+                        const half *krow = tileK + (size_t)(nt * 8 + q_gid) * rowp + kvoff;
+                        const unsigned b0 = mk_pk(krow[db + 2 * q_tid], krow[db + 2 * q_tid + 1]);
+                        mk_hmma_f32(dd[nt][ds][0], dd[nt][ds][1], dd[nt][ds][2], dd[nt][ds][3], a_hi, 0u, b0);
+                        mk_hmma_f32(dd[nt][ds][0], dd[nt][ds][1], dd[nt][ds][2], dd[nt][ds][3], a_lo, 0u, b0);
+                    }
+                }
+            MKP_LAP(FATTN_PH_QK);
+            float sc0[MK_NT16], sc1[MK_NT16];
+#pragma unroll
+            for (int nt = 0; nt < MK_NT16; nt++) {
+                const int pb = nt * 8;
+                const float d0 = dd[nt][0][0] + dd[nt][1][0];   // combine the DS half-sums
+                const float d1 = dd[nt][0][1] + dd[nt][1][1];
+                const bool ok0 = (t0 + pb + 2 * q_tid) < kv1;
+                const bool ok1 = (t0 + pb + 2 * q_tid + 1) < kv1;
+                sc0[nt] = ok0 ? d0 + __half2float(mask_t[pb + 2 * q_tid]) : -INFINITY;
+                sc1[nt] = ok1 ? d1 + __half2float(mask_t[pb + 2 * q_tid + 1]) : -INFINITY;
+            }
+            float ml = -INFINITY;
+            for (int nt = 0; nt < MK_NT16; nt++) ml = fmaxf(ml, fmaxf(sc0[nt], sc1[nt]));
+            ml = mk_qmax(ml);
+            const float m_old = ms[qg * 2];
+            const float m_new = fmaxf(m_old, ml);
+            pv_f = expf(m_old - m_new);
+            float sl = 0.0f;
+            for (int nt = 0; nt < MK_NT16; nt++) {
+                const float e0 = sc0[nt] > -INFINITY ? expf(sc0[nt] - m_new) : 0.0f;
+                const float e1 = sc1[nt] > -INFINITY ? expf(sc1[nt] - m_new) : 0.0f;
+                sl += e0 + e1;
+                pv_p0[nt] = __float2half(e0); pv_p1[nt] = __float2half(e1);
+                pv_p0lo[nt] = __float2half(e0 - __half2float(pv_p0[nt]));
+                pv_p1lo[nt] = __float2half(e1 - __half2float(pv_p1[nt]));
+            }
+            const float s_new = pv_f * ms[qg * 2 + 1] + mk_qsum(sl);
+            if (real && q_tid == 0) { ms[qg * 2] = m_new; ms[qg * 2 + 1] = s_new; }
+            MKP_LAP(FATTN_PH_SOFTMAX);
+        } else {
+            mk_dbuf_load(a.v_cache, tileV, t0, kv1, rw, rowp, sub0);
+        }
+        __syncthreads();
+        MKP_LAP(FATTN_PH_VLOAD);   // thread-0 (compute) wait here = V-load NOT hidden
+        // ---- phase B: PV on tileV(=V[t]) || movers load K[t+1]+mask[t+1] -------
+        if (wcompute) {
+            const bool real = q_gid < (int) gqa;
+            const uint32_t qg = real ? (kvh * gqa + q_gid) : 0u;
+            const uint32_t kvoff = kvh * MK_ATTN_HD;
+            float *oa = out_acc + (size_t) qg * MK_ATTN_HD;
+            constexpr int G = 4;
+            for (int dg = 0; dg < MK_ATTN_HD / 8; dg += G) {
+                float oo[G][4] = {};
+                for (int ks = 0; ks < MK_NT16; ks++) {
+                    const int pb = ks * 8;
+                    const unsigned p_hi = mk_pk(pv_p0[ks], pv_p1[ks]);
+                    const unsigned p_lo = mk_pk(pv_p0lo[ks], pv_p1lo[ks]);
+                    const half *vrow0 = tileV + (size_t)(pb + 2 * q_tid) * rowp + kvoff;
+                    const half *vrow1 = tileV + (size_t)(pb + 2 * q_tid + 1) * rowp + kvoff;
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        const int dcol = (dg + g) * 8 + q_gid;
+                        const unsigned vb = mk_pk(vrow0[dcol], vrow1[dcol]);
+                        mk_hmma_f32(oo[g][0], oo[g][1], oo[g][2], oo[g][3], p_hi, 0u, vb);
+                        mk_hmma_f32(oo[g][0], oo[g][1], oo[g][2], oo[g][3], p_lo, 0u, vb);
+                    }
+                }
+                if (real) {
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        const int dt = dg + g;
+                        oa[dt * 8 + 2 * q_tid]     = pv_f * oa[dt * 8 + 2 * q_tid]     + oo[g][0];
+                        oa[dt * 8 + 2 * q_tid + 1] = pv_f * oa[dt * 8 + 2 * q_tid + 1] + oo[g][1];
+                    }
+                }
+            }
+            MKP_LAP(FATTN_PH_PV);
+        } else {
+            const uint32_t tn = t0 + MK_TILE16;
+            if (tn < kv1) {
+                mk_dbuf_load(a.k_cache, tileK, tn, kv1, rw, rowp, sub0);
+                mk_dbuf_mask(a.mask, mask_t, tn, kv1, sub0);
+            }
+        }
+        __syncthreads();
+        MKP_LAP(FATTN_PH_KLOAD);   // thread-0 (compute) wait here = K-load NOT hidden
+    }
+    if (wcompute && q_gid < (int) gqa) {
+        const uint32_t qg = kvh * gqa + q_gid;
+        float *rec = a.partials + ((size_t) qg * nchunks + chunk) * MK_FATTN_PSTRIDE;
+        const float *oa = out_acc + (size_t) qg * MK_ATTN_HD;
+        for (int dt = 0; dt < MK_ATTN_HD / 8; dt++) {
+            rec[dt * 8 + 2 * q_tid]     = oa[dt * 8 + 2 * q_tid];
+            rec[dt * 8 + 2 * q_tid + 1] = oa[dt * 8 + 2 * q_tid + 1];
+        }
+        if (q_tid == 0) { rec[MK_ATTN_HD] = ms[qg * 2]; rec[MK_ATTN_HD + 1] = ms[qg * 2 + 1]; }
+    }
+#undef MKP_LAP
+}
+#endif // MK_FATTN_DBUF
 #endif
 
 __device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
@@ -603,7 +811,11 @@ __device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
     // and accumulator registers do not inflate the shared interpreter frame (G11
     // 72-block co-residency). Out-accumulator + per-q (max,sum) live in the slab.
     (void) qh; (void) active; (void) head_off; (void) gqa;
+#ifdef MK_FATTN_DBUF
+    mk_fattn_hmma_dbuf(a, smem, n_kv, nchunks, chunk);   // tile-16 double-buffer (LEAD)
+#else
     mk_fattn_hmma_dual(a, smem, n_kv, nchunks, chunk);
+#endif
     return;
 #endif
     }
