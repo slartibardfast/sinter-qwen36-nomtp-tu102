@@ -1942,6 +1942,59 @@ static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
     fflush(stdout);
 }
 
+// plan/0144 primitive telemetry dump: the last timed pass's per-op {gt_start_ns,
+// gt_end_ns, cycles} (block 0) + the block->SM residency census. Writes two TSV
+// files at $MK_TELE.gpu<g>.{tele,smid}; calx-mill's `telemetry` mode ingests them
+// as measured-SteadyState anchors. bytes/ops are attached in a later pass (0 here =
+// "column absent", which the ingest treats as no MemoryBw/Pipe demand). op_kind and
+// lane come from the packed program; op_index keys the record to the schedule.
+static void dump_telemetry(GpuCtx &c, int gpu, const char *prefix) {
+    mk::Host &h = c.ln.h;
+    unsigned n = h.op_tele_cap;
+    if (!n) return;
+    std::vector<long long> te((size_t)n * 3, 0);
+    if (!mk::host_read_op_tele(h, te.data(), n)) return;
+    std::vector<unsigned> smid(mk::GRID_BLOCKS, 0xffffffffu);
+    mk::host_read_smid_census(h, smid.data(), mk::GRID_BLOCKS);
+
+    char path[600];
+    snprintf(path, sizeof path, "%s.gpu%d.tele", prefix, gpu);
+    FILE *f = fopen(path, "w");
+    if (!f) { perror("MK_TELE open"); return; }
+    fprintf(f, "op_index\top_kind\tlane\tgt_start_ns\tgt_end_ns\tcycles\tbytes\tops\n");
+    const auto &instrs = c.staged.instrs;
+    int emitted = 0;
+    long long tele_cyc_sum = 0;
+    for (unsigned i = 0; i < n; i++) {
+        long long gs = te[(size_t)i * 3 + 0], ge = te[(size_t)i * 3 + 1],
+                  cy = te[(size_t)i * 3 + 2];
+        if (gs == 0 && ge == 0 && cy == 0) continue;  // op did not run on block 0
+        unsigned kind = i < instrs.size() ? instrs[i].kind : 0xffffu;
+        const char *kn = kind < mk::OP_KIND_COUNT ? KIND_NAME[kind] : "?";
+        const char *lane = (kind == mk::OP_FATTN_DECODE) ? "compute" : "mem";
+        fprintf(f, "%u\t%s\t%s\t%lld\t%lld\t%lld\t0\t0\n", i, kn, lane, gs, ge, cy);
+        emitted++;
+        tele_cyc_sum += cy;
+    }
+    fclose(f);
+
+    snprintf(path, sizeof path, "%s.gpu%d.smid", prefix, gpu);
+    int distinct = 0;
+    bool used[256] = {false};
+    if ((f = fopen(path, "w"))) {
+        fprintf(f, "block_id\tsmid\n");
+        for (unsigned b = 0; b < mk::GRID_BLOCKS; b++) {
+            fprintf(f, "%u\t%u\n", b, smid[b]);
+            if (smid[b] < 256 && !used[smid[b]]) { used[smid[b]] = true; distinct++; }
+        }
+        fclose(f);
+    }
+    printf("TELE gpu %d: %d op records (cyc-sum %lld) + %u-block census (%d distinct SMs)"
+           " -> %s.gpu%d.{tele,smid}\n",
+           gpu, emitted, tele_cyc_sum, mk::GRID_BLOCKS, distinct, prefix, gpu);
+    fflush(stdout);
+}
+
 // -- tensor bench / soak: dual-GPU decode floor + leak watermark --------------
 // pos0 seeds the starting decode position; at pos0 near n_ctx the KV read (~8.6
 // GB/GPU) dominates, giving the true deep-context floor. Long n_tokens with the
@@ -2002,6 +2055,7 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
                    g, pass_ms, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
         }
         print_op_breakdown(g2[g].ln.h, g, n_tokens, pass_ms);
+        if (const char *tp = getenv("MK_TELE")) dump_telemetry(g2[g], g, tp);
     }
     dual_shutdown(g2);
     return 0;

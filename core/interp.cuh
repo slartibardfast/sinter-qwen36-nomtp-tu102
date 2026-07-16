@@ -72,6 +72,16 @@ struct Control {
     // carries the boundary-wait total. OP_KIND_COUNT entries, nullptr or a
     // non-MK_PROFILE kernel leaves it untouched (production is unaffected).
     long long *op_cycles;
+    // Primitive telemetry (MK_PROFILE builds only; plan/0144 seam). Per-op-instance
+    // timing ring: 3 longs/op {gt_start_ns, gt_end_ns, cycles}, block-0, last-pass-
+    // wins (op_tele_cap = n_instr entries). Residency census: block b writes its
+    // %smid once (GRID_BLOCKS entries). Both nullptr disables; the %globaltimer/
+    // %smid reads and the ring write live under MK_PROFILE, so production is
+    // untouched. The ring write happens AFTER gt_end, so a measured span never
+    // includes its own store.
+    long long *op_tele;       // n_instr*3 longs, nullptr disables
+    unsigned  *smid_census;   // GRID_BLOCKS entries, nullptr disables
+    unsigned   op_tele_cap;   // op_tele ring capacity in ops (bounds the write)
 };
 
 } // namespace mk

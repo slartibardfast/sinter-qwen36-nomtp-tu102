@@ -48,6 +48,13 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
 #ifdef MK_PROFILE
     if (blockIdx.x == 0 && threadIdx.x == 0)
         g_fattn_phase = ctl.op_cycles ? ctl.op_cycles + OP_KIND_COUNT : nullptr;
+    // Residency census (plan/0144): each block records its SM once, so the ingest
+    // can confirm 72 distinct SMs (co-residence). One store per block, at entry.
+    if (threadIdx.x == 0 && ctl.smid_census) {
+        unsigned smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+        ctl.smid_census[blockIdx.x] = smid;
+    }
 #endif
     __syncthreads();
 
@@ -118,9 +125,23 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
             }
             if (blockIdx.x >= in.block_lo && blockIdx.x < in.block_hi) {
 #ifdef MK_PROFILE
+                const bool tele = prof && ctl.op_tele && i < ctl.op_tele_cap;
+                long long gs = 0;
                 long long to = prof ? clock64() : 0;
+                // gt_start read just before the op; the clock64 span `to..c` does not
+                // include the ring store below (which happens after gt_end).
+                if (tele) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gs));
                 op_dispatch(in, mk_smem);
-                if (prof) ctl.op_cycles[kind] += clock64() - to;
+                if (prof) {
+                    long long c = clock64() - to;
+                    ctl.op_cycles[kind] += c;
+                    if (tele) {
+                        long long ge;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ge));
+                        long long *e = ctl.op_tele + (size_t)i * 3;
+                        e[0] = gs; e[1] = ge; e[2] = c;   // write AFTER ge: span-clean
+                    }
+                }
 #else
                 op_dispatch(in, mk_smem);
 #endif

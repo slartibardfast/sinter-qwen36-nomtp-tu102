@@ -45,6 +45,9 @@ struct Host {
     long long *d_pass_cycles = nullptr;  // G15 ring (block-0 clock64 deltas)
     unsigned pass_cycles_cap = 0;
     long long *d_op_cycles = nullptr;    // REDLINE: per-kind cycles (OP_KIND_COUNT)
+    long long *d_op_tele = nullptr;      // plan/0144: per-op-instance {gs,ge,cyc}*n_instr
+    unsigned  *d_smid_census = nullptr;  // plan/0144: %smid per block (GRID_BLOCKS)
+    unsigned   op_tele_cap = 0;          // n_instr (op_tele ring capacity in ops)
     // host-mapped mailbox
     unsigned *h_mail = nullptr;
     volatile unsigned *h_doorbell = nullptr;
@@ -86,5 +89,11 @@ bool host_read_pass_cycles(Host &h, long long *out, unsigned count);
 // still allocated so a profile build can write it).
 bool host_reset_op_cycles(Host &h);
 bool host_read_op_cycles(Host &h, long long *out, unsigned count);
+
+// plan/0144 primitive telemetry readback (MK_PROFILE builds fill it; else zero).
+// op_tele: `n_op*3` longs {gt_start_ns, gt_end_ns, cycles} per op (last timed pass).
+// smid_census: `count` block->SM entries. Both no-op false if the buffer is absent.
+bool host_read_op_tele(Host &h, long long *out, unsigned n_op);
+bool host_read_smid_census(Host &h, unsigned *out, unsigned count);
 
 } // namespace mk

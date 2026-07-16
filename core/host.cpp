@@ -86,6 +86,16 @@ bool host_init(Host &h, int device, unsigned pass_cycles_cap) {
         return false;
     cudaMemset(h.d_op_cycles, 0, (size_t)MK_OP_CYCLES_LEN * 8);
     h.ctl.op_cycles = h.d_op_cycles;
+
+    // plan/0144 residency census: one %smid per block. n_instr is not known yet, so
+    // op_tele is allocated in host_upload; wire it null here.
+    if (!ck(cudaMalloc(&h.d_smid_census, (size_t)GRID_BLOCKS * sizeof(unsigned)),
+            "d_smid_census"))
+        return false;
+    cudaMemset(h.d_smid_census, 0xff, (size_t)GRID_BLOCKS * sizeof(unsigned));
+    h.ctl.smid_census = h.d_smid_census;
+    h.ctl.op_tele = nullptr;
+    h.ctl.op_tele_cap = 0;
     return true;
 }
 
@@ -99,6 +109,15 @@ bool host_upload(Host &h, const Instr *prog, uint32_t n_instr,
         return false;
     h.hdr.n_instr = n_instr;
     h.hdr.epoch_stride = epoch_stride;
+
+    // plan/0144 per-op-instance timing ring: 3 longs/op {gs,ge,cyc}, last timed
+    // pass wins. Allocated here (n_instr now known); only an MK_PROFILE kernel writes.
+    if (!ck(cudaMalloc(&h.d_op_tele, (size_t)n_instr * 3 * 8), "d_op_tele"))
+        return false;
+    cudaMemset(h.d_op_tele, 0, (size_t)n_instr * 3 * 8);
+    h.op_tele_cap = n_instr;
+    h.ctl.op_tele = h.d_op_tele;
+    h.ctl.op_tele_cap = n_instr;
     return true;
 }
 
@@ -217,6 +236,8 @@ void host_destroy(Host &h) {
     cudaFree(h.d_token);
     cudaFree(h.d_pass_cycles);
     cudaFree(h.d_op_cycles);
+    cudaFree(h.d_op_tele);
+    cudaFree(h.d_smid_census);
     cudaFreeHost(h.h_mail);
     if (h.kstream)
         cudaStreamDestroy(h.kstream);
@@ -251,6 +272,24 @@ bool host_read_op_cycles(Host &h, long long *out, unsigned count) {
                               cudaMemcpyDeviceToHost, h.cstream),
               "op_cycles read") &&
            ck(cudaStreamSynchronize(h.cstream), "op_cycles sync");
+}
+
+bool host_read_op_tele(Host &h, long long *out, unsigned n_op) {
+    if (!h.d_op_tele || n_op > h.op_tele_cap)
+        return false;
+    return ck(cudaMemcpyAsync(out, h.d_op_tele, (size_t)n_op * 3 * 8,
+                              cudaMemcpyDeviceToHost, h.cstream),
+              "op_tele read") &&
+           ck(cudaStreamSynchronize(h.cstream), "op_tele sync");
+}
+
+bool host_read_smid_census(Host &h, unsigned *out, unsigned count) {
+    if (!h.d_smid_census || count > GRID_BLOCKS)
+        return false;
+    return ck(cudaMemcpyAsync(out, h.d_smid_census, (size_t)count * sizeof(unsigned),
+                              cudaMemcpyDeviceToHost, h.cstream),
+              "smid_census read") &&
+           ck(cudaStreamSynchronize(h.cstream), "smid_census sync");
 }
 
 } // namespace mk
