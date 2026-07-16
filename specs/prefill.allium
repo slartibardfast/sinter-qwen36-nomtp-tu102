@@ -1,0 +1,286 @@
+-- allium: 3
+-- prefill.allium — the fused megakernel's PREFILL half and the
+-- prefill -> decode handover (plan/0143, the missing half of the
+-- megakernel: "Prefill built and fused").
+--
+-- Scope: the correctness contracts the prefill phase and the
+-- prefill -> decode handover must satisfy, against the stock engine at
+-- the recorded .host-software pin. Sibling to the decode-side
+-- playbook.allium (plan/0135): that file's DecodeStepEquivalence and
+-- BankedStateEquivalence bind the decode half; this file binds the
+-- prefill half (batched U=128 projection, chunk-parallel DeltaNet scan,
+-- FA-2 causal attention) and the no-teardown handover that carries
+-- state from prefill into decode inside ONE resident cooperative
+-- kernel.
+--
+-- Gate bindings (spec/gate-manifest-prefill.md, the binding contract):
+--   PrefillLogitsParity        — prefill-logits KL <= 0.02 vs stock
+--   PostPrefillStateEquivalence — post-prefill KV/state parity: KV rows
+--                                and n_past bit-exact; the DeltaNet
+--                                recurrent bank bounded by the chunked
+--                                fold drift over 8 chunks x 48 layers
+--   HandoverStateCarry         — fused == separate: the state decode
+--                                reads is bit-identical to a separate
+--                                prefill-then-decode run, no teardown
+--
+-- The timing/concurrency half of the handover — that no decode block
+-- consumes state a prefill block has not finished writing — is NOT here
+-- (this file is correctness only, per the playbook.allium convention
+-- that performance and concurrency obligations live outside .allium). It
+-- is the sibling specs/sync/HandoverCarry.tla invariant NoPrematureConsume,
+-- model-checked in the specula lane. CarryIsBarrierOrdered below records
+-- the dependency; the .tla discharges it.
+--
+-- Excludes:
+--   - Kernel-internal structure (SM partition, smem carveout, tile size,
+--     mover/compute warp split): reference/megakernel/ design tables.
+--   - Performance obligations (prefill t/s, chunk crossover U, the
+--     bandwidth floor): spec/gate-manifest*.md and the calx-mill
+--     derivation own those; this file is correctness only.
+
+-- ============================================================
+-- External Entities — owned by the stock engine, not this spec
+-- ============================================================
+
+-- The reference implementation: the llama.cpp fork at the recorded
+-- .host-software pin, running the same GGUF weights, stock CUDA path.
+-- Every equivalence in this file is stated against its prefill.
+external entity StockEngine {
+    build_commit: String
+}
+
+-- One prefill micro-batch: U tokens processed together. The batched
+-- prefill program binds U = 128 (the DeltaNet kernel's native chunk,
+-- gated_delta_net_cuda<128>); projections run as GEMM (M = 1 -> U),
+-- attention is causal-masked.
+external entity PrefillBatch {
+    n_tokens: Integer
+}
+
+-- The model state a prefill pass writes and a decode pass then reads:
+-- the recurrent DeltaNet banks, the KV cache rows for the full-attention
+-- layers, and the position counter. Layout is engine-owned; the
+-- contracts treat it as comparable by value, per layer class.
+external entity ModelState {
+    n_past: Integer
+}
+
+-- The prefill pass's observable logits: one next-token logits row per
+-- batched position under the causal mask.
+external entity LogitsBlock {
+    n_vocab: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The two layer classes whose post-prefill state is compared under
+-- DIFFERENT tolerance classes. attention_kv: the KV rows the causal
+-- attention layers append (a projection + append, no cross-position
+-- reduction, so fold-order-preserving and bit-exact). deltanet_recurrent:
+-- the DeltaNet recurrent bank the chunk-parallel scan produces (a fold
+-- over the sequence whose chunking REORDERS the summation, so
+-- fold-order-sensitive and bounded by a drift budget, not bit-exact).
+enum LayerClass { attention_kv | deltanet_recurrent }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The fixed prefill micro-batch every batched-prefill instantiation
+    -- binds. 128 is the DeltaNet kernel's native chunk and the crossover
+    -- point (U ~ 100-130) where per-chunk compute reaches the fixed
+    -- per-chunk DRAM read at n_ctx 262144 (playbook ResidentProgram.ubatch).
+    prefill_ubatch: Integer = 128
+
+    -- Final prefill-logits comparison vs the stock engine's fp32
+    -- reference, per batched position (KL divergence over the vocab).
+    -- SAME class as the decode-side logits gate (playbook
+    -- logits_kl_tol = 0.02, calibrated 2026-07-11 against the
+    -- legitimate-reordering envelope). FA-causal reorders the softmax
+    -- fold, so prefill logits are KL-class, not bit-exact.
+    prefill_logits_kl_tol: Decimal = 0.02
+
+    -- KV rows and n_past are BIT-EXACT vs stock prefill: the batched
+    -- projection + KV append does no cross-position reduction, so it
+    -- preserves the stock fold order (playbook state_bit_exact_tol = 0.0,
+    -- G21 "bit-exact state").
+    kv_state_bit_exact_tol: Decimal = 0.0
+
+    -- The DeltaNet recurrent bank: the chunk-parallel UT/WY scan reorders
+    -- the sequence fold, so it is NOT bit-exact. The binding ceiling is
+    -- the END-TO-END prefill-logits KL (0.02) the accumulated bank drift
+    -- must not breach across 8 chunks x 48 layers. The measured per-chunk
+    -- state drift (4.2e-4, capture/) is the DIAGNOSTIC toward this
+    -- ceiling, recorded not scored — the per-step-KL-toward-PPL pattern.
+    deltanet_chunk_logits_kl_tol: Decimal = 0.02
+}
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- The parameter object for a prefill instantiation. Binds the ubatch and
+-- the fingerprint of the prefill cgraph it matches (playbook
+-- ResidentProgram, kind = prefill). The substrate is a citation; no
+-- contract branches on it.
+entity PrefillConfiguration {
+    -- The prefill cgraph fingerprint this instantiation matches
+    -- (cgraph/v1 over the batched prefill graph; n_tokens > 1 marks it
+    -- prefill vs the decode fingerprint's n_tokens = 1).
+    fingerprint: String
+
+    -- The bound micro-batch. Fixed-length: one ubatch = one fingerprint
+    -- = one DeltaNet scan chunk.
+    ubatch: Integer
+
+    -- The calx-mill substrate identifier the budgets derive from
+    -- (e.g. "tu102-sm75-2gpu-nvlink"). A citation, not behaviour.
+    substrate: String
+
+    invariant BindsNativeChunk {
+        ubatch = config.prefill_ubatch
+    }
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The batched prefill pass produces stock-equivalent logits. The causal
+-- mask means position i's logits depend only on positions 0..i, so the
+-- batched (GEMM) projection is numerically the stock per-position result
+-- up to the FA-causal softmax fold reorder — bounded by the KL class.
+contract PrefillLogitsParity {
+    invoke: (cfg: PrefillConfiguration, state: ModelState, batch: PrefillBatch) -> LogitsBlock
+
+    @invariant LogitsKLBound
+        -- For every batched position under the causal mask,
+        -- KL(prefill_logits || stock_fp32_ref_logits) <=
+        -- config.prefill_logits_kl_tol. The stock reference is
+        -- StockEngine at its recorded build_commit on identical weights,
+        -- pre-prefill state and token block.
+
+    @invariant GreedyAgreement
+        -- Under greedy sampling the token argmax at each batched position
+        -- is identical to the stock engine's whenever no logits tie sits
+        -- within the tolerance band. Ties within the band are recorded,
+        -- not scored (the plan/0134 determinism lesson).
+
+    @guidance
+        -- The obligation drives the megakernel through the real prefill
+        -- dispatch (the batched cgraph the runtime submits), never a
+        -- test-only entry point.
+}
+
+-- After prefill, the model state the decode phase will read equals what
+-- stock prefill produces, per layer class. Two classes: KV rows and
+-- n_past bit-exact (fold-order-preserving projection + append); the
+-- DeltaNet recurrent bank bounded by the chunked fold drift.
+contract PostPrefillStateEquivalence {
+    invoke: (cfg: PrefillConfiguration, state: ModelState, batch: PrefillBatch) -> ModelState
+
+    @invariant KvRowsBitExact
+        -- For the attention_kv layer class, the KV cache rows the prefill
+        -- pass appends are BIT-EXACT (config.kv_state_bit_exact_tol = 0.0)
+        -- to stock prefill's. The projection + append does no
+        -- cross-position reduction, so it preserves the stock fold order;
+        -- any divergence here is a bug, not a tolerated reorder.
+
+    @invariant NPastExact
+        -- The post-prefill position counter n_past equals the pre-prefill
+        -- n_past + batch.n_tokens exactly — the batched pass advances the
+        -- sequence by exactly the tokens it consumed, no more, no fewer.
+
+    @invariant DeltaNetChunkBound
+        -- For the deltanet_recurrent layer class, the chunk-parallel
+        -- UT/WY scan's recurrent bank REORDERS the sequence fold, so it is
+        -- not bit-exact. Its accumulated drift over the 8 chunks x 48
+        -- layers must keep the derived prefill logits within
+        -- config.deltanet_chunk_logits_kl_tol. The declared chunk fold
+        -- order must be RECORDED in the instantiation spec, not left
+        -- implicit (the DeltaNet fold-order-sensitivity note). The
+        -- measured per-chunk state drift is the diagnostic toward this
+        -- bound.
+}
+
+-- The capstone. The state the decode phase reads in the FUSED resident
+-- kernel is what a separate prefill-then-decode run would have left —
+-- the prefill fills state, decode consumes it, with no teardown and no
+-- relaunch between the phases. This is the behavioural half; the
+-- concurrency half (no premature consume) is HandoverCarry.tla.
+contract HandoverStateCarry {
+    invoke: (cfg: PrefillConfiguration, state: ModelState) -> ModelState
+
+    @invariant FusedEqualsSeparate
+        -- The post-handover state the decode phase reads is BIT-IDENTICAL
+        -- to the state produced by running prefill and decode as two
+        -- separate kernel launches on the same inputs. Fused == separate
+        -- is the handover's binding gate; it holds per layer class
+        -- (KV/n_past bit-exact, DeltaNet under the declared fold order).
+
+    @invariant NoTeardown
+        -- No state buffer is reinitialized, freed, or reallocated between
+        -- the prefill and decode phases: decode consumes EXACTLY the
+        -- buffers prefill wrote. A teardown-and-reload between phases would
+        -- both lose the carry and reintroduce a launch boundary the fused
+        -- kernel exists to remove.
+
+    @invariant SingleLaunch
+        -- Prefill and decode run in ONE resident cooperative launch: there
+        -- is no kernel relaunch at the seam, so the phase ordering cannot
+        -- rely on a launch boundary's implicit grid-wide happens-before.
+
+    @invariant CarryIsBarrierOrdered
+        -- The prefill -> decode carry is ordered by an EXPLICIT grid-wide
+        -- barrier at the phase seam, not by the removed launch boundary.
+        -- This clause binds the end-state (fused == separate); the
+        -- concurrency obligation — that no decode block reads state a
+        -- prefill block has not finished writing — is the sibling
+        -- HandoverCarry.tla invariant NoPrematureConsume, discharged in
+        -- the specula lane, not here.
+}
+
+-- ============================================================
+-- Actor Declarations
+-- ============================================================
+
+-- The ggml runtime hosting the out-of-tree backend (llama-server's
+-- scheduler): code, not a person. It submits the batched prefill cgraph.
+actor GgmlRuntime {
+    identified_by: StockEngine where build_commit != null
+}
+
+-- ============================================================
+-- Surfaces
+-- ============================================================
+
+-- The integration boundary: what an unmodified llama-server sees of the
+-- prefill half. One surface instance per bound prefill configuration.
+surface PrefillComputeBoundary {
+    facing runtime: GgmlRuntime
+    context cfg: PrefillConfiguration
+
+    exposes:
+        cfg.fingerprint
+        cfg.ubatch
+
+    contracts:
+        fulfils PrefillLogitsParity
+        fulfils PostPrefillStateEquivalence
+        fulfils HandoverStateCarry
+
+    @guarantee StockPathAlwaysAvailable
+        -- The stock prefill path remains loaded and correct regardless of
+        -- this backend's state; any internal failure downgrades to it
+        -- (FingerprintDegrade, playbook.allium).
+
+    @guarantee SubstrateNeutrality
+        -- Nothing this surface fulfils names a substrate: no CUDA, warp,
+        -- SM, smem or register term appears in the contracts. The concrete
+        -- mover/compute warp split, the grid.sync, and the smem tiling are
+        -- the specs/sync/*.tla realization and the reference/megakernel
+        -- design tables, cited by cfg.substrate, never bound here.
+}
