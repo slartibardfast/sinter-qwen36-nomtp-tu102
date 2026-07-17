@@ -1539,7 +1539,11 @@ static void gpu_upload_weights(GpuCtx &c, gguf::File &gg) {
            c.device, c.gpu_index, c.warena_bytes / 1e9, n_mirror, n_row, n_col, n_dn);
 }
 
-static void gpu_alloc_buffers(GpuCtx &c, const Jv &program, bool skip_kv = false) {
+// u_max sizes the per-pass input staging for a prefill U-tile (positions,
+// kv_row, mask_f16 grow by the factor); the default 1 keeps every decode
+// caller byte-identical to the pre-tile layout.
+static void gpu_alloc_buffers(GpuCtx &c, const Jv &program, bool skip_kv = false,
+                              int64_t u_max = 1) {
     CUDA_CHECK(cudaSetDevice(c.device));
     CUDA_CHECK(cudaStreamCreateWithFlags(&c.pstream, cudaStreamNonBlocking));
     auto alloc = [&](const std::string &nm, size_t bytes, bool zero = true) {
@@ -1564,12 +1568,12 @@ static void gpu_alloc_buffers(GpuCtx &c, const Jv &program, bool skip_kv = false
             alloc("ssm_state_l" + std::to_string(il), (size_t)(SSM_STATE_N / 2) * 4);
         }
     }
-    alloc("positions", 16);
-    alloc("kv_row", 8);
+    alloc("positions", 16 * (size_t) u_max);              // i32[4] M-RoPE quad per token
+    alloc("kv_row", 8 * (size_t) u_max);                  // i64 KV append row per token
     alloc("rs_row", 8);
     alloc("n_kv", 4);                                     // u32 padded KV window (strong read)
     c.mask_cap = pad_up(c.n_ctx, 256);
-    alloc("mask_f16", (size_t) c.mask_cap * 2);
+    alloc("mask_f16", (size_t) c.mask_cap * 2 * (size_t) u_max);   // u_max causal rows
     alloc("result_output", (size_t)(c.n_vocab_full / 2) * 4);  // this GPU's vocab half
     alloc("done_flag", 4);
     alloc("fattn_error", 4);
@@ -1619,6 +1623,53 @@ static int64_t gpu_set_inputs(GpuCtx &c, int64_t pos) {
     return n_kv;
 }
 
+// Stage a U-token prefill tile starting at position pos0 on GPU c: one M-RoPE
+// quad and one KV append row PER TOKEN, ONE padded window n_kv covering the
+// whole tile, and the 2-D causal mask, query-major with the KV index fastest
+// (row t at mask_f16 + t*n_kv), matching the fork's (n_kv, N, 1, 1) mask
+// layout, idst = n_kv*i (llama-kv-cache.cpp:1477,1542-1573 via
+// docs/PREFILL-SEMANTICS.md, batched causal attention). Row t masks j > pos0+t
+// to -inf: token t attends its own and earlier positions ONLY. At U=1 every
+// byte written here equals gpu_set_inputs(c, pos0); --prefill-parity binds
+// that equivalence on device against the untouched decode staging above.
+// Deliberately a SEPARATE implementation from gpu_set_inputs: the parity
+// memcmp compares two independently written staging paths, so a bug in this
+// one cannot hide by also steering the reference leg.
+static int64_t gpu_set_inputs_tile(GpuCtx &c, int64_t pos0, int64_t U) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    int64_t n_kv = pad_up(pos0 + U, 256);
+    if (n_kv > c.mask_cap) throw std::runtime_error("tile: n_kv past n_ctx padding cap");
+    if ((size_t) U * 16 > c.bufs["positions"].bytes ||
+        (size_t) U * 8 > c.bufs["kv_row"].bytes ||
+        (size_t) U * (size_t) n_kv * 2 > c.bufs["mask_f16"].bytes)
+        throw std::runtime_error("tile: U exceeds the u_max the buffers were sized for "
+                                 "(re-run dual_setup with u_max >= U)");
+    static std::vector<int32_t> p4;       // [U][4] M-RoPE ids, quad t all = pos0+t
+    static std::vector<int64_t> rows;     // [U] KV append rows, row t = pos0+t
+    static std::vector<uint16_t> mask;    // [U][n_kv] causal, row stride n_kv
+    p4.resize((size_t) U * 4);
+    rows.resize((size_t) U);
+    mask.resize((size_t) U * (size_t) n_kv);
+    for (int64_t t = 0; t < U; t++) {
+        for (int q = 0; q < 4; q++) p4[(size_t) t * 4 + q] = (int32_t)(pos0 + t);
+        rows[(size_t) t] = pos0 + t;
+        uint16_t *mrow = mask.data() + (size_t) t * (size_t) n_kv;
+        for (int64_t j = 0; j < n_kv; j++)
+            mrow[j] = j <= pos0 + t ? F16_ZERO : F16_NEG_INF;
+    }
+    uint32_t nkv32 = (uint32_t) n_kv;
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["positions"].ptr, p4.data(), (size_t) U * 16,
+                               cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["kv_row"].ptr, rows.data(), (size_t) U * 8,
+                               cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["n_kv"].ptr, &nkv32, 4, cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["mask_f16"].ptr, mask.data(),
+                               (size_t) U * (size_t) n_kv * 2, cudaMemcpyHostToDevice, c.pstream));
+    CUDA_CHECK(cudaMemsetAsync(c.bufs["fattn_error"].ptr, 0, 4, c.pstream));
+    CUDA_CHECK(cudaStreamSynchronize(c.pstream));
+    return n_kv;
+}
+
 static void gpu_read_f32(GpuCtx &c, const std::string &name, std::vector<float> &out,
                          size_t n_elems, size_t byte_off = 0) {
     CUDA_CHECK(cudaSetDevice(c.device));
@@ -1627,11 +1678,46 @@ static void gpu_read_f32(GpuCtx &c, const std::string &name, std::vector<float> 
                           n_elems * 4, cudaMemcpyDeviceToHost));
 }
 
+// Reset the recurrent stream to its post-alloc initial condition so a second
+// parity leg replays the same prompt from a pristine sequence: DeltaNet
+// conv/ssm banks back to zero (gpu_alloc_buffers zero-fills at alloc) and the
+// first pad_up(kv_rows, 256) KV rows of every attention layer back to zero
+// (covers every window the replay can open over those rows, so the two legs
+// see identical bytes even in the masked padded tail).
+static void gpu_reset_stream_state(GpuCtx &c, int64_t kv_rows) {
+    CUDA_CHECK(cudaSetDevice(c.device));
+    for (int il = 0; il < N_LAYER; il++) {
+        if (is_attn_layer(il)) {
+            size_t kb = (size_t) pad_up(kv_rows, 256) * (size_t)(N_EMBD_GQA / 2) * 2;
+            DevBuf &k = c.bufs["cache_k_l" + std::to_string(il)];
+            DevBuf &v = c.bufs["cache_v_l" + std::to_string(il)];
+            CUDA_CHECK(cudaMemset(k.ptr, 0, std::min(kb, k.bytes)));
+            CUDA_CHECK(cudaMemset(v.ptr, 0, std::min(kb, v.bytes)));
+        } else {
+            DevBuf &s = c.bufs["ssm_state_l" + std::to_string(il)];
+            DevBuf &r = c.bufs["conv_state_l" + std::to_string(il)];
+            CUDA_CHECK(cudaMemset(s.ptr, 0, s.bytes));
+            CUDA_CHECK(cudaMemset(r.ptr, 0, r.bytes));
+        }
+    }
+}
+
 // Ring both doorbells, then wait both done (bounded; never kills). The padded
 // KV window is already in each GPU's "n_kv" cell (gpu_set_inputs); FATTN reads
-// it STRONG, so only $seqno + the token are patched here.
-static bool dual_run_pass(GpuCtx g2[2], int32_t token, unsigned seqno,
-                          double timeout_ms) {
+// it STRONG, so only $seqno + the token span are patched here. n_tok tokens
+// (n_tok = 1 for every decode pass; a prefill U-tile passes its whole tile)
+// land in consecutive d_token slots; the doorbell rings ONCE either way, so
+// the SingleLaunch / NoTeardown discipline is untouched.
+static bool dual_run_pass(GpuCtx g2[2], const int32_t *tokens, int64_t n_tok,
+                          unsigned seqno, double timeout_ms) {
+    if (n_tok < 1 || (size_t) n_tok * 4 > 128) {
+        // d_token is a 128 B cell (core/host.cpp:51): 32 i32 slots. A U>32
+        // tile needs that cell grown in core (a separate reviewed edit);
+        // refuse rather than overrun it.
+        fprintf(stderr, "dual_run_pass: n_tok %lld exceeds the 128 B d_token cell\n",
+                (long long) n_tok);
+        return false;
+    }
     // Per-pass device patch ($seqno) and the token ride the copy stream ASYNC;
     // one sync per GPU collapses the 4-byte copies/pass into 2 stream syncs. The
     // persistent kernel spins at the doorbell between passes, so patching
@@ -1651,8 +1737,8 @@ static bool dual_run_pass(GpuCtx g2[2], int32_t token, unsigned seqno,
                                        GpuCtx::SEQNO_OFF, &s_seq, 4, cudaMemcpyHostToDevice,
                                        c.ln.h.cstream));
         c.ln.h.pass += 1;
-        CUDA_CHECK(cudaMemcpyAsync(c.ln.h.d_token, &token, 4, cudaMemcpyHostToDevice,
-                                   c.ln.h.cstream));
+        CUDA_CHECK(cudaMemcpyAsync(c.ln.h.d_token, tokens, (size_t) n_tok * 4,
+                                   cudaMemcpyHostToDevice, c.ln.h.cstream));
     }
     for (int g = 0; g < 2; g++) {
         CUDA_CHECK(cudaSetDevice(g2[g].device));
@@ -1689,9 +1775,10 @@ static bool dual_run_pass(GpuCtx g2[2], int32_t token, unsigned seqno,
 }
 
 // Set up both GPUs from one mmap'd GGUF + the split program. n_sites from the
-// program (count of OP_XCHG_REDUCE == count of OP_XCHG_PUSH).
+// program (count of OP_XCHG_REDUCE == count of OP_XCHG_PUSH). u_max sizes the
+// per-pass staging buffers for prefill U-tiles (default 1 = decode layout).
 static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t n_ctx,
-                       int64_t n_vocab_full) {
+                       int64_t n_vocab_full, int64_t u_max = 1) {
     // peer access both ways (NVLink); tolerate already-enabled.
     for (int a = 0; a < 2; a++)
         for (int b = 0; b < 2; b++)
@@ -1727,7 +1814,7 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
         GpuCtx &c = g2[g];
         c.ln.init(g);                                   // host_init on device g
         c.R.add("token", c.ln.d_token(), 128);          // cell:token -> d_token
-        gpu_alloc_buffers(c, program);
+        gpu_alloc_buffers(c, program, /*skip_kv=*/false, u_max);
         PackedProgram p = pack_program(program, c.R, &c.mtab, c.gpu_index);
         if (!p.complete)
             throw std::runtime_error("gpu " + std::to_string(g) + " pack failed after " +
@@ -1800,7 +1887,8 @@ static int parity_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, (int32_t) prompt.arr[i].as_i(), pass, 60000.0))
+        int32_t ptok = (int32_t) prompt.arr[i].as_i();
+        if (!dual_run_pass(g2, &ptok, 1, pass, 60000.0))
             return 3;
     }
     gather_logits();
@@ -1812,7 +1900,7 @@ static int parity_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, tok, pass, 60000.0)) return 3;
+        if (!dual_run_pass(g2, &tok, 1, pass, 60000.0)) return 3;
         gather_logits();
         dump.add_logits_row(logits);
 
@@ -2071,11 +2159,12 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
            WARMUP, (long long) n_tokens, (long long) pos0);
     int64_t pos = pos0;
     unsigned pass = 0;
+    int32_t btok = 11;
     for (int i = 0; i < WARMUP; i++, pos++) {
         gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, 11, pass, 60000.0)) return 3;
+        if (!dual_run_pass(g2, &btok, 1, pass, 60000.0)) return 3;
     }
     watermark(g2, "warmed", pos);
     // REDLINE: zero the per-kind accumulator so the itemization covers only the
@@ -2087,7 +2176,7 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         gpu_set_inputs(g2[0], pos);
         gpu_set_inputs(g2[1], pos);
         ++pass;
-        if (!dual_run_pass(g2, 11, pass, 60000.0)) return 3;
+        if (!dual_run_pass(g2, &btok, 1, pass, 60000.0)) return 3;
         if ((i + 1) % sample_every == 0) watermark(g2, "soak", pos);
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -2118,6 +2207,223 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
         print_op_breakdown(g2[g].ln.h, g, n_tokens, pass_ms);
         if (const char *tp = getenv("MK_TELE"))
             dump_telemetry(g2[g], g, tp, program, gg, pos0);  // n_kv ~= pos0 at deep decode
+    }
+    dual_shutdown(g2);
+    return 0;
+}
+
+// -- prefill U-tile self-consistency parity (plan/0143 driver scaffold) ------
+// Same resident kernel, same program, same prompt, run twice: the reference
+// leg through the proven per-token staging (gpu_set_inputs, one doorbell per
+// token), the tile leg through the tile staging (gpu_set_inputs_tile, one
+// doorbell per U-tile). At U=1 the two legs are the same computation op for
+// op, so logits, DeltaNet conv/ssm state, and the appended KV rows must be
+// BIT-IDENTICAL (tol 0.0); a mismatch is a staging bug in the tile path, not
+// an op regression. U>1 needs a program whose ops consume n_tokens (header
+// key "prefill_u", compile_schedule.py --prefill U); with it the same memcmp
+// binds the U-loop ops to the per-token fold, and the changed-tail causality
+// micro-check arms (a transposed or last-row-broadcast mask passes every U=1
+// check and fails only there).
+static int prefill_parity_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
+                              int64_t n_vocab, int64_t U) {
+    static const int32_t PROMPT[] = { 11, 500, 1000, 1500, 2000, 2500, 3000, 3500 };
+    const int64_t P = (int64_t)(sizeof PROMPT / sizeof PROMPT[0]);
+    if (U < 1 || U > P)
+        throw std::runtime_error("--prefill-parity: U must be in 1.." + std::to_string(P));
+    if (U > 1) {
+        const Jv *pu = program.get("prefill_u");
+        if (!pu || pu->k != Jv::NUM || (int64_t) pu->num < U)
+            throw std::runtime_error("--prefill-parity: U>1 needs a prefill program "
+                                     "(python3 k0/compile_schedule.py --prefill U) whose header "
+                                     "carries prefill_u >= U; the decode ops are U=1-only");
+    }
+    if (P + 1 > n_ctx) throw std::runtime_error("prompt exceeds --n-ctx");
+
+    GpuCtx g2[2];
+    dual_setup(g2, gg, program, n_ctx, n_vocab, U);
+    const size_t HALF = (size_t) n_vocab / 2;
+    unsigned pass = 0;
+
+    std::vector<float> lo0, lo1, tmp;
+    auto gather_logits = [&](std::vector<float> &dst) {
+        gpu_read_f32(g2[0], "logits", lo0, HALF);
+        gpu_read_f32(g2[1], "logits", lo1, HALF);
+        dst.resize((size_t) n_vocab);
+        memcpy(dst.data(), lo0.data(), HALF * 4);
+        memcpy(dst.data() + HALF, lo1.data(), HALF * 4);
+    };
+    // KV snapshot: the first n_rows appended rows of each attention layer's K
+    // and V cache, both GPUs (f16 rows read raw as 4-byte words: 512 f16 =
+    // 256 words/row). Bit-compare only, never arithmetic.
+    auto snap_kv = [&](std::vector<float> &dst, int64_t n_rows) {
+        dst.clear();
+        const size_t row_words = (size_t)(N_EMBD_GQA / 2) / 2;
+        for (int g = 0; g < 2; g++)
+            for (int il = 0; il < N_LAYER; il++) {
+                if (!is_attn_layer(il)) continue;
+                gpu_read_f32(g2[g], "cache_k_l" + std::to_string(il), tmp,
+                             (size_t) n_rows * row_words);
+                dst.insert(dst.end(), tmp.begin(), tmp.end());
+                gpu_read_f32(g2[g], "cache_v_l" + std::to_string(il), tmp,
+                             (size_t) n_rows * row_words);
+                dst.insert(dst.end(), tmp.begin(), tmp.end());
+            }
+    };
+    // recurrent snapshot: DeltaNet ssm + conv banks, both GPUs' halves.
+    auto snap_rs = [&](std::vector<float> &dst) {
+        dst.clear();
+        for (int g = 0; g < 2; g++)
+            for (int il = 0; il < N_LAYER; il++) {
+                if (is_attn_layer(il)) continue;
+                gpu_read_f32(g2[g], "ssm_state_l" + std::to_string(il), tmp, SSM_STATE_N / 2);
+                dst.insert(dst.end(), tmp.begin(), tmp.end());
+                gpu_read_f32(g2[g], "conv_state_l" + std::to_string(il), tmp, CONV_STATE_N / 2);
+                dst.insert(dst.end(), tmp.begin(), tmp.end());
+            }
+    };
+    auto run_tiles = [&](const int32_t *toks) -> bool {
+        for (int64_t base = 0; base < P; base += U) {
+            int64_t n_tok = std::min(U, P - base);
+            gpu_set_inputs_tile(g2[0], base, n_tok);
+            gpu_set_inputs_tile(g2[1], base, n_tok);
+            ++pass;
+            if (!dual_run_pass(g2, toks + base, n_tok, pass, 60000.0)) return false;
+        }
+        return true;
+    };
+    // bit-compare as raw 4-byte words (memcmp, NaN-safe); -1 = identical,
+    // else the first differing word index (or min size on length mismatch).
+    auto first_diff = [](const std::vector<float> &a, const std::vector<float> &b) -> long long {
+        if (a.size() != b.size()) return (long long) std::min(a.size(), b.size());
+        for (size_t i = 0; i < a.size(); i++)
+            if (memcmp(&a[i], &b[i], 4) != 0) return (long long) i;
+        return -1;
+    };
+
+    // reference leg: P per-token passes through the decode staging.
+    printf("prefill-parity: U=%lld, prompt %lld tokens, reference leg (per-token)...\n",
+           (long long) U, (long long) P);
+    for (int64_t i = 0; i < P; i++) {
+        gpu_set_inputs(g2[0], i);
+        gpu_set_inputs(g2[1], i);
+        ++pass;
+        int32_t tk = PROMPT[i];
+        if (!dual_run_pass(g2, &tk, 1, pass, 60000.0)) return 3;
+    }
+    std::vector<float> ref_logits, ref_kv, ref_rs;
+    gather_logits(ref_logits);
+    snap_kv(ref_kv, P);
+    snap_rs(ref_rs);
+
+    // tile leg: same prompt in U-tiles from a re-zeroed stream.
+    printf("prefill-parity: tile leg (%lld-token tiles, 1 doorbell per tile)...\n",
+           (long long) U);
+    gpu_reset_stream_state(g2[0], P);
+    gpu_reset_stream_state(g2[1], P);
+    if (!run_tiles(PROMPT)) return 3;
+    std::vector<float> tile_logits, tile_kv, tile_rs, tile_kv_head;
+    gather_logits(tile_logits);
+    snap_kv(tile_kv, P);
+    snap_rs(tile_rs);
+    if (U >= 2) snap_kv(tile_kv_head, P - 1);
+
+    long long dl = first_diff(ref_logits, tile_logits);
+    long long dkv = first_diff(ref_kv, tile_kv);
+    long long drs = first_diff(ref_rs, tile_rs);
+
+    // causality micro-check (arms at U>=2): change ONLY the last prompt token
+    // and rerun the tiles; the KV rows of tokens 0..P-2 must not move (token t
+    // may depend on tokens 0..t ONLY). The final states and logits legitimately
+    // differ and are not compared here.
+    long long dc = -1;
+    if (U >= 2) {
+        std::vector<int32_t> prompt2(PROMPT, PROMPT + P);
+        prompt2[(size_t)(P - 1)] = 42;
+        gpu_reset_stream_state(g2[0], P);
+        gpu_reset_stream_state(g2[1], P);
+        if (!run_tiles(prompt2.data())) return 3;
+        std::vector<float> pert_kv_head;
+        snap_kv(pert_kv_head, P - 1);
+        dc = first_diff(tile_kv_head, pert_kv_head);
+    }
+
+    bool ok = dl < 0 && dkv < 0 && drs < 0 && dc < 0;
+    printf("PREFILL-PARITY U=%lld P=%lld: logits %s, kv-rows %s, rs-state %s, causality %s -> %s\n",
+           (long long) U, (long long) P,
+           dl < 0 ? "BIT-IDENTICAL" : "DIFF",
+           dkv < 0 ? "BIT-IDENTICAL" : "DIFF",
+           drs < 0 ? "BIT-IDENTICAL" : "DIFF",
+           U >= 2 ? (dc < 0 ? "HOLDS" : "VIOLATED") : "n/a (needs U>=2)",
+           ok ? "PASS" : "FAIL");
+    if (dl >= 0) fprintf(stderr, "  logits first diff at word %lld\n", dl);
+    if (dkv >= 0) fprintf(stderr, "  kv rows first diff at word %lld\n", dkv);
+    if (drs >= 0) fprintf(stderr, "  rs state first diff at word %lld\n", drs);
+    if (dc >= 0) fprintf(stderr, "  causality: earlier token's KV moved at word %lld\n", dc);
+    dual_shutdown(g2);
+    return ok ? 0 : 4;
+}
+
+// -- prefill U-tile bench: n_tokens from an empty context, one doorbell per
+// tile. No warmup: prefill is a ramp, not a steady state. At U=1 tok/s must
+// match --bench-tensor with --pos0 0 within noise (the degeneracy check in
+// the plan/0143 prefill build plan). At U>1, once the U-loop program lands,
+// this is the first measured prefill wall; MK_TELE dumps the last pass's
+// per-op telemetry as the calx-mill prefill anchor.
+static int prefill_bench_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
+                             int64_t n_vocab, int64_t U, int64_t n_tokens) {
+    if (U < 1) throw std::runtime_error("--prefill-bench: U must be >= 1");
+    if (n_tokens < U) throw std::runtime_error("--prefill-bench: token count < U");
+    if (n_tokens > n_ctx) throw std::runtime_error("--prefill-bench: n_tokens exceed --n-ctx");
+    if (U > 1) {
+        const Jv *pu = program.get("prefill_u");
+        if (!pu || pu->k != Jv::NUM || (int64_t) pu->num < U)
+            throw std::runtime_error("--prefill-bench: U>1 needs a prefill program "
+                                     "(python3 k0/compile_schedule.py --prefill U) whose header "
+                                     "carries prefill_u >= U; the decode ops are U=1-only");
+    }
+    GpuCtx g2[2];
+    dual_setup(g2, gg, program, n_ctx, n_vocab, U);
+    const int64_t n_tiles = (n_tokens + U - 1) / U;
+    printf("prefill-bench: %lld tokens in %lld tiles of %lld (1 doorbell per tile)\n",
+           (long long) n_tokens, (long long) n_tiles, (long long) U);
+    std::vector<int32_t> toks((size_t) U, 11);   // fixed id, as --bench-tensor
+    unsigned pass = 0;
+    const int64_t sample_every = n_tiles > 20 ? n_tiles / 20 : 1;
+    int64_t last_n_kv = 0, tile_i = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int64_t base = 0; base < n_tokens; base += U, tile_i++) {
+        int64_t n_tok = std::min(U, n_tokens - base);
+        last_n_kv = gpu_set_inputs_tile(g2[0], base, n_tok);
+        gpu_set_inputs_tile(g2[1], base, n_tok);
+        ++pass;
+        if (!dual_run_pass(g2, toks.data(), n_tok, pass, 60000.0)) return 3;
+        if ((tile_i + 1) % sample_every == 0) watermark(g2, "tile", base + n_tok);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    cuProfilerStop();   // close the ncu range opened by dual_setup
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    printf("prefill-bench: %lld tokens (%lld passes) in %.3f s = %.2f tok/s "
+           "[ramp 0..%lld; host-staged mask, see the diff-plan staging note]\n",
+           (long long) n_tokens, (long long) n_tiles, sec, n_tokens / sec,
+           (long long) n_tokens);
+    for (int g = 0; g < 2; g++) {
+        unsigned cap = g2[g].ln.h.pass_cycles_cap;
+        double pass_ms = 0;
+        if (cap && n_tiles > 0) {
+            std::vector<long long> cyc(cap);
+            if (mk::host_read_pass_cycles(g2[g].ln.h, cyc.data(), cap)) {
+                unsigned cnt = (unsigned) std::min<int64_t>(n_tiles, cap);
+                double sum = 0;
+                for (unsigned k = 0; k < cnt; k++)
+                    sum += (double) cyc[(g2[g].ln.h.pass - 1 - k) % cap];
+                pass_ms = sum / cnt / 1.455 / 1e6;
+                printf("prefill-bench: gpu %d per-pass on-device clock64 mean %.3f ms "
+                       "(%u samples, whole ramp, no warmup cut)\n", g, pass_ms, cnt);
+            }
+        }
+        print_op_breakdown(g2[g].ln.h, g, n_tiles, pass_ms);
+        if (const char *tp = getenv("MK_TELE"))
+            dump_telemetry(g2[g], g, tp, program, gg, last_n_kv);
     }
     dual_shutdown(g2);
     return 0;
@@ -2300,7 +2606,7 @@ bool mk_dual_step(const void *seed0, const void *seed1, int64_t pos,
         }
     }
     int32_t tok = oe ? (int32_t) atoi(getenv("MK_TOKEN") ? getenv("MK_TOKEN") : "0") : 0;
-    if (!dual_run_pass(g_mk, tok, ++g_mk_seqno, 60000.0)) return false;
+    if (!dual_run_pass(g_mk, &tok, 1, ++g_mk_seqno, 60000.0)) return false;
     size_t half = (size_t)(g_mk_nvocab / 2) * 4;
     for (int g = 0; g < 2; g++) {
         CUDA_CHECK(cudaSetDevice(g_mk[g].device));
@@ -2375,13 +2681,14 @@ int main(int argc, char **argv) {
     std::string model = "/opt/models/Qwen3.6-27B-AR16asF16-probe.gguf";  // F16-ssm_out base (call/0020)
     std::string program_path;
     std::string parity_ref, out_dir, diag_out;
-    int64_t n_ctx = 8192, bench_n = -1, bench_pos0 = 0;
+    int64_t n_ctx = 8192, bench_n = -1, bench_pos0 = 0, prefill_u = 1;
     int gpu = 0;
     bool allow_inv_mismatch = false;   // per-type inventory totals are hardcoded for
                                        // the AR16 base; the F16-ssm_out base has a
                                        // legit different type mix. Checksums stay the
                                        // hard gate; this only downgrades inventory.
-    enum { M_VALIDATE, M_PARITY, M_BENCH, M_PARITY_TENSOR, M_BENCH_TENSOR } mode = M_VALIDATE;
+    enum { M_VALIDATE, M_PARITY, M_BENCH, M_PARITY_TENSOR, M_BENCH_TENSOR,
+           M_PREFILL_PARITY, M_PREFILL_BENCH } mode = M_VALIDATE;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -2394,6 +2701,11 @@ int main(int argc, char **argv) {
         else if (a == "--bench")   { mode = M_BENCH; bench_n = strtoll(need("token count"), nullptr, 10); }
         else if (a == "--parity-tensor") { mode = M_PARITY_TENSOR; parity_ref = need("oracle ref dir"); }
         else if (a == "--bench-tensor")  { mode = M_BENCH_TENSOR; bench_n = strtoll(need("token count"), nullptr, 10); }
+        else if (a == "--prefill-parity") { mode = M_PREFILL_PARITY;
+                                            prefill_u = strtoll(need("tile width U"), nullptr, 10); }
+        else if (a == "--prefill-bench")  { mode = M_PREFILL_BENCH;
+                                            prefill_u = strtoll(need("tile width U"), nullptr, 10);
+                                            bench_n = strtoll(need("token count"), nullptr, 10); }
         else if (a == "--model")   model = need("gguf path");
         else if (a == "--program") program_path = need("program.json path");
         else if (a == "--out")     out_dir = need("dump dir");
@@ -2404,9 +2716,11 @@ int main(int argc, char **argv) {
         else if (a == "--allow-inventory-mismatch") allow_inv_mismatch = true;
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    const bool tensor_mode = (mode == M_PARITY_TENSOR || mode == M_BENCH_TENSOR);
+    const bool prefill_mode = (mode == M_PREFILL_PARITY || mode == M_PREFILL_BENCH);
+    const bool tensor_mode = (mode == M_PARITY_TENSOR || mode == M_BENCH_TENSOR || prefill_mode);
     if (program_path.empty())
-        program_path = tensor_mode ? "k0/program-split.json" : "k0/program.json";
+        program_path = (prefill_mode && prefill_u > 1) ? "k0/program-prefill.json"
+                     : tensor_mode ? "k0/program-split.json" : "k0/program.json";
 
     try {
         // ---- dual-GPU tensor-parallel path -------------------------------
@@ -2424,7 +2738,9 @@ int main(int argc, char **argv) {
             std::string text;
             if (!read_file(program_path, text)) {
                 struct stat st{};
-                if (stat("k0/compile_schedule.py", &st) == 0) {
+                // auto-regen covers the decode split program only; a U>1
+                // prefill program is generated explicitly (--prefill U).
+                if (!(prefill_mode && prefill_u > 1) && stat("k0/compile_schedule.py", &st) == 0) {
                     printf("program: %s absent — running python3 k0/compile_schedule.py --split\n",
                            program_path.c_str());
                     if (system("python3 k0/compile_schedule.py --split") != 0)
@@ -2432,8 +2748,9 @@ int main(int argc, char **argv) {
                 }
             }
             if (!read_file(program_path, text))
-                throw std::runtime_error("cannot read split program " + program_path +
-                                         " (run: python3 k0/compile_schedule.py --split)");
+                throw std::runtime_error("cannot read program " + program_path +
+                                         " (run: python3 k0/compile_schedule.py --split, "
+                                         "or --prefill U for a U>1 prefill program)");
             JsonParser jp(text);
             Jv program = jp.value();
 
@@ -2454,7 +2771,8 @@ int main(int argc, char **argv) {
                 dual_setup(g2, res.gg, program, n_ctx, res.n_vocab);
                 gpu_set_inputs(g2[0], 0);
                 gpu_set_inputs(g2[1], 0);
-                if (!dual_run_pass(g2, 11, 1, 60000.0)) return 3;
+                int32_t dtok = 11;
+                if (!dual_run_pass(g2, &dtok, 1, 1, 60000.0)) return 3;
                 std::vector<float> lout, lout1, lmid, lo0, lo1;
                 gpu_read_f32(g2[0], "dbg_lout", lout, (size_t) N_LOUT * N_EMBD);
                 gpu_read_f32(g2[1], "dbg_lout", lout1, (size_t) N_LOUT * N_EMBD);
@@ -2479,6 +2797,10 @@ int main(int argc, char **argv) {
                 if (out_dir.empty())
                     out_dir = "/var/tmp/mk-harness/cand-tensor-" + basename_of(parity_ref);
                 rc = parity_run_tensor(res.gg, program, n_ctx, res.n_vocab, parity_ref, out_dir);
+            } else if (mode == M_PREFILL_PARITY) {
+                rc = prefill_parity_run(res.gg, program, n_ctx, res.n_vocab, prefill_u);
+            } else if (mode == M_PREFILL_BENCH) {
+                rc = prefill_bench_run(res.gg, program, n_ctx, res.n_vocab, prefill_u, bench_n);
             } else {
                 rc = bench_run_tensor(res.gg, program, n_ctx, res.n_vocab, bench_n, bench_pos0);
             }

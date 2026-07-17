@@ -50,11 +50,37 @@ NGPU = 2 if SPLIT else 1
 # schedule (k=0/plain instrument + the AR16 parity chain).
 F16_SSM_OUT = "--ssm-out-ar16" not in sys.argv
 
+# --prefill U: emit the batched-prefill program (program-prefill.json, or
+# program-split-prefill.json under --split). Same op DAG, same windows, same
+# boundary count as decode: every compute Instr's args gain n_tokens=U (the
+# U-loop-fallback ops repeat their M=1 per-token body over the U columns,
+# keeping each column's fold independent; decode packers default n_tokens=1,
+# so the decode program is byte-unchanged), the epilogue row_select becomes
+# the literal U-1 (the last prompt token's row), and the per-token transient
+# buffers are U-scaled so Runtime::allocate sizes them from the buffer table.
+# The sequential recurrence carry (gdn_state) and the post-row-select logits
+# stay unscaled. At U=1 the program is decode-equivalent: n_tokens=1 is inert
+# and row_select is 0 (the value $out_row always takes at batch-1).
+PREFILL = None
+if "--prefill" in sys.argv:
+    _pi = sys.argv.index("--prefill")
+    if _pi + 1 >= len(sys.argv):
+        sys.exit("FAIL: --prefill needs a token count U")
+    PREFILL = int(sys.argv[_pi + 1])
+    if PREFILL < 1:
+        sys.exit("FAIL: --prefill U must be >= 1")
+N_TOKENS = 1 if PREFILL is None else PREFILL
+
 
 def sp(n):
     """This GPU's local share of a split dimension (exact half under --split)."""
     assert n % NGPU == 0, "split dim %d not divisible by %d" % (n, NGPU)
     return n // NGPU
+
+
+def ut(n):
+    """U-scale a per-token transient dimension (identity at decode / U=1)."""
+    return n * N_TOKENS
 
 
 N_NODES = 3704
@@ -180,39 +206,40 @@ def insts(blk, kind, want=None):
 # col-split contract) holds this GPU's LOCAL half at offset 0; the mirrored
 # trunk (residual, xn) and the contract OUTPUT (proj_out, full 5120 partial
 # then reduced to mirrored) stay full width.
-Q8_ELEMS = sp(N_FF)                   # largest LOCAL quantized activation vector
+Q8_ELEMS = ut(sp(N_FF))               # largest LOCAL quantized activation vector, xU tokens
 Q8_BYTES = Q8_ELEMS // 32 * 36        # q8_1: 36 B per 32-element block
 # pstride 260 = 256 vkq + max + sumexp + 2 pad (16 B record alignment,
 # MK_FATTN_PSTRIDE in k0/ops/attn.cuh); the buffer must match the op's stride.
-FATTN_PARTIAL_ELEMS = GRID * sp(ATTN_Q_HEADS) * (ATTN_HEAD_DIM + 4)
+# Per query token the partials are independent, so the buffer is U-scaled.
+FATTN_PARTIAL_ELEMS = ut(GRID * sp(ATTN_Q_HEADS) * (ATTN_HEAD_DIM + 4))
 
 BUFFERS = [
-    ("residual", "f32", N_EMBD, "the residual trunk x (mirrored)"),
-    ("xn", "f32", N_EMBD, "rmsnorm output (mirrored, feeds row-split expands)"),
+    ("residual", "f32", ut(N_EMBD), "the residual trunk x (mirrored)"),
+    ("xn", "f32", ut(N_EMBD), "rmsnorm output (mirrored, feeds row-split expands)"),
     ("q8_act", "q8_1", Q8_ELEMS,
      "quantized activations for MMVQ; sized for the largest LOCAL quantized "
      "vector (the 8704-wide half FFN GLU output); rewritten several times/block"),
-    ("mixer_out", "f32", sp(12288),
+    ("mixer_out", "f32", ut(sp(12288)),
      "mixer GEMV output: attn q|gate (local 12x512=6144) or DN qkv (local "
      "5120); on DN blocks reused for post-conv qkv (OP_SSM_CONV_SILU dst)"),
-    ("conv_ws", "f32", D_CONV * sp(CONV_CHANNELS),
+    ("conv_ws", "f32", (D_CONV - 1 + N_TOKENS) * sp(CONV_CHANNELS),
      "conv concat window [d_conv=4 x local channels]"),
-    ("gdn_alpha", "f32", sp(GDN_HEADS),
+    ("gdn_alpha", "f32", ut(sp(GDN_HEADS)),
      "ssm_alpha GEMV out; becomes g = softplus(alpha+dt_bias)*a in place"),
-    ("gdn_beta", "f32", sp(GDN_HEADS),
+    ("gdn_beta", "f32", ut(sp(GDN_HEADS)),
      "ssm_beta GEMV out; becomes sigmoid(beta) in place"),
     ("gdn_state", "f32", sp(786432), "GDN state working copy (local heads)"),
-    ("attn_out", "f32", sp(6144),
+    ("attn_out", "f32", ut(sp(6144)),
      "mixer output vector: GDN token out / FATTN merged out; gated in place"),
-    ("gate_out", "f32", sp(6144), "DN z-gate GEMV out (attn_gate.weight)"),
-    ("k_stage", "f32", sp(1024), "current-token K row; normed+roped in place"),
-    ("v_stage", "f32", sp(1024), "current-token V row"),
-    ("fattn_q", "f32", sp(ATTN_Q_HEADS) * ATTN_HEAD_DIM,
+    ("gate_out", "f32", ut(sp(6144)), "DN z-gate GEMV out (attn_gate.weight)"),
+    ("k_stage", "f32", ut(sp(1024)), "current-token K row; normed+roped in place"),
+    ("v_stage", "f32", ut(sp(1024)), "current-token V row"),
+    ("fattn_q", "f32", ut(sp(ATTN_Q_HEADS) * ATTN_HEAD_DIM),
      "compact roped q (local heads x 256), deinterleaved from mixer_out"),
     ("fattn_partial", "f32", FATTN_PARTIAL_ELEMS,
      "split-KV partials: 72 splits x local heads x (256 vkq + max + sumexp)"),
-    ("ffn_ws", "f32", sp(N_FF), "FFN intermediate silu(gate)*up (local half)"),
-    ("proj_out", "f32", N_EMBD,
+    ("ffn_ws", "f32", ut(sp(N_FF)), "FFN intermediate silu(gate)*up (local half)"),
+    ("proj_out", "f32", ut(N_EMBD),
      "block output projection (ssm_out / attn_output / ffn_down) partial, "
      "reduced in place to the mirrored residual fold (next OP_RMSNORM add_src)"),
     ("logits", "f32", sp(N_VOCAB), "lm head output (this GPU's vocab half)"),
@@ -235,6 +262,11 @@ WEIGHTS_USED = []
 
 
 def I(kind, nodes, args, est=4096, reads=(), writes=()):
+    if PREFILL is not None:
+        # Batched prefill: every compute Instr carries the pass token count.
+        # All other args stay per-token; n_tokens is the column multiplier the
+        # U-loop-fallback ops iterate. Boundaries carry no payload and none.
+        args = dict(args, n_tokens=PREFILL)
     for x in nodes:
         if x in COVERED or x in DROPPED:
             fail("node n%d assigned twice" % x)
@@ -705,9 +737,13 @@ assert leaf(NODES[lrs[0]]["src"][1])["cls"] == "other:out_row_index"
 frms, = insts("post", "rmsnorm", 1)
 W(emit_rmsnorm(frms, rmsnorm_weight(frms), "residual", "xn", "proj_out",
                extra_nodes=pending + lrs,
-               extra={"row_select": "sym:$out_row",
+               extra={"row_select": "sym:$out_row" if PREFILL is None
+                                    else PREFILL - 1,
                       "note": "row_select folds the epilogue GET_ROWS "
-                              "(batch-1: always row 0 of a 1-row trunk)"}))
+                              + ("(batch-1: always row 0 of a 1-row trunk)"
+                                 if PREFILL is None else
+                                 "(prefill: the last prompt token, row U-1 "
+                                 "of the U-row trunk)")}))
 hg, = insts("post", "head_gemv", 1)
 head_w = NODES[hg[0]]["src"][0]
 # lm_head is row-split (vocab-split): each GPU produces its half of the 248320
@@ -1029,7 +1065,44 @@ program = {
     "instructions": instructions,
 }
 
-out_path = os.path.join(HERE, "program-split.json" if SPLIT else "program.json")
+if PREFILL is not None:
+    program["meta"]["prefill"] = {
+        "n_tokens": PREFILL,
+        "binding": "batched prefill, U-loop fallback: every compute Instr's "
+                   "args carry n_tokens=U and all other args stay per-token; "
+                   "each op repeats its M=1 per-token body over the U columns "
+                   "with independent per-column folds (decode packers default "
+                   "n_tokens=1, so decode numerics are byte-unchanged). "
+                   "Windows, ests, block shares, and the boundary count are "
+                   "decode-identical. Ops downstream of the epilogue "
+                   "row_select (head GEMV, logits emit) remain single-row; "
+                   "n_tokens on them is the pass width, not a loop count.",
+        "buffers": "per-token transients are U-scaled (residual, xn, q8_act, "
+                   "mixer_out, gdn_alpha/beta, attn_out, gate_out, k_stage, "
+                   "v_stage, fattn_q, fattn_partial, ffn_ws, proj_out); "
+                   "conv_ws holds the d_conv-1 state columns + U token "
+                   "columns (sliding window); gdn_state (sequential "
+                   "recurrence carry) and logits (post-row-select, last "
+                   "token only) are unscaled",
+        "cells": "token i32[U]; positions i32[4*U] (M-RoPE, 4 per token); "
+                 "mask_f16 f16[n_kv*U] (2-D causal, one row per query "
+                 "token); $kv_row is the base cache row, token t appends at "
+                 "$kv_row + t (contiguous fresh slots)",
+        "epilogue": "row_select is the literal U-1 (the last prompt token); "
+                    "$out_row is not referenced",
+        "accounting_note": "meta.per_pass.dram_bytes is the decode per-token "
+                           "derivation; prefill traffic differs (weights "
+                           "amortized over the U-token pass, FATTN KV read "
+                           "scales with U) and is bench-anchored, not "
+                           "modelled here (calx-mill REFUSED until a "
+                           "measured prefill anchor exists)",
+    }
+    program["meta"]["runtime_symbols"]["$out_row"] = (
+        "unused under --prefill: row_select is the literal U-1")
+
+sfx = "-prefill" if PREFILL is not None else ""
+out_path = os.path.join(
+    HERE, ("program-split%s.json" if SPLIT else "program%s.json") % sfx)
 with open(out_path, "w") as f:
     json.dump(program, f, indent=1)
 
@@ -1061,4 +1134,7 @@ print("weight stream/pass: %.3f GB (+ one %d-B embedding row)"
       % (weight_stream / 1e9, embd_row))
 print("DRAM/pass: %.3f GB at n_kv=33024, %.3f GB at n_kv=262144"
       % (dram(33024) / 1e9, dram(262144) / 1e9))
+if PREFILL is not None:
+    print("prefill: n_tokens=%d on every compute instr, epilogue "
+          "row_select=%d, per-token transients U-scaled" % (PREFILL, PREFILL - 1))
 print("wrote %s" % out_path)
