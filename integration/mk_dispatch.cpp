@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 
 namespace {
 
@@ -129,6 +130,60 @@ static int64_t read_index0(const ggml_tensor * t) {
     int32_t v = -1; return cudaMemcpy(&v, p, 4, cudaMemcpyDeviceToHost) == cudaSuccess ? (int64_t) v : -1;
 }
 
+// v2 count-class structural fingerprint (call/0024, cgraph/v2). A STRUCTURAL
+// signature over op name, tensor type, op_params, and src topology, with tensor
+// EXTENTS (ne) DELIBERATELY EXCLUDED. Because ne is excluded, this one hash is
+// invariant to (a) sequence depth / n_kv, (b) the token/batch count U, and
+// (c) n_ctx -- so decode (U=1) and prefill (U>1) of the served model share ONE
+// fingerprint. The two masked axes that DO bind are checked separately by the
+// caller: n_ctx as the KV-leaf extent, and the batch class (U==1 decode vs U>1
+// prefill). op_params are position-invariant here (this fork writes KV via
+// SET_ROWS with the row index as tensor data, never a view offset -- LG0 NOTES),
+// so including them is safe. Node index = cgraph order; leaves keyed by
+// first-encounter, type only. FNV-1a/64; a local exact-match key, not a digest.
+static inline uint64_t fnv1a(uint64_t h, const void * data, size_t n) {
+    const unsigned char * p = (const unsigned char *) data;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+
+static uint64_t mk_graph_fingerprint(const ggml_cgraph * g) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    std::map<const ggml_tensor *, int> node_idx;
+    std::map<const ggml_tensor *, int> leaf_idx;
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * t = g->nodes[i];
+        const char * opn = ggml_op_name(t->op);
+        h = fnv1a(h, opn, strlen(opn));
+        int ty = (int) t->type;
+        h = fnv1a(h, &ty, sizeof ty);
+        h = fnv1a(h, t->op_params, sizeof t->op_params);   // ne NOT hashed
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (!src) continue;
+            const auto it = node_idx.find(src);
+            if (it != node_idx.end()) {
+                char c = 'n'; int r = it->second;
+                h = fnv1a(h, &c, 1); h = fnv1a(h, &r, sizeof r);
+            } else {
+                const auto lt = leaf_idx.find(src);
+                int k;
+                if (lt != leaf_idx.end()) {
+                    k = lt->second;
+                } else {
+                    k = (int) leaf_idx.size();
+                    leaf_idx.emplace(src, k);
+                    char c = 'L'; int lty = (int) src->type;   // leaf: type only, no ne
+                    h = fnv1a(h, &c, 1); h = fnv1a(h, &lty, sizeof lty);
+                }
+                char c = 'l'; h = fnv1a(h, &c, 1); h = fnv1a(h, &k, sizeof k);
+            }
+        }
+        node_idx.emplace(t, i);
+    }
+    return h;
+}
+
 } // namespace
 
 // Diagnostic (MK_ZERO_STATE): zero llama's cache_k/v/r/s so a decode starts from
@@ -189,6 +244,20 @@ bool mk_dispatch(struct ggml_cgraph * cgraph) {
     static int logged = 0;
     std::map<std::string, dev_ptrs> ptrs;
     build_ptr_map(cgraph, ptrs);
+
+    // v2 fingerprint measurement (MK_FP_LOG): log the structural hash + the two
+    // separately-bound axes (n_ctx = KV-leaf extent, U = batch class) for every
+    // graph that flows -- decode, prefill, K-shift, warmup. Non-destructive; the
+    // gate below is unchanged in this phase.
+    if (getenv("MK_FP_LOG")) {
+        uint64_t fp = mk_graph_fingerprint(cgraph);
+        const ggml_tensor * st = find_named(cgraph, "MK#model.input_embed#0");
+        const ggml_tensor * ck = find_named(cgraph, "cache_k_l3");
+        fprintf(stderr, "[MK fp] fp=%016llx nodes=%d n_ctx=%lld U=%lld\n",
+                (unsigned long long) fp, cgraph->n_nodes,
+                (long long) (ck ? ck->ne[1] : -1),
+                (long long) (st ? st->ne[1] : -1));
+    }
 
     // Coverage of the load-bearing families the split program binds by name.
     if (logged < 2 && getenv("MK_DISPATCH_LOG")) {
