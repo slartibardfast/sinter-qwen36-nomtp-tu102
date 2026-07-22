@@ -46,10 +46,12 @@ bool host_init(Host &h, int device, unsigned pass_cycles_cap) {
         return false;
 
     // Device cells, one 128 B line each: y02 counter | doorbell_dev | err_dev.
+    // d_token is 512 B = 128 i32 slots: one token id per prefill column at the
+    // U=128 gate config (decode uses slot 0 only; meta.prefill cells).
     if (!ck(cudaMalloc(&h.d_cells, 3 * 128), "d_cells") ||
         !ck(cudaMemset(h.d_cells, 0, 3 * 128), "d_cells memset") ||
-        !ck(cudaMalloc(&h.d_token, 128), "d_token") ||
-        !ck(cudaMemset(h.d_token, 0, 128), "d_token memset"))
+        !ck(cudaMalloc(&h.d_token, 512), "d_token") ||
+        !ck(cudaMemset(h.d_token, 0, 512), "d_token memset"))
         return false;
     h.hdr.y02_counter = h.d_cells;
     h.ctl.doorbell_dev = h.d_cells + 32;

@@ -139,6 +139,11 @@ struct QkNormRopeArgs {
     float         *dst;        // contiguous [n_heads][MK_ATTN_HD]
     uint32_t       n_heads;
     uint32_t       src_stride; // f32 elems between heads: 512 (q) / 256 (k)
+    // U-loop (meta.prefill): token t reads pos + 4*t (the i32[4*U] cell),
+    // src/dst advance by their buffers' per-token slots. Decode packs 1.
+    uint32_t       n_tokens;
+    uint32_t       src_tstride;
+    uint32_t       dst_tstride;
 };
 static_assert(sizeof(QkNormRopeArgs) <= 112, "payload overflow");
 
@@ -149,14 +154,17 @@ __device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
     const int gw   = (blockIdx.x - ins.block_lo) * warps_per_block + threadIdx.x / 32;
     const int gw_n = (ins.block_hi - ins.block_lo) * warps_per_block;
 
+    for (uint32_t t = 0; t < a.n_tokens; t++) {
+    const float *src_t = a.src + (size_t) t * a.src_tstride;
+    float       *dst_t = a.dst + (size_t) t * a.dst_tstride;
     // Positions are per-token, shared by every head: compute the lane's
-    // cos/sin once. Lane l owns elements {l, l+32, l+64, ..., l+224}; the
-    // NEOX split-half pair for rotary pair p = l is (elem l, elem l+32) =
-    // (v[0], v[1]), so no cross-lane exchange is needed.
-    const int p0 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 0);
-    const int p1 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 1);
-    const int p2 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 2);
-    const int p3 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 3);
+    // cos/sin once per token. Lane l owns elements {l, l+32, l+64, ...,
+    // l+224}; the NEOX split-half pair for rotary pair p = l is (elem l,
+    // elem l+32) = (v[0], v[1]), so no cross-lane exchange is needed.
+    const int p0 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 4 * t + 0);
+    const int p1 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 4 * t + 1);
+    const int p2 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 4 * t + 2);
+    const int p3 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 4 * t + 3);
 
     // is_imrope sector chain, rope.cu:231-240, evaluated in source order
     // (h, w, t, else e). sect_dims = 11+11+10+0 = 32 = n_dims/2, so
@@ -179,7 +187,7 @@ __device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
     const float sin_t = sinf(theta);
 
     for (uint32_t h = gw; h < a.n_heads; h += gw_n) {
-        const float *x = a.src + (size_t) h * a.src_stride;
+        const float *x = src_t + (size_t) h * a.src_stride;
         float v[MK_ATTN_HD / 32];
         float ss = 0.0f;
 #pragma unroll
@@ -199,11 +207,12 @@ __device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
         v[0] = x0 * cos_t - x1 * sin_t;
         v[1] = x0 * sin_t + x1 * cos_t;
         // dims >= n_dims pass through (rope.cu:219-224).
-        float *d = a.dst + (size_t) h * MK_ATTN_HD;
+        float *d = dst_t + (size_t) h * MK_ATTN_HD;
 #pragma unroll
         for (int i = 0; i < MK_ATTN_HD / 32; i++) {
             d[i * 32 + lane] = v[i];
         }
+    }
     }
 }
 
@@ -219,20 +228,27 @@ struct KvAppendArgs {
     const long long *row_idx;  // i64[1] destination row (strong read)
     half            *cache;    // rows of row_width f16, dense
     uint32_t         row_width;// f16 elems per row (local: 512)
+    // U-loop (meta.prefill): $kv_row is the BASE row; token t appends at
+    // row + t (contiguous fresh slots) from src + t*src_tstride. Decode: 1.
+    uint32_t         n_tokens;
+    uint32_t         src_tstride;
 };
 static_assert(sizeof(KvAppendArgs) <= 112, "payload overflow");
 
 __device__ MK_OPFN void op_kv_append(const Instr &ins, char *) {
     const KvAppendArgs a = *reinterpret_cast<const KvAppendArgs *>(ins.payload);
     const long long row = ld_cg_i64(a.row_idx);
-    half *d = a.cache + (size_t) row * a.row_width;
     const uint32_t nthr = (ins.block_hi - ins.block_lo) * blockDim.x;
     const uint32_t t0   = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
-    for (uint32_t i4 = t0; i4 < a.row_width / 4; i4 += nthr) {
-        const float4 v = ld_cg(reinterpret_cast<const float4 *>(a.src) + i4);
-        half2 *d2 = reinterpret_cast<half2 *>(d) + 2 * i4;
-        d2[0] = __floats2half2_rn(v.x, v.y);
-        d2[1] = __floats2half2_rn(v.z, v.w);
+    for (uint32_t t = 0; t < a.n_tokens; t++) {
+        const float *src = a.src + (size_t) t * a.src_tstride;
+        half *d = a.cache + (size_t) (row + t) * a.row_width;
+        for (uint32_t i4 = t0; i4 < a.row_width / 4; i4 += nthr) {
+            const float4 v = ld_cg(reinterpret_cast<const float4 *>(src) + i4);
+            half2 *d2 = reinterpret_cast<half2 *>(d) + 2 * i4;
+            d2[0] = __floats2half2_rn(v.x, v.y);
+            d2[1] = __floats2half2_rn(v.z, v.w);
+        }
     }
 }
 
@@ -280,6 +296,14 @@ struct FattnDecodeArgs {
     uint32_t        n_q;       // local q heads (12)
     uint32_t        n_kv_heads;// local kv heads (2); gqa = n_q / n_kv_heads
     uint32_t        row_width; // f16 elems per cache row (512)
+    // U-loop (meta.prefill): token t's view is q + t*q_tstride, mask row t
+    // (mask + t*n_kv_padded, the 2-D causal mask cell), partials +
+    // t*partial_tstride; each column's online-softmax fold is independent
+    // and identical to the M=1 decode fold. The wrapper builds the per-token
+    // view and runs the unchanged one-token body. Decode packs 1.
+    uint32_t        n_tokens;
+    uint32_t        q_tstride;
+    uint32_t        partial_tstride;
 };
 static_assert(sizeof(FattnDecodeArgs) <= 112, "payload overflow");
 
@@ -707,8 +731,8 @@ __device__ __noinline__ inline void mk_fattn_hmma_dbuf(const FattnDecodeArgs &a,
 #endif // MK_FATTN_DBUF
 #endif
 
-__device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
-    const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
+__device__ MK_OPFN void fattn_decode_one(const Instr &ins, const FattnDecodeArgs &a,
+                                         char *smem) {
     // Dual-GPU (row_width<=512) fits the full-row tile in the 60 KiB slab -> the
     // contiguous-load path (plan/0143: FATTN reads coalesced; measured ~7% deep,
     // bit-identical). Single-GPU (row_width 1024) overflows the slab -> per-head.
@@ -938,6 +962,25 @@ __device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
     }
 }
 
+// The op entry: the U-loop over per-token views of the one-token body above.
+// Each token's q slice, causal-mask row, and partial records are disjoint, so
+// the columns fold independently (bit-exact to U per-token decode passes).
+__device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
+    const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
+    if (a.n_tokens == 1) { // decode: no view arithmetic
+        fattn_decode_one(ins, a, smem);
+        return;
+    }
+    const uint32_t n_kv = ld_cg(reinterpret_cast<const unsigned *>(a.n_kv_cell));
+    for (uint32_t t = 0; t < a.n_tokens; t++) {
+        FattnDecodeArgs at = a;
+        at.q        = a.q + (size_t) t * a.q_tstride;
+        at.mask     = a.mask + (size_t) t * n_kv;      // causal row t
+        at.partials = a.partials + (size_t) t * a.partial_tstride;
+        fattn_decode_one(ins, at, smem);
+    }
+}
+
 // ------------------------------------------------------------ OP_FATTN_REDUCE
 //
 // The Y03 merge: fold the per-chunk partials of each head with the fork's
@@ -956,6 +999,9 @@ struct FattnReduceArgs {
     unsigned    *error;     // sentinel detections (host-checked; zeroed per pass)
     uint32_t     n_q;
     uint32_t     n_chunks;
+    uint32_t     n_tokens;        // U-loop; decode packs 1
+    uint32_t     partial_tstride; // per-token slots (buffer table)
+    uint32_t     dst_tstride;
 };
 static_assert(sizeof(FattnReduceArgs) <= 112, "payload overflow");
 
@@ -966,10 +1012,12 @@ __device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *) {
     const int d   = threadIdx.x;
     if (d >= MK_ATTN_HD) return;
 
+    for (uint32_t t = 0; t < a.n_tokens; t++)
     for (uint32_t h = rel; h < a.n_q; h += nb) {
         float max_val = -INFINITY, rowsum = 0.0f, acc = 0.0f;
         for (uint32_t c = 0; c < a.n_chunks; c++) {
-            const float *rec = a.partials + ((size_t) h * a.n_chunks + c) * MK_FATTN_PSTRIDE;
+            const float *rec = a.partials + (size_t) t * a.partial_tstride
+                                          + ((size_t) h * a.n_chunks + c) * MK_FATTN_PSTRIDE;
             const float m_c = ld_cg(rec + MK_ATTN_HD);
             if (m_c == MK_FATTN_SENTINEL) { // never-written partial (Y03)
                 if (d == 0) atomicAdd(a.error, 1u);
@@ -989,9 +1037,9 @@ __device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *) {
             rowsum = scale_val * rowsum + scale_add * s_c;
             max_val = max_new;
         }
-        // Final normalize (fattn-common.cuh:752). rowsum > 0 at decode: the
-        // current token's own position is always unmasked.
-        a.dst[(size_t) h * MK_ATTN_HD + d] = acc / rowsum;
+        // Final normalize (fattn-common.cuh:752). rowsum > 0 at decode and at
+        // prefill: every token's own position is always unmasked in its row.
+        a.dst[(size_t) t * a.dst_tstride + (size_t) h * MK_ATTN_HD + d] = acc / rowsum;
     }
 }
 
@@ -1008,6 +1056,9 @@ struct AttnGateArgs {
     float       *dst;         // [n_q*256] contiguous
     uint32_t     n_q;
     uint32_t     gate_stride; // f32 elems between heads (512)
+    uint32_t     n_tokens;     // U-loop; decode packs 1
+    uint32_t     attn_tstride; // attn AND dst per-token slot (gated in place)
+    uint32_t     gate_tstride; // gate source buffer per-token slot
 };
 static_assert(sizeof(AttnGateArgs) <= 112, "payload overflow");
 
@@ -1016,12 +1067,17 @@ __device__ MK_OPFN void op_attn_gate(const Instr &ins, char *) {
     const uint32_t total = a.n_q * MK_ATTN_HD;
     const uint32_t nthr  = (ins.block_hi - ins.block_lo) * blockDim.x;
     const uint32_t t0    = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    for (uint32_t t = 0; t < a.n_tokens; t++) {
+    const float *attn = a.attn + (size_t) t * a.attn_tstride;
+    const float *gate = a.gate + (size_t) t * a.gate_tstride;
+    float       *dst  = a.dst + (size_t) t * a.attn_tstride;
     for (uint32_t i = t0; i < total; i += nthr) {
         const uint32_t h = i / MK_ATTN_HD, d = i % MK_ATTN_HD;
-        const float gv = ld_cg(a.gate + (size_t) h * a.gate_stride + d);
-        const float av = ld_cg(a.attn + i);
+        const float gv = ld_cg(gate + (size_t) h * a.gate_stride + d);
+        const float av = ld_cg(attn + i);
         // op_sigmoid, unary.cu:48-50; MUL order attn * sigmoid per the graph.
-        a.dst[i] = av * (1.0f / (1.0f + expf(-gv)));
+        dst[i] = av * (1.0f / (1.0f + expf(-gv)));
+    }
     }
 }
 

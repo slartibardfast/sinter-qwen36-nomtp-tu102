@@ -631,6 +631,10 @@ static float *dev_f32(const Resolver &R, const Jv &a, const char *k, int64_t off
     return reinterpret_cast<float *>(dev_ptr(R, arg_str(a, k))) + off_elems;
 }
 
+// Per-instr U (batched prefill, meta.prefill): compute instrs carry
+// n_tokens=U; a decode program has no such key -> 1.
+static uint32_t arg_ntok(const Jv &a) { return (uint32_t) arg_i_def(a, "n_tokens", 1); }
+
 // Everything a pack fn needs: the resolver, the proto instruction (kind /
 // block range / flags / dbg_node prefilled), and a hook to record the emitted
 // FATTN_DECODE positions (reporting count).
@@ -642,7 +646,22 @@ struct PackCtx {
     const std::map<std::string, void *> *mbox = nullptr;  // "peer_payload:0"->ptr
     int gpu_index = -1;                  // 0/1, selects the p0+p1 fold order
     std::vector<size_t> *out_idx_xchg = nullptr;  // OP_XCHG_REDUCE ($seqno patch)
+    uint32_t prog_u = 1;                 // meta.prefill.n_tokens (1 = decode program)
 };
+
+// Per-token slot (f32 elems) of a U-scaled scratch buffer: table bytes/4 / U.
+// meta.prefill scales every per-token transient uniformly by U (decode: U=1,
+// slot = whole buffer). Only f32 buffers are queried; q8_act's per-token
+// stride is width-derived inside the ops instead.
+static uint32_t slot_elems(const PackCtx &c, const Jv &a, const char *k) {
+    std::string spec = arg_str(a, k);
+    size_t colon = spec.find(':');
+    std::string name = colon == std::string::npos ? spec : spec.substr(colon + 1);
+    auto it = c.R.table.find(name);
+    if (it == c.R.table.end())
+        throw std::runtime_error("slot_elems: unknown buffer '" + spec + "'");
+    return (uint32_t) (it->second.bytes / 4 / c.prog_u);
+}
 
 template <class Args>
 static mk::Instr with_payload(const mk::Instr &proto, const Args &args) {
@@ -682,6 +701,7 @@ static void pack_EMBED_LOOKUP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     e.y          = dev_f32(c.R, a, "dst");
     e.ncols      = (uint32_t) arg_i(a, "n_embd");
     e.row_stride = e.ncols;
+    e.n_tokens   = arg_ntok(a);
     emit(out, c.proto, e);
 }
 
@@ -710,6 +730,18 @@ static void pack_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
         else if (w == "gguf:blk.0.attn_norm.weight")
             r.dbg = mid + (size_t) N_LAYER * N_EMBD;   // = the embedding (no add)
     }
+    r.n_tokens = arg_ntok(a);
+    // Epilogue row-select with a literal row (prefill: U-1, the last prompt
+    // token): fold it as a pack-time source offset and run the norm ONCE (its
+    // dst is the single epilogue row). The decode form is "sym:$out_row",
+    // always row 0 of a 1-row trunk, which the offsetless pack realizes.
+    if (arg_has(a, "row_select") && !is_sym(a, "row_select")) {
+        const int64_t rs = arg_i(a, "row_select");
+        r.x = r.x + rs * (int64_t) r.ncols;
+        if (r.add) r.add = r.add + rs * (int64_t) r.ncols;
+        if (r.sum) r.sum = r.sum + rs * (int64_t) r.ncols;
+        r.n_tokens = 1;
+    }
     emit(out, c.proto, r);
 }
 
@@ -719,11 +751,12 @@ static void pack_QUANT_Q8_1(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out
     q.y          = dev_ptr(c.R, arg_str(a, "dst"));
     q.ne00       = (uint32_t) arg_i(a, "elems");
     q.ne0_padded = (uint32_t) pad_up(q.ne00, 512);  // MATRIX_ROW_PADDING
+    q.n_tokens   = arg_ntok(a);
     emit(out, c.proto, q);
 }
 
 static void pack_gemv_f16_common(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out,
-                                 uint32_t ncols_default) {
+                                 uint32_t ncols_default, bool single_row = false) {
     mk::GemvF16Args g{};
     g.w      = reinterpret_cast<const half *>(dev_ptr(c.R, arg_str(a, "weight")));
     g.x      = dev_f32(c.R, a, "src");
@@ -731,13 +764,17 @@ static void pack_gemv_f16_common(const Jv &a, PackCtx &c, std::vector<mk::Instr>
     g.ncols  = (uint32_t) arg_i_def(a, "src_elems", ncols_default);
     g.row_lo = (uint32_t) arg_i(a, "row_lo");
     g.row_hi = (uint32_t) arg_i(a, "row_hi");
+    g.n_tokens    = single_row ? 1 : arg_ntok(a);
+    g.dst_tstride = single_row ? 0 : slot_elems(c, a, "dst");
     emit(out, c.proto, g);
 }
 static void pack_GEMV_F16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
     pack_gemv_f16_common(a, c, out, N_EMBD);
 }
 static void pack_HEAD_GEMV_F16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
-    pack_gemv_f16_common(a, c, out, N_EMBD);       // src = xn (5120), no src_elems arg
+    // src = xn (5120), no src_elems arg. Downstream of the epilogue row
+    // select: single-row at any U (meta.prefill), so loop count 1.
+    pack_gemv_f16_common(a, c, out, N_EMBD, /*single_row=*/true);
 }
 
 static void pack_MMVQ_Q4_0(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -748,6 +785,8 @@ static void pack_MMVQ_Q4_0(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     m.ncols  = (uint32_t) arg_i(a, "src_elems");
     m.row_lo = (uint32_t) arg_i(a, "row_lo");
     m.row_hi = (uint32_t) arg_i(a, "row_hi");
+    m.n_tokens    = arg_ntok(a);
+    m.dst_tstride = slot_elems(c, a, "dst");
     emit(out, c.proto, m);
 }
 static void pack_MMVQ_Q4_0_FUSED(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -759,6 +798,8 @@ static void pack_MMVQ_Q4_0_FUSED(const Jv &a, PackCtx &c, std::vector<mk::Instr>
     m.ncols  = (uint32_t) arg_i(a, "src_elems");
     m.row_lo = (uint32_t) arg_i(a, "row_lo");
     m.row_hi = (uint32_t) arg_i(a, "row_hi");
+    m.n_tokens    = arg_ntok(a);
+    m.dst_tstride = slot_elems(c, a, "dst");
     emit(out, c.proto, m);
 }
 static void pack_MMVQ_AR16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -769,6 +810,8 @@ static void pack_MMVQ_AR16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     m.ncols  = (uint32_t) arg_i(a, "src_elems");
     m.row_lo = (uint32_t) arg_i(a, "row_lo");
     m.row_hi = (uint32_t) arg_i(a, "row_hi");
+    m.n_tokens    = arg_ntok(a);
+    m.dst_tstride = slot_elems(c, a, "dst");
     emit(out, c.proto, m);
 }
 
@@ -782,6 +825,8 @@ static void pack_CONV_SHIFT_CONCAT(const Jv &a, PackCtx &c, std::vector<mk::Inst
     s.row        = reinterpret_cast<const int64_t *>(dev_ptr(c.R, "rs_row"));
     s.channels   = (int32_t) arg_i(a, "channels");
     s.row_stride = (int64_t) CONV_STATE_N;          // one conv-cache row
+    s.n_tokens     = (int32_t) arg_ntok(a);
+    s.xnew_tstride = (int32_t) slot_elems(c, a, "token_col");
     emit(out, c.proto, s);
 }
 static void pack_SSM_CONV_SILU(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -790,6 +835,8 @@ static void pack_SSM_CONV_SILU(const Jv &a, PackCtx &c, std::vector<mk::Instr> &
     s.weight   = dev_f32(c.R, a, "kernel");
     s.dst      = dev_f32(c.R, a, "dst");
     s.channels = (int32_t) arg_i(a, "channels");
+    s.n_tokens    = (int32_t) arg_ntok(a);
+    s.dst_tstride = (int32_t) slot_elems(c, a, "dst");
     emit(out, c.proto, s);
 }
 static void pack_QK_L2NORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -804,6 +851,9 @@ static void pack_QK_L2NORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     n.dst     = dev_f32(c.R, a, "buf", q_off);   // in place
     n.n_heads = (int32_t)(2 * heads);
     n.eps     = (float) a.at("eps").num;
+    n.n_tokens    = (int32_t) arg_ntok(a);
+    n.src_tstride = (int32_t) slot_elems(c, a, "buf");
+    n.dst_tstride = n.src_tstride;               // in place
     emit(out, c.proto, n);
 }
 static void pack_GDN_GATES(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -815,6 +865,8 @@ static void pack_GDN_GATES(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     g.g         = dev_f32(c.R, a, "g_dst");
     g.beta      = dev_f32(c.R, a, "beta_dst");
     g.n_heads   = (int32_t) arg_i(a, "heads");
+    g.n_tokens  = (int32_t) arg_ntok(a);
+    g.tstride   = (int32_t) slot_elems(c, a, "alpha");
     emit(out, c.proto, g);
 }
 static void pack_GDN_STEP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -830,6 +882,9 @@ static void pack_GDN_STEP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) 
     s.n_heads   = (int32_t) arg_i(a, "v_heads");
     s.n_k_heads = (int32_t) arg_i(a, "k_heads");
     s.scale     = (float) a.at("scale").num;
+    s.n_tokens    = (int32_t) arg_ntok(a);
+    s.qkv_tstride = (int32_t) slot_elems(c, a, "qkv");
+    s.out_tstride = (int32_t) slot_elems(c, a, "dst");
     emit(out, c.proto, s);
 }
 static void pack_GATED_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -840,6 +895,10 @@ static void pack_GATED_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &
     g.dst     = dev_f32(c.R, a, "dst");
     g.n_heads = (int32_t) arg_i(a, "heads");
     g.eps     = (float) a.at("eps").num;
+    g.n_tokens    = (int32_t) arg_ntok(a);
+    g.x_tstride   = (int32_t) slot_elems(c, a, "src");
+    g.z_tstride   = (int32_t) slot_elems(c, a, "gate");
+    g.dst_tstride = (int32_t) slot_elems(c, a, "dst");
     emit(out, c.proto, g);
 }
 static void pack_STATE_LOAD(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -875,6 +934,9 @@ static void pack_QK_NORM_ROPE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     q.dst        = dev_f32(c.R, a, "q_dst");
     q.n_heads    = (uint32_t) arg_i(a, "q_heads");
     q.src_stride = (uint32_t) arg_i(a, "q_head_stride");
+    q.n_tokens    = arg_ntok(a);
+    q.src_tstride = slot_elems(c, a, "q_src");
+    q.dst_tstride = slot_elems(c, a, "q_dst");
     emit(out, c.proto, q);
 
     mk::QkNormRopeArgs k{};
@@ -884,6 +946,9 @@ static void pack_QK_NORM_ROPE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     k.dst        = dev_f32(c.R, a, "k_dst");
     k.n_heads    = (uint32_t) arg_i(a, "k_heads");
     k.src_stride = (uint32_t) arg_i(a, "head_dim");   // k rows are dense (256)
+    k.n_tokens    = arg_ntok(a);
+    k.src_tstride = slot_elems(c, a, "k_src");
+    k.dst_tstride = slot_elems(c, a, "k_dst");
     emit(out, c.proto, k);
 }
 static void pack_KV_APPEND(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -894,11 +959,15 @@ static void pack_KV_APPEND(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     kk.src = dev_f32(c.R, a, "k_src"); kk.row_idx = row;
     kk.cache = reinterpret_cast<half *>(dev_ptr(c.R, arg_str(a, "cache_k")));
     kk.row_width = rw;
+    kk.n_tokens = arg_ntok(a);
+    kk.src_tstride = slot_elems(c, a, "k_src");
     emit(out, c.proto, kk);
     mk::KvAppendArgs vv{};
     vv.src = dev_f32(c.R, a, "v_src"); vv.row_idx = row;
     vv.cache = reinterpret_cast<half *>(dev_ptr(c.R, arg_str(a, "cache_v")));
     vv.row_width = rw;
+    vv.n_tokens = arg_ntok(a);
+    vv.src_tstride = slot_elems(c, a, "v_src");
     emit(out, c.proto, vv);
 }
 static void pack_FATTN_DECODE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -912,6 +981,9 @@ static void pack_FATTN_DECODE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     f.n_q        = (uint32_t) arg_i(a, "q_heads");
     f.n_kv_heads = (uint32_t) arg_i(a, "kv_heads");
     f.row_width  = (uint32_t)(arg_i(a, "kv_heads") * arg_i(a, "head_dim"));
+    f.n_tokens        = arg_ntok(a);
+    f.q_tstride       = slot_elems(c, a, "q");
+    f.partial_tstride = slot_elems(c, a, "partials");
     c.out_idx_fattn.push_back(out.size());             // record for reporting count
     emit(out, c.proto, f);
 }
@@ -922,6 +994,9 @@ static void pack_FATTN_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     f.error    = reinterpret_cast<unsigned *>(dev_ptr(c.R, "fattn_error"));
     f.n_q      = (uint32_t) arg_i(a, "q_heads");
     f.n_chunks = (uint32_t) arg_i(a, "n_splits");
+    f.n_tokens        = arg_ntok(a);
+    f.partial_tstride = slot_elems(c, a, "partials");
+    f.dst_tstride     = slot_elems(c, a, "dst");
     emit(out, c.proto, f);
 }
 static void pack_ATTN_GATE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -931,6 +1006,9 @@ static void pack_ATTN_GATE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     g.dst         = dev_f32(c.R, a, "dst");
     g.n_q         = (uint32_t) arg_i(a, "heads");
     g.gate_stride = (uint32_t) arg_i(a, "gate_head_stride");
+    g.n_tokens     = arg_ntok(a);
+    g.attn_tstride = slot_elems(c, a, "attn");
+    g.gate_tstride = slot_elems(c, a, "gate_src");
     emit(out, c.proto, g);
 }
 static void pack_LOGITS_EMIT(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -956,6 +1034,8 @@ static void pack_XCHG_PUSH(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     x.local_partial = dev_f32(c.R, a, "local_partial");
     x.peer_payload  = reinterpret_cast<float *>(mbox_ptr(c, a, "peer_payload"));
     x.n_elems       = (int) arg_i(a, "n_elems");
+    x.n_tokens      = (int) arg_ntok(a);
+    x.lp_tstride    = (int) slot_elems(c, a, "local_partial");
     emit(out, c.proto, x);
 }
 static void pack_XCHG_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -968,6 +1048,10 @@ static void pack_XCHG_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &ou
     x.n_elems       = (int) arg_i(a, "n_elems");
     x.seqno         = 0;                 // $seqno, patched per pass (= pass number)
     x.gpu_index     = c.gpu_index;       // fixed p0+p1 fold order
+    x.n_tokens      = (int) arg_ntok(a);
+    x.lp_tstride    = (int) slot_elems(c, a, "local_partial");
+    if (x.lp_tstride != (int) slot_elems(c, a, "out"))
+        throw std::runtime_error("XCHG_REDUCE: local_partial/out slot mismatch");
     if (c.out_idx_xchg) c.out_idx_xchg->push_back(out.size());
     emit(out, c.proto, x);
 }
@@ -1035,6 +1119,12 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R,
     if (const Jv *m = pj.get("meta"))
         if (const Jv *pp = m->get("per_pass"))
             if (const Jv *es = pp->get("epoch_stride")) out.epoch_stride = (uint32_t) es->as_i();
+    // Batched prefill: the buffer table is U-scaled uniformly (meta.prefill),
+    // so per-token slot strides divide by the program's U. Decode: 1.
+    uint32_t prog_u = 1;
+    if (const Jv *m = pj.get("meta"))
+        if (const Jv *pf = m->get("prefill"))
+            if (const Jv *nt = pf->get("n_tokens")) prog_u = (uint32_t) nt->as_i();
     const Jv &instrs = pj.get("instructions") ? pj.at("instructions") : pj.at("instrs");
     out.instrs.reserve(instrs.arr.size());
     for (size_t i = 0; i < instrs.arr.size(); i++) {
@@ -1055,7 +1145,7 @@ static PackedProgram pack_program(const Jv &pj, const Resolver &R,
                              ? (uint32_t) ij.at("dbg_node").as_i() : 0;
         static const Jv empty_args;
         const Jv *args = ij.get("args");
-        PackCtx ctx{R, proto, out.fattn_idx, mbox, gpu_index, &out.xchg_idx};
+        PackCtx ctx{R, proto, out.fattn_idx, mbox, gpu_index, &out.xchg_idx, prog_u};
         size_t before = out.instrs.size();
         try {
             ke->pack(args ? *args : empty_args, ctx, out.instrs);
@@ -1710,11 +1800,10 @@ static void gpu_reset_stream_state(GpuCtx &c, int64_t kv_rows) {
 // the SingleLaunch / NoTeardown discipline is untouched.
 static bool dual_run_pass(GpuCtx g2[2], const int32_t *tokens, int64_t n_tok,
                           unsigned seqno, double timeout_ms) {
-    if (n_tok < 1 || (size_t) n_tok * 4 > 128) {
-        // d_token is a 128 B cell (core/host.cpp:51): 32 i32 slots. A U>32
-        // tile needs that cell grown in core (a separate reviewed edit);
-        // refuse rather than overrun it.
-        fprintf(stderr, "dual_run_pass: n_tok %lld exceeds the 128 B d_token cell\n",
+    if (n_tok < 1 || (size_t) n_tok * 4 > 512) {
+        // d_token is a 512 B cell (core/host.cpp): 128 i32 slots, the U=128
+        // gate config's whole tile. Refuse rather than overrun it.
+        fprintf(stderr, "dual_run_pass: n_tok %lld exceeds the 512 B d_token cell\n",
                 (long long) n_tok);
         return false;
     }
@@ -1813,7 +1902,7 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
     for (int g = 0; g < 2; g++) {
         GpuCtx &c = g2[g];
         c.ln.init(g);                                   // host_init on device g
-        c.R.add("token", c.ln.d_token(), 128);          // cell:token -> d_token
+        c.R.add("token", c.ln.d_token(), 512);          // cell:token -> d_token
         gpu_alloc_buffers(c, program, /*skip_kv=*/false, u_max);
         PackedProgram p = pack_program(program, c.R, &c.mtab, c.gpu_index);
         if (!p.complete)
@@ -2212,6 +2301,16 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
     return 0;
 }
 
+// The program's batched-prefill width: meta.prefill.n_tokens (the key
+// compile_schedule.py --prefill actually emits; the same one pack_program
+// divides buffer slots by). A decode program has no prefill block -> 1.
+static int64_t program_prefill_u(const Jv &program) {
+    if (const Jv *m = program.get("meta"))
+        if (const Jv *pf = m->get("prefill"))
+            if (const Jv *nt = pf->get("n_tokens")) return nt->as_i();
+    return 1;
+}
+
 // -- prefill U-tile self-consistency parity (plan/0143 driver scaffold) ------
 // Same resident kernel, same program, same prompt, run twice: the reference
 // leg through the proven per-token staging (gpu_set_inputs, one doorbell per
@@ -2219,24 +2318,21 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
 // doorbell per U-tile). At U=1 the two legs are the same computation op for
 // op, so logits, DeltaNet conv/ssm state, and the appended KV rows must be
 // BIT-IDENTICAL (tol 0.0); a mismatch is a staging bug in the tile path, not
-// an op regression. U>1 needs a program whose ops consume n_tokens (header
-// key "prefill_u", compile_schedule.py --prefill U); with it the same memcmp
-// binds the U-loop ops to the per-token fold, and the changed-tail causality
-// micro-check arms (a transposed or last-row-broadcast mask passes every U=1
-// check and fails only there).
+// an op regression. U>1 needs a program whose ops consume n_tokens
+// (meta.prefill.n_tokens, compile_schedule.py --prefill U); with it the same
+// memcmp binds the U-loop ops to the per-token fold, and the changed-tail
+// causality micro-check arms (a transposed or last-row-broadcast mask passes
+// every U=1 check and fails only there).
 static int prefill_parity_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
                               int64_t n_vocab, int64_t U) {
     static const int32_t PROMPT[] = { 11, 500, 1000, 1500, 2000, 2500, 3000, 3500 };
     const int64_t P = (int64_t)(sizeof PROMPT / sizeof PROMPT[0]);
     if (U < 1 || U > P)
         throw std::runtime_error("--prefill-parity: U must be in 1.." + std::to_string(P));
-    if (U > 1) {
-        const Jv *pu = program.get("prefill_u");
-        if (!pu || pu->k != Jv::NUM || (int64_t) pu->num < U)
-            throw std::runtime_error("--prefill-parity: U>1 needs a prefill program "
-                                     "(python3 k0/compile_schedule.py --prefill U) whose header "
-                                     "carries prefill_u >= U; the decode ops are U=1-only");
-    }
+    if (U > 1 && program_prefill_u(program) < U)
+        throw std::runtime_error("--prefill-parity: U>1 needs a prefill program "
+                                 "(python3 k0/compile_schedule.py --prefill U --split) whose "
+                                 "meta.prefill.n_tokens >= U; the decode ops pack n_tokens=1");
     if (P + 1 > n_ctx) throw std::runtime_error("prompt exceeds --n-ctx");
 
     GpuCtx g2[2];
@@ -2374,13 +2470,10 @@ static int prefill_bench_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
     if (U < 1) throw std::runtime_error("--prefill-bench: U must be >= 1");
     if (n_tokens < U) throw std::runtime_error("--prefill-bench: token count < U");
     if (n_tokens > n_ctx) throw std::runtime_error("--prefill-bench: n_tokens exceed --n-ctx");
-    if (U > 1) {
-        const Jv *pu = program.get("prefill_u");
-        if (!pu || pu->k != Jv::NUM || (int64_t) pu->num < U)
-            throw std::runtime_error("--prefill-bench: U>1 needs a prefill program "
-                                     "(python3 k0/compile_schedule.py --prefill U) whose header "
-                                     "carries prefill_u >= U; the decode ops are U=1-only");
-    }
+    if (U > 1 && program_prefill_u(program) < U)
+        throw std::runtime_error("--prefill-bench: U>1 needs a prefill program "
+                                 "(python3 k0/compile_schedule.py --prefill U --split) whose "
+                                 "meta.prefill.n_tokens >= U; the decode ops pack n_tokens=1");
     GpuCtx g2[2];
     dual_setup(g2, gg, program, n_ctx, n_vocab, U);
     const int64_t n_tiles = (n_tokens + U - 1) / U;
@@ -2519,7 +2612,7 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
     for (int g = 0; g < 2; g++) {
         GpuCtx &c = g_mk[g];
         c.ln.init(g);
-        c.R.add("token", c.ln.d_token(), 128);
+        c.R.add("token", c.ln.d_token(), 512);
         gpu_bind_llama(c, pm);
         if (const char *mp = getenv("MK_OWNEMBED")) {   // bind the full mirrored token_embd
             gguf::File gg; gg.open(mp);
@@ -2719,7 +2812,7 @@ int main(int argc, char **argv) {
     const bool prefill_mode = (mode == M_PREFILL_PARITY || mode == M_PREFILL_BENCH);
     const bool tensor_mode = (mode == M_PARITY_TENSOR || mode == M_BENCH_TENSOR || prefill_mode);
     if (program_path.empty())
-        program_path = (prefill_mode && prefill_u > 1) ? "k0/program-prefill.json"
+        program_path = (prefill_mode && prefill_u > 1) ? "k0/program-split-prefill.json"
                      : tensor_mode ? "k0/program-split.json" : "k0/program.json";
 
     try {
@@ -2859,7 +2952,7 @@ int main(int argc, char **argv) {
         Launcher ln;
         if (mode != M_VALIDATE) {
             ln.init(gpu);
-            R.add("token", ln.d_token(), 128);   // cell:token -> Host d_token
+            R.add("token", ln.d_token(), 512);   // cell:token -> Host d_token
         }
 
         rt.allocate(R, have_program ? &program : nullptr);

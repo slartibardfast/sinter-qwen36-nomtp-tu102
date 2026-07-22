@@ -44,6 +44,12 @@ struct XchgPushArgs {
     const float *local_partial; // this GPU's computed slice (device-local)
     float *peer_payload;        // the PEER inbox payload (peer VRAM, UVA)
     int n_elems;                // slice length (e.g. 5120)
+    // U-loop (meta.prefill): U per-token slices in one site exchange, ONE
+    // membar/seqno pair for the whole tile. local_partial advances by
+    // lp_tstride (its buffer's per-token slot); the inbox payload is packed
+    // dense at t*n_elems (the mailbox is sized n_elems*U). Decode packs 1.
+    int n_tokens;
+    int lp_tstride;
 };
 static_assert(sizeof(XchgPushArgs) <= sizeof(((Instr *)0)->payload),
               "XchgPushArgs exceeds Instr payload");
@@ -57,6 +63,8 @@ struct XchgReduceArgs {
     int n_elems;
     unsigned seqno;             // monotonic per site per pass (wrap-safe)
     int gpu_index;              // 0 or 1 — selects the fixed fold order
+    int n_tokens;               // U-loop: as XchgPushArgs; one seqno per site
+    int lp_tstride;             // local_partial AND out per-token slot
 };
 static_assert(sizeof(XchgReduceArgs) <= sizeof(((Instr *)0)->payload),
               "XchgReduceArgs exceeds Instr payload");
@@ -74,17 +82,22 @@ static __device__ MK_OPFN void op_xchg_push(const Instr &in, char *) {
     const int nthr  = lanes * (int)blockDim.x;
 
     const int n4 = a.n_elems >> 2;
-    const float4 *src4 = reinterpret_cast<const float4 *>(a.local_partial);
-    float4 *dst4       = reinterpret_cast<float4 *>(a.peer_payload);
-    for (int i = tid; i < n4; i += nthr)
-        dst4[i] = src4[i];                      // peer store, linear order
-    for (int i = (n4 << 2) + tid; i < a.n_elems; i += nthr)
-        a.peer_payload[i] = a.local_partial[i]; // scalar tail
+    for (int t = 0; t < a.n_tokens; t++) {
+        const float *lp = a.local_partial + (int64_t) t * a.lp_tstride;
+        float *pp       = a.peer_payload + (int64_t) t * a.n_elems;
+        const float4 *src4 = reinterpret_cast<const float4 *>(lp);
+        float4 *dst4       = reinterpret_cast<float4 *>(pp);
+        for (int i = tid; i < n4; i += nthr)
+            dst4[i] = src4[i];                  // peer store, linear order
+        for (int i = (n4 << 2) + tid; i < a.n_elems; i += nthr)
+            pp[i] = lp[i];                      // scalar tail
+    }
 
     // Each pushing block sys-orders ITS OWN peer stores: the Y02 boundary's
     // .gpu-scope release does not order sys-destined stores for a sys
     // observer (the peer GPU). The following OP_BOUNDARY then makes every
-    // block's push globally complete before any seqno is published.
+    // block's push globally complete before any seqno is published. One
+    // membar covers the whole U-token payload.
     membar_sys();
 }
 
@@ -114,10 +127,15 @@ static __device__ MK_OPFN void op_xchg_reduce(const Instr &in, char *) {
     // where p0 is GPU0's partial and p1 is GPU1's. This GPU owns
     // local_partial; the peer's slice is in my_payload. gpu_index picks which
     // is the left addend so the summation order matches bit-for-bit.
-    for (int i = tid; i < a.n_elems; i += nthr) {
-        const float mine = a.local_partial[i];
-        const float peer = ld_cg(a.my_payload + i);   // strong, never plain
-        a.out[i] = (a.gpu_index == 0) ? (mine + peer) : (peer + mine);
+    for (int t = 0; t < a.n_tokens; t++) {
+        const float *lp = a.local_partial + (int64_t) t * a.lp_tstride;
+        const float *mp = a.my_payload + (int64_t) t * a.n_elems;
+        float *out      = a.out + (int64_t) t * a.lp_tstride;
+        for (int i = tid; i < a.n_elems; i += nthr) {
+            const float mine = lp[i];
+            const float peer = ld_cg(mp + i);         // strong, never plain
+            out[i] = (a.gpu_index == 0) ? (mine + peer) : (peer + mine);
+        }
     }
 }
 

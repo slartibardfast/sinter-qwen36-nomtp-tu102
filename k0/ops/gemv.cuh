@@ -78,6 +78,10 @@ struct QuantQ8_1Args {
     void        *y;       // block_q8_1 out, 4-byte aligned
     uint32_t ne00;        // real element count
     uint32_t ne0_padded;  // ne00 rounded up to MATRIX_ROW_PADDING (512)
+    // U-loop (meta.prefill): x advances by ne00, y by (ne0_padded/32)*36 B per
+    // token (dense per width; every scheduled width is a 512 multiple, so the
+    // consumer MMVQ derives the same block stride from its ncols). Decode: 1.
+    uint32_t n_tokens;
 };
 static_assert(sizeof(QuantQ8_1Args) <= 112, "payload overflow");
 
@@ -93,6 +97,13 @@ struct MmvqQ40Args {
     uint32_t ncols;       // K, row length in elements
     uint32_t row_lo;
     uint32_t row_hi;
+    // U-loop (meta.prefill): y advances by (ncols/32) q8_1 blocks per token
+    // (the producer QUANT's dense-width stride); dst by dst_tstride f32 (the
+    // destination buffer's per-token slot, packed from the buffer table -- not
+    // derivable from the row range when dst_off offsets into a wider vector).
+    // Weights are token-invariant. Decode packs n_tokens=1.
+    uint32_t n_tokens;
+    uint32_t dst_tstride;
 };
 static_assert(sizeof(MmvqQ40Args) <= 112, "payload overflow");
 
@@ -107,6 +118,8 @@ struct MmvqQ40FusedArgs {
     uint32_t ncols;
     uint32_t row_lo;
     uint32_t row_hi;
+    uint32_t n_tokens;    // U-loop strides as MmvqQ40Args
+    uint32_t dst_tstride;
 };
 static_assert(sizeof(MmvqQ40FusedArgs) <= 112, "payload overflow");
 
@@ -120,6 +133,8 @@ struct MmvqAr16Args {
     uint32_t ncols;
     uint32_t row_lo;
     uint32_t row_hi;
+    uint32_t n_tokens;    // U-loop: y advances (ncols/32) q8_1 blocks per token
+    uint32_t dst_tstride; // dst per-token slot (buffer table), f32 elements
 };
 static_assert(sizeof(MmvqAr16Args) <= 112, "payload overflow");
 
@@ -132,6 +147,8 @@ struct GemvF16Args {
     uint32_t ncols;
     uint32_t row_lo;
     uint32_t row_hi;
+    uint32_t n_tokens;    // U-loop: x advances by ncols per token
+    uint32_t dst_tstride; // dst per-token slot (buffer table), f32 elements
 };
 static_assert(sizeof(GemvF16Args) <= 112, "payload overflow");
 
@@ -216,9 +233,12 @@ static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
     const WarpSlice ws = warp_slice(I);
     const uint32_t nblk = a.ne0_padded / 32u;
 
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    const float *x = a.x + (size_t)t * a.ne00;
+    int8_t *yt = reinterpret_cast<int8_t *>(a.y) + (size_t)t * nblk * 36u;
     for (uint32_t b = (uint32_t)ws.gw; b < nblk; b += (uint32_t)ws.nwarps) {
         const uint32_t i = b * 32u + (uint32_t)ws.lane;
-        const float xi = i < a.ne00 ? ld_cg(a.x + i) : 0.0f;
+        const float xi = i < a.ne00 ? ld_cg(x + i) : 0.0f;
         float amax = fabsf(xi);
         float sum  = xi;
 #pragma unroll
@@ -229,10 +249,11 @@ static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
         const float d = amax / 127.0f;
         const int   q = amax == 0.0f ? 0 : (int)roundf(xi / d);
 
-        int8_t *blk = reinterpret_cast<int8_t *>(a.y) + (size_t)b * 36u;
+        int8_t *blk = yt + (size_t)b * 36u;
         blk[4 + ws.lane] = (int8_t)q;
         if (ws.lane == 0)
             *reinterpret_cast<half2 *>(blk) = __floats2half2_rn(d, sum);
+    }
     }
 }
 
@@ -308,16 +329,20 @@ static __device__ MK_OPFN void op_mmvq_q4_0(const Instr &I, char *smem) {
     const int npair = nblk / 2;
     const int npair_full = npair & ~31;
     uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
-    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y), (uint32_t)nblk * 9u);
-
     const WarpSlice ws = warp_slice(I);
     const size_t row_words = (size_t)npair * 9u;   // 18 B/block as u32
+
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y) + (size_t)t * nblk * 9u,
+                   (uint32_t)nblk * 9u);
+    float *dst = a.dst + (size_t)t * a.dst_tstride;
     for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
         const uint32_t *w_row = reinterpret_cast<const uint32_t *>(a.w) + (size_t)r * row_words;
         const float acc = warp_sum(mmvq_q40_row(w_row, ys, npair, npair_full, nblk, ws.lane));
-        if (ws.lane == 0) a.dst[r] = acc;
+        if (ws.lane == 0) dst[r] = acc;
     }
     __syncthreads();   // slab handoff: no warp may still read ys after return
+    }
 }
 
 // OP_MMVQ_Q4_0_FUSED. Two sequential row dots (up then gate) over the one
@@ -330,10 +355,13 @@ static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
     const int npair = nblk / 2;
     const int npair_full = npair & ~31;
     uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
-    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y), (uint32_t)nblk * 9u);
-
     const WarpSlice ws = warp_slice(I);
     const size_t row_words = (size_t)npair * 9u;
+
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y) + (size_t)t * nblk * 9u,
+                   (uint32_t)nblk * 9u);
+    float *dst = a.dst + (size_t)t * a.dst_tstride;
     for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
         const uint32_t *up_row =
             reinterpret_cast<const uint32_t *>(a.w_up) + (size_t)r * row_words;
@@ -341,9 +369,10 @@ static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
             reinterpret_cast<const uint32_t *>(a.w_gate) + (size_t)r * row_words;
         const float up   = warp_sum(mmvq_q40_row(up_row,   ys, npair, npair_full, nblk, ws.lane));
         const float gate = warp_sum(mmvq_q40_row(gate_row, ys, npair, npair_full, nblk, ws.lane));
-        if (ws.lane == 0) a.dst[r] = __fmul_rn(up, mk_silu(gate));
+        if (ws.lane == 0) dst[r] = __fmul_rn(up, mk_silu(gate));
     }
     __syncthreads();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,16 +446,21 @@ static __device__ MK_OPFN void op_mmvq_ar16(const Instr &I, char *smem) {
     const int npair = nblk / 2;
     const int npair_full = npair & ~31;
     uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
-    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y), (uint32_t)(a.ncols / 32u) * 9u);
-
     const WarpSlice ws = warp_slice(I);
     const size_t row_words = (size_t)npair * 5u;   // 10 B/block as u32
+
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y)
+                           + (size_t)t * (a.ncols / 32u) * 9u,
+                   (uint32_t)(a.ncols / 32u) * 9u);
+    float *dst = a.dst + (size_t)t * a.dst_tstride;
     for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
         const uint32_t *w_row = reinterpret_cast<const uint32_t *>(a.w) + (size_t)r * row_words;
         const float acc = warp_sum(mmvq_ar16_row(w_row, ys, npair, npair_full, nblk, ws.lane));
-        if (ws.lane == 0) a.dst[r] = acc;
+        if (ws.lane == 0) dst[r] = acc;
     }
     __syncthreads();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,19 +498,23 @@ static __device__ __forceinline__ float gemv_f16_row(
 static __device__ __forceinline__ void gemv_f16_common(const Instr &I, char *smem) {
     const GemvF16Args &a = *reinterpret_cast<const GemvF16Args *>(I.payload);
     float *xs = reinterpret_cast<float *>(smem);
-    stage_words_cg(reinterpret_cast<uint32_t *>(xs),
-                   reinterpret_cast<const uint32_t *>(a.x), a.ncols);
-
     const WarpSlice ws = warp_slice(I);
     const int ngrp = (int)(a.ncols / 8u);
+
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    stage_words_cg(reinterpret_cast<uint32_t *>(xs),
+                   reinterpret_cast<const uint32_t *>(a.x + (size_t)t * a.ncols),
+                   a.ncols);
+    float *dst = a.dst + (size_t)t * a.dst_tstride;
     for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
         const uint4 *w_row =
             reinterpret_cast<const uint4 *>(a.w + (size_t)r * a.ncols);
         const float acc = warp_sum(
             gemv_f16_row(w_row, reinterpret_cast<const float4 *>(xs), ngrp, ws.lane));
-        if (ws.lane == 0) a.dst[r] = acc;
+        if (ws.lane == 0) dst[r] = acc;
     }
     __syncthreads();
+    }
 }
 
 // smem: ncols*4 B staged x.

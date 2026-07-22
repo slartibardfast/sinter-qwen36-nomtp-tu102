@@ -50,6 +50,11 @@ struct RmsnormArgs {
     // (l_out node). Both nullptr => sum not published (the op's plain form).
     float *sum;
     float *dbg;
+    // Batched-prefill U-loop (program meta.prefill): repeat the per-token body
+    // once per column, all five pointers advancing by nrows*ncols per token.
+    // Decode packs 1 (byte-identical numerics); the epilogue row-select norm
+    // also packs 1 (its source offset selects row U-1 at pack time).
+    uint32_t n_tokens;
 };
 static_assert(sizeof(RmsnormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -68,12 +73,14 @@ __device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
     float *stage = reinterpret_cast<float *>(smem + 64);
     const bool can_stage = (size_t)a.ncols * 4 + 64 <= SMEM_BYTES;
 
+    const size_t tsz = (size_t)a.nrows * a.ncols; // per-token slot (U-loop)
+    for (uint32_t t = 0; t < a.n_tokens; ++t)
     for (uint32_t row = blockIdx.x - in.block_lo; row < a.nrows; row += nblk) {
-        const float *x = a.x + (size_t)row * a.ncols;
-        const float *add = a.add ? a.add + (size_t)row * a.ncols : nullptr;
-        float *y = a.y + (size_t)row * a.ncols;
-        float *sum = a.sum ? a.sum + (size_t)row * a.ncols : nullptr;
-        float *dbg = a.dbg ? a.dbg + (size_t)row * a.ncols : nullptr;
+        const float *x = a.x + t * tsz + (size_t)row * a.ncols;
+        const float *add = a.add ? a.add + t * tsz + (size_t)row * a.ncols : nullptr;
+        float *y = a.y + t * tsz + (size_t)row * a.ncols;
+        float *sum = a.sum ? a.sum + t * tsz + (size_t)row * a.ncols : nullptr;
+        float *dbg = a.dbg ? a.dbg + t * tsz + (size_t)row * a.ncols : nullptr;
 
         float acc = 0.0f;
         const bool vec = (a.ncols % 4u == 0) && aligned16(x) &&
@@ -160,6 +167,7 @@ struct ResidualAddArgs {
     const float *b; // mutable -> strong reads
     float *y;
     uint32_t n;
+    uint32_t n_tokens; // U-loop: a/b/y advance by n per token; decode packs 1
 };
 static_assert(sizeof(ResidualAddArgs) <= sizeof(Instr::payload), "payload");
 
@@ -170,17 +178,22 @@ __device__ MK_OPFN void op_residual_add(const Instr &in, char *) {
     const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
     const unsigned stride = nblk * blockDim.x;
 
-    if ((a.n % 4u == 0) && aligned16(a.a) && aligned16(a.b) && aligned16(a.y)) {
-        const float4 *a4 = reinterpret_cast<const float4 *>(a.a);
-        const float4 *b4 = reinterpret_cast<const float4 *>(a.b);
-        float4 *y4 = reinterpret_cast<float4 *>(a.y);
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    const float *pa = a.a + (size_t)t * a.n;
+    const float *pb = a.b + (size_t)t * a.n;
+    float *py = a.y + (size_t)t * a.n;
+    if ((a.n % 4u == 0) && aligned16(pa) && aligned16(pb) && aligned16(py)) {
+        const float4 *a4 = reinterpret_cast<const float4 *>(pa);
+        const float4 *b4 = reinterpret_cast<const float4 *>(pb);
+        float4 *y4 = reinterpret_cast<float4 *>(py);
         for (uint32_t i = tid; i < a.n / 4; i += stride) {
             const float4 u = ld_cg(a4 + i), v = ld_cg(b4 + i);
             y4[i] = make_float4(u.x + v.x, u.y + v.y, u.z + v.z, u.w + v.w);
         }
     } else {
         for (uint32_t i = tid; i < a.n; i += stride)
-            a.y[i] = ld_cg(a.a + i) + ld_cg(a.b + i);
+            py[i] = ld_cg(pa + i) + ld_cg(pb + i);
+    }
     }
 }
 
@@ -192,10 +205,11 @@ __device__ MK_OPFN void op_residual_add(const Instr &in, char *) {
 // ---------------------------------------------------------------------------
 struct EmbedLookupArgs {
     const __half *emb;    // token_embd.weight base
-    const int32_t *token; // i32 token-id cell (device, host-written per pass)
-    float *y;             // f32 out row [ncols]
+    const int32_t *token; // i32 token-id cell(s) (device, host-written per pass)
+    float *y;             // f32 out row(s) [n_tokens x ncols]
     uint32_t ncols;       // 5120
     uint32_t row_stride;  // elements between consecutive rows (5120)
+    uint32_t n_tokens;    // U-loop: token[t] -> y + t*ncols; decode packs 1
 };
 static_assert(sizeof(EmbedLookupArgs) <= sizeof(Instr::payload), "payload");
 
@@ -203,26 +217,30 @@ __device__ MK_OPFN void op_embed_lookup(const Instr &in, char *smem) {
     const EmbedLookupArgs &a =
         *reinterpret_cast<const EmbedLookupArgs *>(in.payload);
     int *bc = reinterpret_cast<int *>(smem);
+    const unsigned nblk = in.block_hi - in.block_lo;
+    const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
+    const unsigned stride = nblk * blockDim.x;
+
+    for (uint32_t t = 0; t < a.n_tokens; ++t) {
     if (threadIdx.x == 0)
-        *bc = (int)ld_cg(reinterpret_cast<const unsigned *>(a.token));
+        *bc = (int)ld_cg(reinterpret_cast<const unsigned *>(a.token) + t);
     __syncthreads();
     const int tok = *bc;
     __syncthreads();
 
     const __half *row = a.emb + (size_t)tok * a.row_stride;
-    const unsigned nblk = in.block_hi - in.block_lo;
-    const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
-    const unsigned stride = nblk * blockDim.x;
+    float *y = a.y + (size_t)t * a.ncols;
 
     if ((a.ncols % 2u == 0) && ((reinterpret_cast<uintptr_t>(row) & 3u) == 0) &&
-        ((reinterpret_cast<uintptr_t>(a.y) & 7u) == 0)) {
+        ((reinterpret_cast<uintptr_t>(y) & 7u) == 0)) {
         const __half2 *row2 = reinterpret_cast<const __half2 *>(row);
-        float2 *y2 = reinterpret_cast<float2 *>(a.y);
+        float2 *y2 = reinterpret_cast<float2 *>(y);
         for (uint32_t i = tid; i < a.ncols / 2; i += stride)
             y2[i] = __half22float2(row2[i]);
     } else {
         for (uint32_t i = tid; i < a.ncols; i += stride)
-            a.y[i] = __half2float(row[i]);
+            y[i] = __half2float(row[i]);
+    }
     }
 }
 

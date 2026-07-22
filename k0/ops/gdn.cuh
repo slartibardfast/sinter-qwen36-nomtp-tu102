@@ -118,6 +118,13 @@ struct ConvShiftConcatArgs {
     const int64_t *row;         // i64[1] destination cache row
     int64_t        row_stride;  // f32 elements between conv cache rows
     int32_t        channels;    // 10240 full model / 5120 per GPU half
+    // U-loop (meta.prefill): the per-channel window widens to
+    // GDN_DCONV-1 + n_tokens (hist cols then the U token cols, the sliding
+    // window); the commit takes the window's LAST GDN_DCONV-1 entries. xnew
+    // column t is at xnew + t*xnew_tstride (the producer buffer's per-token
+    // slot). Decode packs n_tokens=1: window width 4, commit h1,h2,x.
+    int32_t        n_tokens;
+    int32_t        xnew_tstride;
 };
 static_assert(sizeof(ConvShiftConcatArgs) <= sizeof(Instr::payload), "payload");
 
@@ -127,15 +134,24 @@ __device__ MK_OPFN void op_conv_shift_concat(const Instr &ins, char *smem) {
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
     const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
     float *commit = a.state + ld_cg_s64(a.row) * a.row_stride;
+    const int W = GDN_DCONV - 1 + a.n_tokens; // per-channel window width
     for (int c = tid; c < a.channels; c += nthreads) {
         const float h0 = ld_cg(a.hist + c * (GDN_DCONV - 1) + 0);
         const float h1 = ld_cg(a.hist + c * (GDN_DCONV - 1) + 1);
         const float h2 = ld_cg(a.hist + c * (GDN_DCONV - 1) + 2);
-        const float x  = ld_cg(a.xnew + c);
-        float *w = a.win + c * GDN_DCONV;
-        w[0] = h0; w[1] = h1; w[2] = h2; w[3] = x;
+        float *w = a.win + (int64_t) c * W;
+        w[0] = h0; w[1] = h1; w[2] = h2;
+        for (int t = 0; t < a.n_tokens; t++) {
+            w[GDN_DCONV - 1 + t] = ld_cg(a.xnew + (int64_t) t * a.xnew_tstride + c);
+        }
         float *s = commit + c * (GDN_DCONV - 1);
-        s[0] = h1; s[1] = h2; s[2] = x;
+        const float hh[GDN_DCONV - 1] = { h0, h1, h2 };
+        for (int j = 0; j < GDN_DCONV - 1; j++) {
+            const int idx = W - (GDN_DCONV - 1) + j;
+            s[j] = idx < GDN_DCONV - 1
+                       ? hh[idx]
+                       : ld_cg(a.xnew + (int64_t) (idx - (GDN_DCONV - 1)) * a.xnew_tstride + c);
+        }
     }
 }
 
@@ -150,6 +166,12 @@ struct SsmConvSiluArgs {
     const float *weight;   // (GDN_DCONV, channels) ssm_conv1d.weight, immutable
     float       *dst;      // (channels)
     int32_t      channels;
+    // U-loop (meta.prefill): the window is (GDN_DCONV-1 + n_tokens, channels)
+    // tap-contiguous per channel; token t's conv reads window entries t..t+3
+    // (the sliding causal window) and writes dst + t*dst_tstride. The tap fold
+    // order is the decode sequential order either way. Decode packs 1.
+    int32_t      n_tokens;
+    int32_t      dst_tstride;
 };
 static_assert(sizeof(SsmConvSiluArgs) <= sizeof(Instr::payload), "payload");
 
@@ -158,15 +180,31 @@ __device__ MK_OPFN void op_ssm_conv_silu(const Instr &ins, char *smem) {
     const SsmConvSiluArgs &a = *reinterpret_cast<const SsmConvSiluArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
     const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    if (a.n_tokens == 1) { // decode fast path: one float4 window load/channel
+        for (int c = tid; c < a.channels; c += nthreads) {
+            const float4 x = ld_cg(reinterpret_cast<const float4 *>(a.win) + c);
+            const float4 w = reinterpret_cast<const float4 *>(a.weight)[c];
+            float sum = 0.0f;
+            sum = __fadd_rn(sum, __fmul_rn(x.x, w.x));
+            sum = __fadd_rn(sum, __fmul_rn(x.y, w.y));
+            sum = __fadd_rn(sum, __fmul_rn(x.z, w.z));
+            sum = __fadd_rn(sum, __fmul_rn(x.w, w.w));
+            a.dst[c] = gdn_silu(sum);
+        }
+        return;
+    }
+    const int W = GDN_DCONV - 1 + a.n_tokens;
     for (int c = tid; c < a.channels; c += nthreads) {
-        const float4 x = ld_cg(reinterpret_cast<const float4 *>(a.win) + c);
         const float4 w = reinterpret_cast<const float4 *>(a.weight)[c];
-        float sum = 0.0f;
-        sum = __fadd_rn(sum, __fmul_rn(x.x, w.x));
-        sum = __fadd_rn(sum, __fmul_rn(x.y, w.y));
-        sum = __fadd_rn(sum, __fmul_rn(x.z, w.z));
-        sum = __fadd_rn(sum, __fmul_rn(x.w, w.w));
-        a.dst[c] = gdn_silu(sum);
+        const float *wc = a.win + (int64_t) c * W;
+        for (int t = 0; t < a.n_tokens; t++) {
+            float sum = 0.0f;
+            sum = __fadd_rn(sum, __fmul_rn(ld_cg(wc + t + 0), w.x));
+            sum = __fadd_rn(sum, __fmul_rn(ld_cg(wc + t + 1), w.y));
+            sum = __fadd_rn(sum, __fmul_rn(ld_cg(wc + t + 2), w.z));
+            sum = __fadd_rn(sum, __fmul_rn(ld_cg(wc + t + 3), w.w));
+            a.dst[(int64_t) t * a.dst_tstride + c] = gdn_silu(sum);
+        }
     }
 }
 
@@ -181,6 +219,9 @@ struct QkL2NormArgs {
     float       *dst;
     int32_t      n_heads;
     float        eps;      // 1e-6
+    int32_t      n_tokens;    // U-loop; decode packs 1
+    int32_t      src_tstride; // per-token slot of src's buffer, f32 elements
+    int32_t      dst_tstride; // per-token slot of dst's buffer, f32 elements
 };
 static_assert(sizeof(QkL2NormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -192,9 +233,10 @@ __device__ MK_OPFN void op_qk_l2norm(const Instr &ins, char *smem) {
     const int nwarps = (ins.block_hi - ins.block_lo) * warps_per_blk;
     const int wid    = (blockIdx.x - ins.block_lo) * warps_per_blk + (threadIdx.x >> 5);
     const int lane   = threadIdx.x & 31;
+    for (int t = 0; t < a.n_tokens; t++)
     for (int h = wid; h < a.n_heads; h += nwarps) {
-        const float *x = a.src + (int64_t) h * GDN_SV;
-        float       *y = a.dst + (int64_t) h * GDN_SV;
+        const float *x = a.src + (int64_t) t * a.src_tstride + (int64_t) h * GDN_SV;
+        float       *y = a.dst + (int64_t) t * a.dst_tstride + (int64_t) h * GDN_SV;
         float xr[rows_per_lane];
         float ss = 0.0f;
 #pragma unroll
@@ -228,6 +270,8 @@ struct GdnGatesArgs {
     float       *g;          // out: per-head decay, already exp'd
     float       *beta;       // out: per-head mixing coeff
     int32_t      n_heads;
+    int32_t      n_tokens;   // U-loop: all four mutable ptrs advance by tstride
+    int32_t      tstride;    // per-token slot (gdn_alpha/gdn_beta), f32 elements
 };
 static_assert(sizeof(GdnGatesArgs) <= sizeof(Instr::payload), "payload");
 
@@ -236,11 +280,14 @@ __device__ MK_OPFN void op_gdn_gates(const Instr &ins, char *smem) {
     const GdnGatesArgs &a = *reinterpret_cast<const GdnGatesArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
     const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    for (int t = 0; t < a.n_tokens; t++) {
+    const int64_t off = (int64_t) t * a.tstride;
     for (int h = tid; h < a.n_heads; h += nthreads) {
-        const float ab = ld_cg(a.alpha_raw + h) + a.dt_bias[h];
+        const float ab = ld_cg(a.alpha_raw + off + h) + a.dt_bias[h];
         const float sp = (ab > 20.0f) ? ab : logf(1.0f + expf(ab));
-        a.g[h]    = expf(sp * a.a[h]);
-        a.beta[h] = 1.0f / (1.0f + expf(-ld_cg(a.beta_raw + h)));
+        a.g[off + h]    = expf(sp * a.a[h]);
+        a.beta[off + h] = 1.0f / (1.0f + expf(-ld_cg(a.beta_raw + off + h)));
+    }
     }
 }
 
@@ -269,6 +316,15 @@ struct GdnStepArgs {
     int32_t      n_heads;    // H_v: 48 full model / 24 per GPU half
     int32_t      n_k_heads;  // H_k: 16 full model /  8 per GPU half
     float        scale;      // 1/sqrtf(GDN_SV), output scale, applied LAST
+    // U-loop (meta.prefill): the fork production token-loop shape. Each
+    // (head, column) task loads its state column ONCE, then runs the per-token
+    // recurrence over the U columns carrying s_shard in registers, and stores
+    // ONCE; identical values to U per-token passes (the load/store roundtrip
+    // is an exact fp32 copy). q/k/v advance by qkv_tstride per token, g/beta
+    // by n_heads (their per-token slot), attn_out by out_tstride. Decode: 1.
+    int32_t      n_tokens;
+    int32_t      qkv_tstride;
+    int32_t      out_tstride;
 };
 static_assert(sizeof(GdnStepArgs) <= sizeof(Instr::payload), "payload");
 
@@ -285,21 +341,30 @@ __device__ MK_OPFN void op_gdn_step(const Instr &ins, char *smem) {
         const int h   = task / GDN_SV;
         const int col = task - h * GDN_SV;
         const int hk  = h % a.n_k_heads;
+        const int64_t s_off = ((int64_t) h * GDN_SV + col) * GDN_SV;
 
-        const float *q_t = a.q + (int64_t) hk * GDN_SV;
-        const float *k_t = a.k + (int64_t) hk * GDN_SV;
-        const float g_val    = ld_cg(a.g + h);
-        const float beta_val = ld_cg(a.beta + h);
-        const float v_col    = ld_cg(a.v + (int64_t) h * GDN_SV + col);
-        const int64_t s_off  = ((int64_t) h * GDN_SV + col) * GDN_SV;
-
+        // State column loaded ONCE, carried in registers across the U tokens
+        // (the fork production token-loop; exact vs the per-token roundtrip).
         float s_shard[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] = ld_cg(a.state_in + s_off + r * 32 + lane);
+        }
+
+        for (int t = 0; t < a.n_tokens; t++) {
+        const int64_t toff = (int64_t) t * a.qkv_tstride;
+        const int64_t goff = (int64_t) t * a.n_heads;
+        const float *q_t = a.q + toff + (int64_t) hk * GDN_SV;
+        const float *k_t = a.k + toff + (int64_t) hk * GDN_SV;
+        const float g_val    = ld_cg(a.g + goff + h);
+        const float beta_val = ld_cg(a.beta + goff + h);
+        const float v_col    = ld_cg(a.v + toff + (int64_t) h * GDN_SV + col);
+
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * 32 + lane;
-            s_shard[r]  = ld_cg(a.state_in + s_off + i);
             k_reg[r]    = ld_cg(k_t + i);
             q_reg[r]    = ld_cg(q_t + i);
         }
@@ -325,13 +390,16 @@ __device__ MK_OPFN void op_gdn_step(const Instr &ins, char *smem) {
         }
         const float attn_col = gdn_warp_tree_sum(attn_partial);
 
+        if (lane == 0) {
+            // 5. output scaled by 1/sqrt(S_v) LAST.
+            a.attn_out[(int64_t) t * a.out_tstride + (int64_t) h * GDN_SV + col] =
+                __fmul_rn(attn_col, a.scale);
+        }
+        }
+
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             a.state_out[s_off + r * 32 + lane] = s_shard[r];
-        }
-        if (lane == 0) {
-            // 5. output scaled by 1/sqrt(S_v) LAST.
-            a.attn_out[(int64_t) h * GDN_SV + col] = __fmul_rn(attn_col, a.scale);
         }
     }
 }
@@ -350,6 +418,10 @@ struct GatedRmsNormArgs {
     float       *dst;    // (GDN_SV, n_heads)
     int32_t      n_heads;
     float        eps;    // 1e-6
+    int32_t      n_tokens;    // U-loop; decode packs 1
+    int32_t      x_tstride;   // per-token slots (buffer table), f32 elements
+    int32_t      z_tstride;
+    int32_t      dst_tstride;
 };
 static_assert(sizeof(GatedRmsNormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -361,10 +433,11 @@ __device__ MK_OPFN void op_gated_rmsnorm(const Instr &ins, char *smem) {
     const int nwarps = (ins.block_hi - ins.block_lo) * warps_per_blk;
     const int wid    = (blockIdx.x - ins.block_lo) * warps_per_blk + (threadIdx.x >> 5);
     const int lane   = threadIdx.x & 31;
+    for (int t = 0; t < a.n_tokens; t++)
     for (int h = wid; h < a.n_heads; h += nwarps) {
-        const float *x = a.x + (int64_t) h * GDN_SV;
-        const float *z = a.z + (int64_t) h * GDN_SV;
-        float       *y = a.dst + (int64_t) h * GDN_SV;
+        const float *x = a.x + (int64_t) t * a.x_tstride + (int64_t) h * GDN_SV;
+        const float *z = a.z + (int64_t) t * a.z_tstride + (int64_t) h * GDN_SV;
+        float       *y = a.dst + (int64_t) t * a.dst_tstride + (int64_t) h * GDN_SV;
         float xr[rows_per_lane];
         float ss = 0.0f;
 #pragma unroll
