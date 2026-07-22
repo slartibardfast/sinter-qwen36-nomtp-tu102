@@ -1673,22 +1673,28 @@ static void gpu_alloc_buffers(GpuCtx &c, const Jv &program, bool skip_kv = false
     for (auto &b : tbl.arr) alloc(b.at("name").str, (size_t) b.at("bytes").as_i());
 }
 
-static void gpu_alloc_mailboxes(GpuCtx &c, int n_sites) {
+// u_max widens each site's payload slot to MBOX_PAYLOAD_ELEMS * u_max: a
+// prefill U-tile's OP_XCHG_PUSH lands U dense per-token slices per site
+// (xchg.cuh, inbox packed at t*n_elems). One seqno per site either way.
+static void gpu_alloc_mailboxes(GpuCtx &c, int n_sites, int64_t u_max = 1) {
     CUDA_CHECK(cudaSetDevice(c.device));
-    CUDA_CHECK(cudaMalloc(&c.mbox_payload, (size_t) n_sites * MBOX_PAYLOAD_ELEMS * 4));
-    CUDA_CHECK(cudaMemset(c.mbox_payload, 0, (size_t) n_sites * MBOX_PAYLOAD_ELEMS * 4));
+    const size_t slot = (size_t) MBOX_PAYLOAD_ELEMS * (size_t) u_max;
+    CUDA_CHECK(cudaMalloc(&c.mbox_payload, (size_t) n_sites * slot * 4));
+    CUDA_CHECK(cudaMemset(c.mbox_payload, 0, (size_t) n_sites * slot * 4));
     CUDA_CHECK(cudaMalloc(&c.mbox_seqno, (size_t) n_sites * MBOX_SEQNO_STRIDE * 4));
     CUDA_CHECK(cudaMemset(c.mbox_seqno, 0, (size_t) n_sites * MBOX_SEQNO_STRIDE * 4));
 }
 
 // Wire the packer's mailbox table: my inbox (peer writes here), and the peer's
 // inbox (I push/publish there). Peer access is enabled both ways beforehand.
-static void gpu_wire_mailboxes(GpuCtx &c, GpuCtx &peer, int n_sites) {
+// u_max must match gpu_alloc_mailboxes (per-site payload slot stride).
+static void gpu_wire_mailboxes(GpuCtx &c, GpuCtx &peer, int n_sites, int64_t u_max = 1) {
+    const size_t slot = (size_t) MBOX_PAYLOAD_ELEMS * (size_t) u_max;
     for (int s = 0; s < n_sites; s++) {
         std::string ss = std::to_string(s);
-        c.mtab["my_payload:" + ss]   = c.mbox_payload + (size_t) s * MBOX_PAYLOAD_ELEMS;
+        c.mtab["my_payload:" + ss]   = c.mbox_payload + (size_t) s * slot;
         c.mtab["my_seqno:" + ss]     = c.mbox_seqno + (size_t) s * MBOX_SEQNO_STRIDE;
-        c.mtab["peer_payload:" + ss] = peer.mbox_payload + (size_t) s * MBOX_PAYLOAD_ELEMS;
+        c.mtab["peer_payload:" + ss] = peer.mbox_payload + (size_t) s * slot;
         c.mtab["peer_seqno:" + ss]   = peer.mbox_seqno + (size_t) s * MBOX_SEQNO_STRIDE;
     }
 }
@@ -1891,9 +1897,9 @@ static void dual_setup(GpuCtx g2[2], gguf::File &gg, const Jv &program, int64_t 
     }
     printf("dual: %d cross-GPU reduce sites/pass; uploading sliced weights...\n", n_sites);
     for (int g = 0; g < 2; g++) gpu_upload_weights(g2[g], gg);
-    for (int g = 0; g < 2; g++) gpu_alloc_mailboxes(g2[g], n_sites);
-    gpu_wire_mailboxes(g2[0], g2[1], n_sites);
-    gpu_wire_mailboxes(g2[1], g2[0], n_sites);
+    for (int g = 0; g < 2; g++) gpu_alloc_mailboxes(g2[g], n_sites, u_max);
+    gpu_wire_mailboxes(g2[0], g2[1], n_sites, u_max);
+    gpu_wire_mailboxes(g2[1], g2[0], n_sites, u_max);
 
     // Phase 1 (BEFORE the ncu range): init, allocate, pack, upload the program, and set
     // the dynamic-smem opt-in on each device. Everything but the launch. The smem opt-in
@@ -2325,8 +2331,16 @@ static int64_t program_prefill_u(const Jv &program) {
 // every U=1 check and fails only there).
 static int prefill_parity_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
                               int64_t n_vocab, int64_t U) {
-    static const int32_t PROMPT[] = { 11, 500, 1000, 1500, 2000, 2500, 3000, 3500 };
-    const int64_t P = (int64_t)(sizeof PROMPT / sizeof PROMPT[0]);
+    // 128 tokens so the GATE config (U=128, one full tile) binds bit-exactly
+    // against 128 per-token decode passes, not a shallow stand-in (drift
+    // tripwire: shallow-as-deep). The first 8 ids are the original scaffold
+    // prompt (capture/prefill-parity-u1.txt continuity); the tail walks odd
+    // ids so no two tokens repeat and a row-swap cannot alias.
+    static int32_t PROMPT[128];
+    PROMPT[0] = 11;
+    for (int i = 1; i < 8; i++) PROMPT[i] = 500 * i;
+    for (int i = 8; i < 128; i++) PROMPT[i] = 4001 + 2 * i;
+    const int64_t P = 128;
     if (U < 1 || U > P)
         throw std::runtime_error("--prefill-parity: U must be in 1.." + std::to_string(P));
     if (U > 1 && program_prefill_u(program) < U)
