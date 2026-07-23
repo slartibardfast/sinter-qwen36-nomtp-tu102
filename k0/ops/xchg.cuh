@@ -1,9 +1,7 @@
-// Cross-GPU exchange ops (the Y06 mirrored fp32 allreduce). DUAL-GPU PREP —
-// authored against core/EXCHANGE-DESIGN.md; NOT yet wired into
-// k0/ops/registry.cuh or the build. It is wired + litmus-validated + packed
-// when the dual-GPU harness lands (roadmap step 2); until then it is a
-// standalone header that compiles but is never dispatched, so it cannot
-// disturb the single-GPU bring-up.
+// Cross-GPU exchange ops (the Y06 mirrored fp32 allreduce). LIVE: wired in
+// k0/ops/registry.cuh and dispatched at every --split contract-GEMV site
+// (128 sites/pass in the dual-GPU program); originally authored as dual-GPU
+// prep against core/EXCHANGE-DESIGN.md, and litmus-validated before wiring.
 //
 // Replaces the fork's pinned-host PCIe AllReduce (the ggml_cuda_ar_kernel
 // census op; call/0021's one declared divergence) with an NVLink peer
@@ -48,9 +46,9 @@ struct XchgPushArgs {
     // membar/seqno pair for the whole tile. local_partial advances by
     // lp_tstride (its buffer's per-token slot); the inbox payload is packed
     // dense at t*n_elems (the mailbox is sized n_elems*U). Decode packs 1.
-    int n_tokens;
+    int n_tokens = 1;
     int lp_tstride;
-    const unsigned *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const unsigned *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(XchgPushArgs) <= sizeof(((Instr *)0)->payload),
               "XchgPushArgs exceeds Instr payload");
@@ -64,9 +62,9 @@ struct XchgReduceArgs {
     int n_elems;
     unsigned seqno;             // monotonic per site per pass (wrap-safe)
     int gpu_index;              // 0 or 1 — selects the fixed fold order
-    int n_tokens;               // U-loop: as XchgPushArgs; one seqno per site
+    int n_tokens = 1;               // U-loop: as XchgPushArgs; one seqno per site
     int lp_tstride;             // local_partial AND out per-token slot
-    const unsigned *ntok_cell;
+    const unsigned *ntok_cell = nullptr;
 };
 static_assert(sizeof(XchgReduceArgs) <= sizeof(((Instr *)0)->payload),
               "XchgReduceArgs exceeds Instr payload");

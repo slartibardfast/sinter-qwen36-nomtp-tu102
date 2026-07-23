@@ -141,10 +141,10 @@ struct QkNormRopeArgs {
     uint32_t       src_stride; // f32 elems between heads: 512 (q) / 256 (k)
     // U-loop (meta.prefill): token t reads pos + 4*t (the i32[4*U] cell),
     // src/dst advance by their buffers' per-token slots. Decode packs 1.
-    uint32_t       n_tokens;
+    uint32_t       n_tokens = 1;
     uint32_t       src_tstride;
     uint32_t       dst_tstride;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(QkNormRopeArgs) <= 112, "payload overflow");
 
@@ -298,9 +298,9 @@ struct KvAppendArgs {
     uint32_t         row_width;// f16 elems per row (local: 512)
     // U-loop (meta.prefill): $kv_row is the BASE row; token t appends at
     // row + t (contiguous fresh slots) from src + t*src_tstride. Decode: 1.
-    uint32_t         n_tokens;
+    uint32_t         n_tokens = 1;
     uint32_t         src_tstride;
-    const uint32_t  *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t  *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(KvAppendArgs) <= 112, "payload overflow");
 
@@ -386,10 +386,10 @@ struct FattnDecodeArgs {
     // t*partial_tstride; each column's online-softmax fold is independent
     // and identical to the M=1 decode fold. The wrapper builds the per-token
     // view and runs the unchanged one-token body. Decode packs 1.
-    uint32_t        n_tokens;
+    uint32_t        n_tokens = 1;
     uint32_t        q_tstride;
     uint32_t        partial_tstride;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(FattnDecodeArgs) <= 112, "payload overflow");
 
@@ -823,6 +823,13 @@ __device__ MK_OPFN void fattn_decode_one(const Instr &ins, const FattnDecodeArgs
     // contiguous-load path (plan/0143: FATTN reads coalesced; measured ~7% deep,
     // bit-identical). Single-GPU (row_width 1024) overflows the slab -> per-head.
     if ((size_t) MK_FATTN_TILE * (a.row_width + 2) * 2 + (size_t) a.n_q * MK_ATTN_HD * 4 + 64
+#ifdef MK_FATTN_DBUF
+            // dbuf layout additionally keeps q_s (n_q x 256 f32) AND the per-q
+            // (max, sum) pairs resident beside its two half-tiles; admit the
+            // contiguous branch only when the LARGER footprint fits (review
+            // finding: the dual-only formula understated dbuf by ~1032*n_q B).
+            + (size_t) a.n_q * (MK_ATTN_HD * 4 + 8)
+#endif
             <= (size_t) SMEM_BYTES) {
     // ---- contiguous-load variant (plan/0143 primary lever) --------------------
     // One warp = one q head (12 warps = 12 q heads dual-GPU). Full row loaded once
@@ -1095,10 +1102,10 @@ struct FattnReduceArgs {
     unsigned    *error;     // sentinel detections (host-checked; zeroed per pass)
     uint32_t     n_q;
     uint32_t     n_chunks;
-    uint32_t     n_tokens;        // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    uint32_t     n_tokens = 1;        // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     uint32_t     partial_tstride; // per-token slots (buffer table)
     uint32_t     dst_tstride;
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(FattnReduceArgs) <= 112, "payload overflow");
 
@@ -1191,10 +1198,10 @@ struct AttnGateArgs {
     float       *dst;         // [n_q*256] contiguous
     uint32_t     n_q;
     uint32_t     gate_stride; // f32 elems between heads (512)
-    uint32_t     n_tokens;     // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    uint32_t     n_tokens = 1;     // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     uint32_t     attn_tstride; // attn AND dst per-token slot (gated in place)
     uint32_t     gate_tstride; // gate source buffer per-token slot
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(AttnGateArgs) <= 112, "payload overflow");
 

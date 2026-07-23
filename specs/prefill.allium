@@ -65,8 +65,10 @@ external entity ModelState {
     n_past: Integer
 }
 
--- The prefill pass's observable logits: one next-token logits row per
--- batched position under the causal mask.
+-- The prefill pass's observable logits: the FINAL live position's
+-- next-token row only, matching the stock engine's prefill semantics
+-- (logits_all = false: intermediate positions' rows are never emitted)
+-- and the built program's runtime row select (row nt-1, meta.prefill).
 external entity LogitsBlock {
     n_vocab: Integer
 }
@@ -96,7 +98,7 @@ config {
     prefill_ubatch: Integer = 128
 
     -- Final prefill-logits comparison vs the stock engine's fp32
-    -- reference, per batched position (KL divergence over the vocab).
+    -- reference, on the final emitted row (KL divergence over the vocab).
     -- SAME class as the decode-side logits gate (playbook
     -- logits_kl_tol = 0.02, calibrated 2026-07-11 against the
     -- legitimate-reordering envelope). FA-causal reorders the softmax
@@ -157,7 +159,8 @@ contract PrefillLogitsParity {
     invoke: (cfg: PrefillConfiguration, state: ModelState, batch: PrefillBatch) -> LogitsBlock
 
     @invariant LogitsKLBound
-        -- For every batched position under the causal mask,
+        -- For the FINAL live position's emitted logits row (the only row
+        -- either engine emits at prefill, stock logits_all = false),
         -- KL(prefill_logits || stock_fp32_ref_logits) <=
         -- config.prefill_logits_kl_tol. The stock reference is
         -- StockEngine at its recorded build_commit on identical weights,

@@ -123,9 +123,9 @@ struct ConvShiftConcatArgs {
     // window); the commit takes the window's LAST GDN_DCONV-1 entries. xnew
     // column t is at xnew + t*xnew_tstride (the producer buffer's per-token
     // slot). Decode packs n_tokens=1: window width 4, commit h1,h2,x.
-    int32_t        n_tokens;
+    int32_t        n_tokens = 1;
     int32_t        xnew_tstride;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(ConvShiftConcatArgs) <= sizeof(Instr::payload), "payload");
 
@@ -192,9 +192,9 @@ struct SsmConvSiluArgs {
     // tap-contiguous per channel; token t's conv reads window entries t..t+3
     // (the sliding causal window) and writes dst + t*dst_tstride. The tap fold
     // order is the decode sequential order either way. Decode packs 1.
-    int32_t      n_tokens;
+    int32_t      n_tokens = 1;
     int32_t      dst_tstride;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(SsmConvSiluArgs) <= sizeof(Instr::payload), "payload");
 
@@ -261,10 +261,10 @@ struct QkL2NormArgs {
     float       *dst;
     int32_t      n_heads;
     float        eps;      // 1e-6
-    int32_t      n_tokens;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    int32_t      n_tokens = 1;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     int32_t      src_tstride; // per-token slot of src's buffer, f32 elements
     int32_t      dst_tstride; // per-token slot of dst's buffer, f32 elements
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(QkL2NormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -342,9 +342,9 @@ struct GdnGatesArgs {
     float       *g;          // out: per-head decay, already exp'd
     float       *beta;       // out: per-head mixing coeff
     int32_t      n_heads;
-    int32_t      n_tokens;   // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    int32_t      n_tokens = 1;   // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     int32_t      tstride;    // per-token slot (gdn_alpha/gdn_beta), f32 elements
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(GdnGatesArgs) <= sizeof(Instr::payload), "payload");
 
@@ -410,10 +410,10 @@ struct GdnStepArgs {
     // ONCE; identical values to U per-token passes (the load/store roundtrip
     // is an exact fp32 copy). q/k/v advance by qkv_tstride per token, g/beta
     // by n_heads (their per-token slot), attn_out by out_tstride. Decode: 1.
-    int32_t      n_tokens;
+    int32_t      n_tokens = 1;
     int32_t      qkv_tstride;
     int32_t      out_tstride;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(GdnStepArgs) <= sizeof(Instr::payload), "payload");
 
@@ -573,11 +573,11 @@ struct GatedRmsNormArgs {
     float       *dst;    // (GDN_SV, n_heads)
     int32_t      n_heads;
     float        eps;    // 1e-6
-    int32_t      n_tokens;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    int32_t      n_tokens = 1;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     int32_t      x_tstride;   // per-token slots (buffer table), f32 elements
     int32_t      z_tstride;
     int32_t      dst_tstride;
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(GatedRmsNormArgs) <= sizeof(Instr::payload), "payload");
 

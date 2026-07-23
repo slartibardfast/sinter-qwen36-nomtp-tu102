@@ -57,8 +57,8 @@ struct RmsnormArgs {
     // n_tokens is the CAPACITY (buffer slots); the live loop bound is
     // min(n_tokens, *ntok_cell), the host-written per-pass tile width (the
     // n_kv-cell pattern): a 1-token pass through a U=128 program runs 1.
-    uint32_t n_tokens;
-    const uint32_t *ntok_cell;
+    uint32_t n_tokens = 1;
+    const uint32_t *ntok_cell = nullptr;
     // Epilogue row select: the single-row norm of the LAST LIVE token. The
     // selected row is (nt-1), a RUNTIME value: a pack-time literal cannot know
     // the live width (a per-token reference pass or a remainder tile runs
@@ -285,8 +285,8 @@ struct ResidualAddArgs {
     const float *b; // mutable -> strong reads
     float *y;
     uint32_t n;
-    uint32_t n_tokens; // U-loop capacity; live bound min(n_tokens, *ntok_cell)
-    const uint32_t *ntok_cell;
+    uint32_t n_tokens = 1; // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(ResidualAddArgs) <= sizeof(Instr::payload), "payload");
 
@@ -350,8 +350,8 @@ struct EmbedLookupArgs {
     float *y;             // f32 out row(s) [n_tokens x ncols]
     uint32_t ncols;       // 5120
     uint32_t row_stride;  // elements between consecutive rows (5120)
-    uint32_t n_tokens;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
-    const uint32_t *ntok_cell;
+    uint32_t n_tokens = 1;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(EmbedLookupArgs) <= sizeof(Instr::payload), "payload");
 

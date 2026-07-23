@@ -24,6 +24,14 @@ CASES=(
     "WarpSpecHandoff  WarpSpecHandoff_overlap      pass"
     "WarpSpecHandoff  WarpSpecHandoff_no_fence     fail"
     "WarpSpecHandoff  WarpSpecHandoff_no_warguard  fail"
+    "PipeOverlap      PipeOverlap_acquire          pass"
+    "PipeOverlap      PipeOverlap_plain_reads      fail"
+    "PipeOverlap      PipeOverlap_no_release       fail"
+    "XchgVisibility   XchgVisibility_ordered       pass"
+    "XchgVisibility   XchgVisibility_unordered_push fail"
+    "XchgVisibility   XchgVisibility_plain_consume fail"
+    "HandoverCarry    HandoverCarry_barrier        pass"
+    "HandoverCarry    HandoverCarry_no_barrier     fail"
 )
 
 rc=0

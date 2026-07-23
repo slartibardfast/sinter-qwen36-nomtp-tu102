@@ -81,8 +81,8 @@ struct QuantQ8_1Args {
     // U-loop (meta.prefill): x advances by ne00, y by (ne0_padded/32)*36 B per
     // token (dense per width; every scheduled width is a 512 multiple, so the
     // consumer MMVQ derives the same block stride from its ncols). Decode: 1.
-    uint32_t n_tokens;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    uint32_t n_tokens = 1;
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(QuantQ8_1Args) <= 112, "payload overflow");
 
@@ -103,9 +103,9 @@ struct MmvqQ40Args {
     // destination buffer's per-token slot, packed from the buffer table -- not
     // derivable from the row range when dst_off offsets into a wider vector).
     // Weights are token-invariant. Decode packs n_tokens=1.
-    uint32_t n_tokens;
+    uint32_t n_tokens = 1;
     uint32_t dst_tstride;
-    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell = nullptr; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(MmvqQ40Args) <= 112, "payload overflow");
 
@@ -120,9 +120,9 @@ struct MmvqQ40FusedArgs {
     uint32_t ncols;
     uint32_t row_lo;
     uint32_t row_hi;
-    uint32_t n_tokens;    // U-loop strides as MmvqQ40Args
+    uint32_t n_tokens = 1;    // U-loop strides as MmvqQ40Args
     uint32_t dst_tstride;
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(MmvqQ40FusedArgs) <= 112, "payload overflow");
 
@@ -136,9 +136,9 @@ struct MmvqAr16Args {
     uint32_t ncols;
     uint32_t row_lo;
     uint32_t row_hi;
-    uint32_t n_tokens;    // U-loop: y advances (ncols/32) q8_1 blocks per token
+    uint32_t n_tokens = 1;    // U-loop: y advances (ncols/32) q8_1 blocks per token
     uint32_t dst_tstride; // dst per-token slot (buffer table), f32 elements
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(MmvqAr16Args) <= 112, "payload overflow");
 
@@ -151,9 +151,9 @@ struct GemvF16Args {
     uint32_t ncols;
     uint32_t row_lo;
     uint32_t row_hi;
-    uint32_t n_tokens;    // U-loop: x advances by ncols per token
+    uint32_t n_tokens = 1;    // U-loop: x advances by ncols per token
     uint32_t dst_tstride; // dst per-token slot (buffer table), f32 elements
-    const uint32_t *ntok_cell;
+    const uint32_t *ntok_cell = nullptr;
 };
 static_assert(sizeof(GemvF16Args) <= 112, "payload overflow");
 

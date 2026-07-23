@@ -1084,11 +1084,15 @@ if PREFILL is not None:
                    "columns (sliding window); gdn_state (sequential "
                    "recurrence carry) and logits (post-row-select, last "
                    "token only) are unscaled",
-        "cells": "token i32[U]; positions i32[4*U] (M-RoPE, 4 per token); "
+        "cells": "n_tok u32[1]: the LIVE tile width, host-written per pass; "
+                 "every op's loop bound is min(payload n_tokens CAPACITY, "
+                 "*n_tok) (the n_kv-cell pattern), so a pass narrower than U "
+                 "(a per-token reference pass, a remainder tile) runs exactly "
+                 "its own width. token i32[U]; positions i32[4*U] (M-RoPE, 4 per token); "
                  "mask_f16 f16[n_kv*U] (2-D causal, one row per query "
                  "token); $kv_row is the base cache row, token t appends at "
                  "$kv_row + t (contiguous fresh slots)",
-        "epilogue": "row_select is the literal U-1 (the last prompt token); "
+        "epilogue": "row select is RUNTIME row nt-1 from the n_tok cell (the pack-time literal was retired: it normed an unwritten row on any pass narrower than capacity); "
                     "$out_row is not referenced",
         "accounting_note": "meta.per_pass.dram_bytes is the decode per-token "
                            "derivation; prefill traffic differs (weights "
