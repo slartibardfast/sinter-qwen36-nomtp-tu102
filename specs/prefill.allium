@@ -92,9 +92,11 @@ enum LayerClass { attention_kv | deltanet_recurrent }
 
 config {
     -- The fixed prefill micro-batch every batched-prefill instantiation
-    -- binds. 128 is the DeltaNet kernel's native chunk and the crossover
-    -- point (U ~ 100-130) where per-chunk compute reaches the fixed
-    -- per-chunk DRAM read at n_ctx 262144 (playbook ResidentProgram.ubatch).
+    -- binds. 128 is the DeltaNet kernel's native chunk and the PROJECTED
+    -- crossover point (U ~ 100-130) where per-chunk compute reaches the
+    -- fixed per-chunk DRAM read at n_ctx 262144 (playbook
+    -- ResidentProgram.ubatch). The crossover is calx-mill REFUSED until a
+    -- measured prefill anchor exists: projection-only, not established.
     prefill_ubatch: Integer = 128
 
     -- Final prefill-logits comparison vs the stock engine's fp32
