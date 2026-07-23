@@ -30,6 +30,7 @@ CASES=(
     "XchgVisibility   XchgVisibility_ordered       pass"
     "XchgVisibility   XchgVisibility_unordered_push fail"
     "XchgVisibility   XchgVisibility_plain_consume fail"
+    "XchgVisibility   XchgVisibility_width_mismatch fail"
     "HandoverCarry    HandoverCarry_barrier        pass"
     "HandoverCarry    HandoverCarry_no_barrier     fail"
 )

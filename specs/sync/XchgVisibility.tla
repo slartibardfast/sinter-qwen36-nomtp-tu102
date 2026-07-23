@@ -35,10 +35,16 @@ EXTENDS Naturals
 
 CONSTANTS
     PushFenced,    \* membar.sys after the peer payload stores, before the seqno release (E1)
-    StrongConsume  \* the peer reads the received payload with .cg / ld_cg, not a plain LDG (E2)
+    StrongConsume, \* the peer reads the received payload with .cg / ld_cg, not a plain LDG (E2)
+    PushWidth,     \* per-token slices the pusher lands this pass (E3; 1 = decode)
+    FoldWidth      \* per-token slices the reducer folds this pass (E3)
 
 ASSUME PushFenced \in BOOLEAN
 ASSUME StrongConsume \in BOOLEAN
+ASSUME PushWidth \in 1..2
+ASSUME FoldWidth \in 1..2
+
+Slices == 1..2                   \* the mailbox slot's slice capacity (2 = any U>1)
 
 STALE == 0                       \* the peer inbox's previous-pass payload
 FRESH == 1                       \* this pass's pushed slice
@@ -56,17 +62,17 @@ VARIABLES
 vars == <<gPayload, gSeqno, cPayload, pushStored, done, taken>>
 
 Init ==
-    /\ gPayload = STALE
+    /\ gPayload = [s \in Slices |-> STALE]
     /\ gSeqno = NOSEQ
-    /\ cPayload = STALE           \* the peer's L1 holds the previous pass's line
+    /\ cPayload = [s \in Slices |-> STALE]  \* the peer's L1 holds last pass's lines
     /\ pushStored = FALSE
     /\ done = FALSE
-    /\ taken = STALE
+    /\ taken = [s \in Slices |-> STALE]
 
 (* op_xchg_push: the mover float4-stores this GPU's slice into the peer inbox. *)
 PushStore ==
     /\ ~pushStored
-    /\ gPayload' = FRESH
+    /\ gPayload' = [s \in Slices |-> IF s <= PushWidth THEN FRESH ELSE gPayload[s]]
     /\ pushStored' = TRUE
     /\ UNCHANGED <<gSeqno, cPayload, done, taken>>
 
@@ -85,7 +91,7 @@ RefreshPayload ==
     /\ cPayload' = gPayload
     /\ UNCHANGED <<gPayload, gSeqno, pushStored, done, taken>>
 
-ReadPayload == IF StrongConsume THEN gPayload ELSE cPayload
+ReadPayload(s) == IF StrongConsume THEN gPayload[s] ELSE cPayload[s]
 
 (* op_xchg_reduce consume: poll the local seqno (ld.acquire.sys) and, on a     *)
 (* hit, read the received payload and fold. A .cg read fetches VRAM; a plain   *)
@@ -93,7 +99,7 @@ ReadPayload == IF StrongConsume THEN gPayload ELSE cPayload
 Consume ==
     /\ ~done
     /\ gSeqno = SEQ
-    /\ taken' = ReadPayload
+    /\ taken' = [s \in Slices |-> IF s <= FoldWidth THEN ReadPayload(s) ELSE taken[s]]
     /\ done' = TRUE
     /\ UNCHANGED <<gPayload, gSeqno, cPayload, pushStored>>
 
@@ -109,15 +115,16 @@ Spec ==
     /\ WF_vars(PushStore) /\ WF_vars(SeqnoRelease) /\ WF_vars(Consume)
 
 TypeOK ==
-    /\ gPayload \in {STALE, FRESH} /\ cPayload \in {STALE, FRESH}
+    /\ gPayload \in [Slices -> {STALE, FRESH}]
+    /\ cPayload \in [Slices -> {STALE, FRESH}]
     /\ gSeqno \in {NOSEQ, SEQ}
     /\ pushStored \in BOOLEAN /\ done \in BOOLEAN
-    /\ taken \in {STALE, FRESH}
+    /\ taken \in [Slices -> {STALE, FRESH}]
 
 (* The load-bearing safety obligation: when the peer folds, it read THIS       *)
 (* pass's pushed slice -- never a payload still in flight (E1) and never a      *)
 (* stale L1 line (E2). Folding a stale slice corrupts the mirrored allreduce.  *)
-NoStaleConsume == done => taken = FRESH
+NoStaleConsume == done => \A s \in 1..FoldWidth : taken[s] = FRESH
 
 (* The peer eventually folds: the exchange completes. *)
 Progress == <>done
