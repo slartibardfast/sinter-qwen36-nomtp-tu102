@@ -232,9 +232,8 @@ static __device__ __forceinline__ WarpSlice warp_slice(const Instr &I) {
 // Fold order: amax and sum are butterfly __shfl_xor reduces over the 32
 // lanes, identical to the fork's warp_reduce_max/sum<32>.
 // smem: 0 bytes.
-static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
+static __device__ __noinline__ void op_quant_q8_1_utile(const Instr &I, const QuantQ8_1Args &a, char *smem) {
     (void)smem;
-    const QuantQ8_1Args &a = *reinterpret_cast<const QuantQ8_1Args *>(I.payload);
     const WarpSlice ws = warp_slice(I);
     const uint32_t nblk = a.ne0_padded / 32u;
 
@@ -260,6 +259,34 @@ static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
         if (ws.lane == 0)
             *reinterpret_cast<half2 *>(blk) = __floats2half2_rn(d, sum);
     }
+    }
+}
+
+static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
+    (void)smem;
+    const QuantQ8_1Args &a = *reinterpret_cast<const QuantQ8_1Args *>(I.payload);
+    if (a.n_tokens != 1) { op_quant_q8_1_utile(I, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const WarpSlice ws = warp_slice(I);
+    const uint32_t nblk = a.ne0_padded / 32u;
+
+    for (uint32_t b = (uint32_t)ws.gw; b < nblk; b += (uint32_t)ws.nwarps) {
+        const uint32_t i = b * 32u + (uint32_t)ws.lane;
+        const float xi = i < a.ne00 ? ld_cg(a.x + i) : 0.0f;
+        float amax = fabsf(xi);
+        float sum  = xi;
+#pragma unroll
+        for (int off = 16; off; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off, 32));
+            sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off, 32);
+        }
+        const float d = amax / 127.0f;
+        const int   q = amax == 0.0f ? 0 : (int)roundf(xi / d);
+
+        int8_t *blk = reinterpret_cast<int8_t *>(a.y) + (size_t)b * 36u;
+        blk[4 + ws.lane] = (int8_t)q;
+        if (ws.lane == 0)
+            *reinterpret_cast<half2 *>(blk) = __floats2half2_rn(d, sum);
     }
 }
 
@@ -329,8 +356,7 @@ static __device__ __forceinline__ float mmvq_q40_row(
 }
 
 // OP_MMVQ_Q4_0. smem: (ncols/32)*36 B staged q8_1.
-static __device__ MK_OPFN void op_mmvq_q4_0(const Instr &I, char *smem) {
-    const MmvqQ40Args &a = *reinterpret_cast<const MmvqQ40Args *>(I.payload);
+static __device__ __noinline__ void op_mmvq_q4_0_utile(const Instr &I, const MmvqQ40Args &a, char *smem) {
     const int nblk = (int)(a.ncols / 32u);
     const int npair = nblk / 2;
     const int npair_full = npair & ~31;
@@ -352,12 +378,31 @@ static __device__ MK_OPFN void op_mmvq_q4_0(const Instr &I, char *smem) {
     }
 }
 
+static __device__ MK_OPFN void op_mmvq_q4_0(const Instr &I, char *smem) {
+    const MmvqQ40Args &a = *reinterpret_cast<const MmvqQ40Args *>(I.payload);
+    if (a.n_tokens != 1) { op_mmvq_q4_0_utile(I, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nblk = (int)(a.ncols / 32u);
+    const int npair = nblk / 2;
+    const int npair_full = npair & ~31;
+    uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
+    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y), (uint32_t)nblk * 9u);
+
+    const WarpSlice ws = warp_slice(I);
+    const size_t row_words = (size_t)npair * 9u;   // 18 B/block as u32
+    for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
+        const uint32_t *w_row = reinterpret_cast<const uint32_t *>(a.w) + (size_t)r * row_words;
+        const float acc = warp_sum(mmvq_q40_row(w_row, ys, npair, npair_full, nblk, ws.lane));
+        if (ws.lane == 0) a.dst[r] = acc;
+    }
+    __syncthreads();   // slab handoff: no warp may still read ys after return
+}
+
 // OP_MMVQ_Q4_0_FUSED. Two sequential row dots (up then gate) over the one
 // staged y, then the SwiGLU epilogue dst[r] = up * silu(gate)
 // (mmvq.cu:572-575). Fold order per stream identical to OP_MMVQ_Q4_0.
 // smem: (ncols/32)*36 B.
-static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
-    const MmvqQ40FusedArgs &a = *reinterpret_cast<const MmvqQ40FusedArgs *>(I.payload);
+static __device__ __noinline__ void op_mmvq_q4_0_fused_utile(const Instr &I, const MmvqQ40FusedArgs &a, char *smem) {
     const int nblk = (int)(a.ncols / 32u);
     const int npair = nblk / 2;
     const int npair_full = npair & ~31;
@@ -381,6 +426,30 @@ static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
     }
     __syncthreads();
     }
+}
+
+static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
+    const MmvqQ40FusedArgs &a = *reinterpret_cast<const MmvqQ40FusedArgs *>(I.payload);
+    if (a.n_tokens != 1) { op_mmvq_q4_0_fused_utile(I, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nblk = (int)(a.ncols / 32u);
+    const int npair = nblk / 2;
+    const int npair_full = npair & ~31;
+    uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
+    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y), (uint32_t)nblk * 9u);
+
+    const WarpSlice ws = warp_slice(I);
+    const size_t row_words = (size_t)npair * 9u;
+    for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
+        const uint32_t *up_row =
+            reinterpret_cast<const uint32_t *>(a.w_up) + (size_t)r * row_words;
+        const uint32_t *gate_row =
+            reinterpret_cast<const uint32_t *>(a.w_gate) + (size_t)r * row_words;
+        const float up   = warp_sum(mmvq_q40_row(up_row,   ys, npair, npair_full, nblk, ws.lane));
+        const float gate = warp_sum(mmvq_q40_row(gate_row, ys, npair, npair_full, nblk, ws.lane));
+        if (ws.lane == 0) a.dst[r] = __fmul_rn(up, mk_silu(gate));
+    }
+    __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
@@ -448,8 +517,7 @@ static __device__ __forceinline__ float mmvq_ar16_row(
 }
 
 // smem: (ncols/32)*36 B staged q8_1.
-static __device__ MK_OPFN void op_mmvq_ar16(const Instr &I, char *smem) {
-    const MmvqAr16Args &a = *reinterpret_cast<const MmvqAr16Args *>(I.payload);
+static __device__ __noinline__ void op_mmvq_ar16_utile(const Instr &I, const MmvqAr16Args &a, char *smem) {
     const int nblk = (int)(a.ncols / 16u);
     const int npair = nblk / 2;
     const int npair_full = npair & ~31;
@@ -470,6 +538,26 @@ static __device__ MK_OPFN void op_mmvq_ar16(const Instr &I, char *smem) {
     }
     __syncthreads();
     }
+}
+
+static __device__ MK_OPFN void op_mmvq_ar16(const Instr &I, char *smem) {
+    const MmvqAr16Args &a = *reinterpret_cast<const MmvqAr16Args *>(I.payload);
+    if (a.n_tokens != 1) { op_mmvq_ar16_utile(I, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nblk = (int)(a.ncols / 16u);
+    const int npair = nblk / 2;
+    const int npair_full = npair & ~31;
+    uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
+    stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y), (uint32_t)(a.ncols / 32u) * 9u);
+
+    const WarpSlice ws = warp_slice(I);
+    const size_t row_words = (size_t)npair * 5u;   // 10 B/block as u32
+    for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
+        const uint32_t *w_row = reinterpret_cast<const uint32_t *>(a.w) + (size_t)r * row_words;
+        const float acc = warp_sum(mmvq_ar16_row(w_row, ys, npair, npair_full, nblk, ws.lane));
+        if (ws.lane == 0) a.dst[r] = acc;
+    }
+    __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
@@ -504,8 +592,7 @@ static __device__ __forceinline__ float gemv_f16_row(
     return acc;
 }
 
-static __device__ __forceinline__ void gemv_f16_common(const Instr &I, char *smem) {
-    const GemvF16Args &a = *reinterpret_cast<const GemvF16Args *>(I.payload);
+static __device__ __noinline__ void gemv_f16_common_utile(const Instr &I, const GemvF16Args &a, char *smem) {
     float *xs = reinterpret_cast<float *>(smem);
     const WarpSlice ws = warp_slice(I);
     const int ngrp = (int)(a.ncols / 8u);
@@ -525,6 +612,26 @@ static __device__ __forceinline__ void gemv_f16_common(const Instr &I, char *sme
     }
     __syncthreads();
     }
+}
+
+static __device__ __forceinline__ void gemv_f16_common(const Instr &I, char *smem) {
+    const GemvF16Args &a = *reinterpret_cast<const GemvF16Args *>(I.payload);
+    if (a.n_tokens != 1) { gemv_f16_common_utile(I, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    float *xs = reinterpret_cast<float *>(smem);
+    stage_words_cg(reinterpret_cast<uint32_t *>(xs),
+                   reinterpret_cast<const uint32_t *>(a.x), a.ncols);
+
+    const WarpSlice ws = warp_slice(I);
+    const int ngrp = (int)(a.ncols / 8u);
+    for (uint32_t r = a.row_lo + (uint32_t)ws.gw; r < a.row_hi; r += (uint32_t)ws.nwarps) {
+        const uint4 *w_row =
+            reinterpret_cast<const uint4 *>(a.w + (size_t)r * a.ncols);
+        const float acc = warp_sum(
+            gemv_f16_row(w_row, reinterpret_cast<const float4 *>(xs), ngrp, ws.lane));
+        if (ws.lane == 0) a.dst[r] = acc;
+    }
+    __syncthreads();
 }
 
 // smem: ncols*4 B staged x.

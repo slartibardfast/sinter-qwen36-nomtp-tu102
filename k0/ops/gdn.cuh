@@ -129,9 +129,8 @@ struct ConvShiftConcatArgs {
 };
 static_assert(sizeof(ConvShiftConcatArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_conv_shift_concat(const Instr &ins, char *smem) {
+static __device__ __noinline__ void op_conv_shift_concat_utile(const Instr &ins, const ConvShiftConcatArgs &a, char *smem) {
     (void) smem;
-    const ConvShiftConcatArgs &a = *reinterpret_cast<const ConvShiftConcatArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
     const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
     float *commit = a.state + ld_cg_s64(a.row) * a.row_stride;
@@ -158,6 +157,26 @@ __device__ MK_OPFN void op_conv_shift_concat(const Instr &ins, char *smem) {
     }
 }
 
+__device__ MK_OPFN void op_conv_shift_concat(const Instr &ins, char *smem) {
+    (void) smem;
+    const ConvShiftConcatArgs &a = *reinterpret_cast<const ConvShiftConcatArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_conv_shift_concat_utile(ins, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
+    const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    float *commit = a.state + ld_cg_s64(a.row) * a.row_stride;
+    for (int c = tid; c < a.channels; c += nthreads) {
+        const float h0 = ld_cg(a.hist + c * (GDN_DCONV - 1) + 0);
+        const float h1 = ld_cg(a.hist + c * (GDN_DCONV - 1) + 1);
+        const float h2 = ld_cg(a.hist + c * (GDN_DCONV - 1) + 2);
+        const float x  = ld_cg(a.xnew + c);
+        float *w = a.win + c * GDN_DCONV;
+        w[0] = h0; w[1] = h1; w[2] = h2; w[3] = x;
+        float *s = commit + c * (GDN_DCONV - 1);
+        s[0] = h1; s[1] = h2; s[2] = x;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OP_SSM_CONV_SILU: y[c] = silu(sum_{j=0..3} win[c][j] * w[c][j]), the
 // sequential tap order of ssm_conv_f32<1,128,4> (ssm-conv.cu:33-50) at
@@ -179,9 +198,8 @@ struct SsmConvSiluArgs {
 };
 static_assert(sizeof(SsmConvSiluArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_ssm_conv_silu(const Instr &ins, char *smem) {
+static __device__ __noinline__ void op_ssm_conv_silu_utile(const Instr &ins, const SsmConvSiluArgs &a, char *smem) {
     (void) smem;
-    const SsmConvSiluArgs &a = *reinterpret_cast<const SsmConvSiluArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
     const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
     if (a.n_tokens == 1) { // decode fast path: one float4 window load/channel
@@ -213,6 +231,25 @@ __device__ MK_OPFN void op_ssm_conv_silu(const Instr &ins, char *smem) {
     }
 }
 
+__device__ MK_OPFN void op_ssm_conv_silu(const Instr &ins, char *smem) {
+    (void) smem;
+    const SsmConvSiluArgs &a = *reinterpret_cast<const SsmConvSiluArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_ssm_conv_silu_utile(ins, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
+    const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    for (int c = tid; c < a.channels; c += nthreads) {
+        const float4 x = ld_cg(reinterpret_cast<const float4 *>(a.win) + c);
+        const float4 w = reinterpret_cast<const float4 *>(a.weight)[c];
+        float sum = 0.0f;
+        sum = __fadd_rn(sum, __fmul_rn(x.x, w.x));
+        sum = __fadd_rn(sum, __fmul_rn(x.y, w.y));
+        sum = __fadd_rn(sum, __fmul_rn(x.z, w.z));
+        sum = __fadd_rn(sum, __fmul_rn(x.w, w.w));
+        a.dst[c] = gdn_silu(sum);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OP_QK_L2NORM: per head, dst = src * rsqrtf(max(sum(src^2), eps^2))
 // (l2_norm_f32<32>, norm.cu:239-271, including the eps^2 floor). One warp
@@ -231,9 +268,8 @@ struct QkL2NormArgs {
 };
 static_assert(sizeof(QkL2NormArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_qk_l2norm(const Instr &ins, char *smem) {
+static __device__ __noinline__ void op_qk_l2norm_utile(const Instr &ins, const QkL2NormArgs &a, char *smem) {
     (void) smem;
-    const QkL2NormArgs &a = *reinterpret_cast<const QkL2NormArgs *>(ins.payload);
     constexpr int rows_per_lane = GDN_SV / 32;
     const int warps_per_blk = blockDim.x >> 5;
     const int nwarps = (ins.block_hi - ins.block_lo) * warps_per_blk;
@@ -244,6 +280,35 @@ __device__ MK_OPFN void op_qk_l2norm(const Instr &ins, char *smem) {
     for (int h = wid; h < a.n_heads; h += nwarps) {
         const float *x = a.src + (int64_t) t * a.src_tstride + (int64_t) h * GDN_SV;
         float       *y = a.dst + (int64_t) t * a.dst_tstride + (int64_t) h * GDN_SV;
+        float xr[rows_per_lane];
+        float ss = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            xr[r] = ld_cg(x + r * 32 + lane);
+            ss    = __fadd_rn(ss, __fmul_rn(xr[r], xr[r]));
+        }
+        ss = gdn_warp_tree_sum(ss);
+        const float scale = rsqrtf(fmaxf(ss, a.eps * a.eps));
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            y[r * 32 + lane] = scale * xr[r];
+        }
+    }
+}
+
+__device__ MK_OPFN void op_qk_l2norm(const Instr &ins, char *smem) {
+    (void) smem;
+    const QkL2NormArgs &a = *reinterpret_cast<const QkL2NormArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_qk_l2norm_utile(ins, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    constexpr int rows_per_lane = GDN_SV / 32;
+    const int warps_per_blk = blockDim.x >> 5;
+    const int nwarps = (ins.block_hi - ins.block_lo) * warps_per_blk;
+    const int wid    = (blockIdx.x - ins.block_lo) * warps_per_blk + (threadIdx.x >> 5);
+    const int lane   = threadIdx.x & 31;
+    for (int h = wid; h < a.n_heads; h += nwarps) {
+        const float *x = a.src + (int64_t) h * GDN_SV;
+        float       *y = a.dst + (int64_t) h * GDN_SV;
         float xr[rows_per_lane];
         float ss = 0.0f;
 #pragma unroll
@@ -283,9 +348,8 @@ struct GdnGatesArgs {
 };
 static_assert(sizeof(GdnGatesArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_gdn_gates(const Instr &ins, char *smem) {
+static __device__ __noinline__ void op_gdn_gates_utile(const Instr &ins, const GdnGatesArgs &a, char *smem) {
     (void) smem;
-    const GdnGatesArgs &a = *reinterpret_cast<const GdnGatesArgs *>(ins.payload);
     const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
     const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
     const int nt = (int) mk_live_ntok((unsigned) a.n_tokens, a.ntok_cell);
@@ -297,6 +361,21 @@ __device__ MK_OPFN void op_gdn_gates(const Instr &ins, char *smem) {
         a.g[off + h]    = expf(sp * a.a[h]);
         a.beta[off + h] = 1.0f / (1.0f + expf(-ld_cg(a.beta_raw + off + h)));
     }
+    }
+}
+
+__device__ MK_OPFN void op_gdn_gates(const Instr &ins, char *smem) {
+    (void) smem;
+    const GdnGatesArgs &a = *reinterpret_cast<const GdnGatesArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_gdn_gates_utile(ins, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nthreads = (ins.block_hi - ins.block_lo) * blockDim.x;
+    const int tid      = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    for (int h = tid; h < a.n_heads; h += nthreads) {
+        const float ab = ld_cg(a.alpha_raw + h) + a.dt_bias[h];
+        const float sp = (ab > 20.0f) ? ab : logf(1.0f + expf(ab));
+        a.g[h]    = expf(sp * a.a[h]);
+        a.beta[h] = 1.0f / (1.0f + expf(-ld_cg(a.beta_raw + h)));
     }
 }
 
@@ -338,9 +417,8 @@ struct GdnStepArgs {
 };
 static_assert(sizeof(GdnStepArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_gdn_step(const Instr &ins, char *smem) {
+static __device__ __noinline__ void op_gdn_step_utile(const Instr &ins, const GdnStepArgs &a, char *smem) {
     (void) smem;
-    const GdnStepArgs &a = *reinterpret_cast<const GdnStepArgs *>(ins.payload);
     constexpr int rows_per_lane = GDN_SV / 32;
     const int warps_per_blk = blockDim.x >> 5;
     const int nwarps  = (ins.block_hi - ins.block_lo) * warps_per_blk;
@@ -415,6 +493,72 @@ __device__ MK_OPFN void op_gdn_step(const Instr &ins, char *smem) {
     }
 }
 
+__device__ MK_OPFN void op_gdn_step(const Instr &ins, char *smem) {
+    (void) smem;
+    const GdnStepArgs &a = *reinterpret_cast<const GdnStepArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_gdn_step_utile(ins, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    constexpr int rows_per_lane = GDN_SV / 32;
+    const int warps_per_blk = blockDim.x >> 5;
+    const int nwarps  = (ins.block_hi - ins.block_lo) * warps_per_blk;
+    const int wid     = (blockIdx.x - ins.block_lo) * warps_per_blk + (threadIdx.x >> 5);
+    const int lane    = threadIdx.x & 31;
+    const int n_tasks = a.n_heads * GDN_SV;
+    for (int task = wid; task < n_tasks; task += nwarps) {
+        const int h   = task / GDN_SV;
+        const int col = task - h * GDN_SV;
+        const int hk  = h % a.n_k_heads;
+
+        const float *q_t = a.q + (int64_t) hk * GDN_SV;
+        const float *k_t = a.k + (int64_t) hk * GDN_SV;
+        const float g_val    = ld_cg(a.g + h);
+        const float beta_val = ld_cg(a.beta + h);
+        const float v_col    = ld_cg(a.v + (int64_t) h * GDN_SV + col);
+        const int64_t s_off  = ((int64_t) h * GDN_SV + col) * GDN_SV;
+
+        float s_shard[rows_per_lane];
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * 32 + lane;
+            s_shard[r]  = ld_cg(a.state_in + s_off + i);
+            k_reg[r]    = ld_cg(k_t + i);
+            q_reg[r]    = ld_cg(q_t + i);
+        }
+
+        // 1. kv[col] = sum_i S[i][col] * k[i]: per-lane sequential fp32
+        //    partial over ascending r, then the tree reduce.
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard = __fadd_rn(kv_shard, __fmul_rn(s_shard[r], k_reg[r]));
+        }
+        const float kv_col = gdn_warp_tree_sum(kv_shard);
+
+        // 2. delta[col] = (v[col] - g * kv[col]) * beta
+        const float delta_col = __fmul_rn(__fsub_rn(v_col, __fmul_rn(g_val, kv_col)), beta_val);
+
+        // 3+4. fused state update + output partial, one pass over the rows.
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r]   = __fadd_rn(__fmul_rn(g_val, s_shard[r]), __fmul_rn(k_reg[r], delta_col));
+            attn_partial = __fadd_rn(attn_partial, __fmul_rn(s_shard[r], q_reg[r]));
+        }
+        const float attn_col = gdn_warp_tree_sum(attn_partial);
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            a.state_out[s_off + r * 32 + lane] = s_shard[r];
+        }
+        if (lane == 0) {
+            // 5. output scaled by 1/sqrt(S_v) LAST.
+            a.attn_out[(int64_t) h * GDN_SV + col] = __fmul_rn(attn_col, a.scale);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OP_GATED_RMSNORM: per head, dst = (rsqrtf(sum(x^2)/128 + eps) * x) * w
 // * silu(z) -- the fork's two-op sequence rms_norm_f32<256,1,0> (norm.cu:
@@ -437,9 +581,8 @@ struct GatedRmsNormArgs {
 };
 static_assert(sizeof(GatedRmsNormArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_gated_rmsnorm(const Instr &ins, char *smem) {
+static __device__ __noinline__ void op_gated_rmsnorm_utile(const Instr &ins, const GatedRmsNormArgs &a, char *smem) {
     (void) smem;
-    const GatedRmsNormArgs &a = *reinterpret_cast<const GatedRmsNormArgs *>(ins.payload);
     constexpr int rows_per_lane = GDN_SV / 32;
     const int warps_per_blk = blockDim.x >> 5;
     const int nwarps = (ins.block_hi - ins.block_lo) * warps_per_blk;
@@ -451,6 +594,37 @@ __device__ MK_OPFN void op_gated_rmsnorm(const Instr &ins, char *smem) {
         const float *x = a.x + (int64_t) t * a.x_tstride + (int64_t) h * GDN_SV;
         const float *z = a.z + (int64_t) t * a.z_tstride + (int64_t) h * GDN_SV;
         float       *y = a.dst + (int64_t) t * a.dst_tstride + (int64_t) h * GDN_SV;
+        float xr[rows_per_lane];
+        float ss = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            xr[r] = ld_cg(x + r * 32 + lane);
+            ss    = __fadd_rn(ss, __fmul_rn(xr[r], xr[r]));
+        }
+        ss = gdn_warp_tree_sum(ss);
+        const float scale = rsqrtf(ss / (float) GDN_SV + a.eps);
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int col = r * 32 + lane;
+            y[col] = scale * xr[r] * a.w[col] * gdn_silu(ld_cg(z + col));
+        }
+    }
+}
+
+__device__ MK_OPFN void op_gated_rmsnorm(const Instr &ins, char *smem) {
+    (void) smem;
+    const GatedRmsNormArgs &a = *reinterpret_cast<const GatedRmsNormArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_gated_rmsnorm_utile(ins, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    constexpr int rows_per_lane = GDN_SV / 32;
+    const int warps_per_blk = blockDim.x >> 5;
+    const int nwarps = (ins.block_hi - ins.block_lo) * warps_per_blk;
+    const int wid    = (blockIdx.x - ins.block_lo) * warps_per_blk + (threadIdx.x >> 5);
+    const int lane   = threadIdx.x & 31;
+    for (int h = wid; h < a.n_heads; h += nwarps) {
+        const float *x = a.x + (int64_t) h * GDN_SV;
+        const float *z = a.z + (int64_t) h * GDN_SV;
+        float       *y = a.dst + (int64_t) h * GDN_SV;
         float xr[rows_per_lane];
         float ss = 0.0f;
 #pragma unroll

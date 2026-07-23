@@ -69,8 +69,7 @@ struct RmsnormArgs {
 };
 static_assert(sizeof(RmsnormArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
-    const RmsnormArgs &a = *reinterpret_cast<const RmsnormArgs *>(in.payload);
+static __device__ __noinline__ void op_rmsnorm_utile(const Instr &in, const RmsnormArgs &a, char *smem) {
     const unsigned nblk = in.block_hi - in.block_lo;
     float *red = reinterpret_cast<float *>(smem); // one partial per warp
     // The trunk norms are one 5120-row on one block; the v0 write loop then
@@ -177,6 +176,106 @@ __device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
     }
 }
 
+__device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
+    const RmsnormArgs &a = *reinterpret_cast<const RmsnormArgs *>(in.payload);
+    if (a.n_tokens != 1) { op_rmsnorm_utile(in, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const unsigned nblk = in.block_hi - in.block_lo;
+    float *red = reinterpret_cast<float *>(smem); // one partial per warp
+    // The trunk norms are one 5120-row on one block; the v0 write loop then
+    // re-read x+add from L2 (scalar) and wrote y/sum/dbg scalar -- ~4 latency
+    // passes on a single SM. Stage the summed row (x+add) into the smem slab
+    // during the reduction, then write vectorized from smem: one memory read
+    // of x+add, no re-read, float4 stores. Bit-identical (same fold order,
+    // same scale, same (x+add)); it only removes redundant traffic. The stage
+    // holds one row (ncols f32) after red[]; falls back to the re-read form
+    // when a row does not fit the slab.
+    float *stage = reinterpret_cast<float *>(smem + 64);
+    const bool can_stage = (size_t)a.ncols * 4 + 64 <= SMEM_BYTES;
+
+    for (uint32_t row = blockIdx.x - in.block_lo; row < a.nrows; row += nblk) {
+        const float *x = a.x + (size_t)row * a.ncols;
+        const float *add = a.add ? a.add + (size_t)row * a.ncols : nullptr;
+        float *y = a.y + (size_t)row * a.ncols;
+        float *sum = a.sum ? a.sum + (size_t)row * a.ncols : nullptr;
+        float *dbg = a.dbg ? a.dbg + (size_t)row * a.ncols : nullptr;
+
+        float acc = 0.0f;
+        const bool vec = (a.ncols % 4u == 0) && aligned16(x) &&
+                         (!add || aligned16(add));
+        const bool staged = vec && can_stage;
+        if (vec) {
+            const float4 *x4 = reinterpret_cast<const float4 *>(x);
+            const float4 *a4 = reinterpret_cast<const float4 *>(add);
+            float4 *st4 = reinterpret_cast<float4 *>(stage);
+            for (uint32_t i = threadIdx.x; i < a.ncols / 4; i += blockDim.x) {
+                float4 v = ld_cg(x4 + i);
+                if (add) {
+                    const float4 r = ld_cg(a4 + i);
+                    v.x += r.x; v.y += r.y; v.z += r.z; v.w += r.w;
+                }
+                if (staged) st4[i] = v;   // keep (x+add) hot in smem for the write
+                acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
+                float v = ld_cg(x + i);
+                if (add) v += ld_cg(add + i);
+                acc += v * v;
+            }
+        }
+
+        acc = warp_sum(acc);
+        const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+        if (lane == 0) red[warp] = acc;
+        __syncthreads();
+        if (warp == 0) {
+            float v = lane < (blockDim.x >> 5) ? red[lane] : 0.0f;
+            v = warp_sum(v);
+            if (lane == 0)
+                red[0] = rsqrtf(v / (float)a.ncols + RMSNORM_EPS);
+        }
+        __syncthreads();
+        const float scale = red[0];
+        __syncthreads(); // red[]/stage are reused by the next row
+
+        if (staged) {
+            const float4 *st4 = reinterpret_cast<const float4 *>(stage);
+            const float4 *w4 = reinterpret_cast<const float4 *>(a.w);
+            float4 *y4 = reinterpret_cast<float4 *>(y);
+            float4 *s4 = reinterpret_cast<float4 *>(sum);
+            float4 *d4 = reinterpret_cast<float4 *>(dbg);
+            const bool wv = aligned16(a.w) && aligned16(y) &&
+                            (!sum || aligned16(sum)) && (!dbg || aligned16(dbg));
+            if (wv) {
+                for (uint32_t i = threadIdx.x; i < a.ncols / 4; i += blockDim.x) {
+                    const float4 v = st4[i];
+                    if (sum) s4[i] = v;
+                    if (dbg) d4[i] = v;
+                    const float4 w = w4[i];
+                    y4[i] = make_float4(scale * v.x * w.x, scale * v.y * w.y,
+                                        scale * v.z * w.z, scale * v.w * w.w);
+                }
+            } else {
+                for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
+                    const float v = stage[i];
+                    if (sum) sum[i] = v;
+                    if (dbg) dbg[i] = v;
+                    y[i] = scale * v * a.w[i];
+                }
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < a.ncols; i += blockDim.x) {
+                float v = ld_cg(x + i);
+                if (add) v += ld_cg(add + i);
+                if (sum) sum[i] = v;   // residual trunk write-back (x + add)
+                if (dbg) dbg[i] = v;   // parity residual-stream snapshot (l_out)
+                y[i] = scale * v * a.w[i];
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OP_RESIDUAL_ADD: y = a + b, f32, n elements interleave-strided over the
 // participating blocks.
@@ -191,9 +290,7 @@ struct ResidualAddArgs {
 };
 static_assert(sizeof(ResidualAddArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_residual_add(const Instr &in, char *) {
-    const ResidualAddArgs &a =
-        *reinterpret_cast<const ResidualAddArgs *>(in.payload);
+static __device__ __noinline__ void op_residual_add_utile(const Instr &in, const ResidualAddArgs &a, char *) {
     const unsigned nblk = in.block_hi - in.block_lo;
     const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
     const unsigned stride = nblk * blockDim.x;
@@ -218,6 +315,29 @@ __device__ MK_OPFN void op_residual_add(const Instr &in, char *) {
     }
 }
 
+__device__ MK_OPFN void op_residual_add(const Instr &in, char *smem_u_) {
+    const ResidualAddArgs &a =
+        *reinterpret_cast<const ResidualAddArgs *>(in.payload);
+    if (a.n_tokens != 1) { op_residual_add_utile(in, a, smem_u_); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const unsigned nblk = in.block_hi - in.block_lo;
+    const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
+    const unsigned stride = nblk * blockDim.x;
+
+    if ((a.n % 4u == 0) && aligned16(a.a) && aligned16(a.b) && aligned16(a.y)) {
+        const float4 *a4 = reinterpret_cast<const float4 *>(a.a);
+        const float4 *b4 = reinterpret_cast<const float4 *>(a.b);
+        float4 *y4 = reinterpret_cast<float4 *>(a.y);
+        for (uint32_t i = tid; i < a.n / 4; i += stride) {
+            const float4 u = ld_cg(a4 + i), v = ld_cg(b4 + i);
+            y4[i] = make_float4(u.x + v.x, u.y + v.y, u.z + v.z, u.w + v.w);
+        }
+    } else {
+        for (uint32_t i = tid; i < a.n; i += stride)
+            a.y[i] = ld_cg(a.a + i) + ld_cg(a.b + i);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OP_EMBED_LOOKUP: f16 embedding row -> f32 residual root. The row index is
 // an i32 token cell written by the host before the pass doorbell (mutable
@@ -235,9 +355,7 @@ struct EmbedLookupArgs {
 };
 static_assert(sizeof(EmbedLookupArgs) <= sizeof(Instr::payload), "payload");
 
-__device__ MK_OPFN void op_embed_lookup(const Instr &in, char *smem) {
-    const EmbedLookupArgs &a =
-        *reinterpret_cast<const EmbedLookupArgs *>(in.payload);
+static __device__ __noinline__ void op_embed_lookup_utile(const Instr &in, const EmbedLookupArgs &a, char *smem) {
     int *bc = reinterpret_cast<int *>(smem);
     const unsigned nblk = in.block_hi - in.block_lo;
     const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
@@ -264,6 +382,35 @@ __device__ MK_OPFN void op_embed_lookup(const Instr &in, char *smem) {
         for (uint32_t i = tid; i < a.ncols; i += stride)
             y[i] = __half2float(row[i]);
     }
+    }
+}
+
+__device__ MK_OPFN void op_embed_lookup(const Instr &in, char *smem) {
+    const EmbedLookupArgs &a =
+        *reinterpret_cast<const EmbedLookupArgs *>(in.payload);
+    if (a.n_tokens != 1) { op_embed_lookup_utile(in, a, smem); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    int *bc = reinterpret_cast<int *>(smem);
+    if (threadIdx.x == 0)
+        *bc = (int)ld_cg(reinterpret_cast<const unsigned *>(a.token));
+    __syncthreads();
+    const int tok = *bc;
+    __syncthreads();
+
+    const __half *row = a.emb + (size_t)tok * a.row_stride;
+    const unsigned nblk = in.block_hi - in.block_lo;
+    const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
+    const unsigned stride = nblk * blockDim.x;
+
+    if ((a.ncols % 2u == 0) && ((reinterpret_cast<uintptr_t>(row) & 3u) == 0) &&
+        ((reinterpret_cast<uintptr_t>(a.y) & 7u) == 0)) {
+        const __half2 *row2 = reinterpret_cast<const __half2 *>(row);
+        float2 *y2 = reinterpret_cast<float2 *>(a.y);
+        for (uint32_t i = tid; i < a.ncols / 2; i += stride)
+            y2[i] = __half22float2(row2[i]);
+    } else {
+        for (uint32_t i = tid; i < a.ncols; i += stride)
+            a.y[i] = __half2float(row[i]);
     }
 }
 

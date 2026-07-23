@@ -148,8 +148,7 @@ struct QkNormRopeArgs {
 };
 static_assert(sizeof(QkNormRopeArgs) <= 112, "payload overflow");
 
-__device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
-    const QkNormRopeArgs a = *reinterpret_cast<const QkNormRopeArgs *>(ins.payload);
+static __device__ __noinline__ void op_qk_norm_rope_utile(const Instr &ins, const QkNormRopeArgs &a, char *) {
     const int warps_per_block = blockDim.x / 32;
     const int lane = threadIdx.x % 32;
     const int gw   = (blockIdx.x - ins.block_lo) * warps_per_block + threadIdx.x / 32;
@@ -218,6 +217,73 @@ __device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
     }
 }
 
+__device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *smem_u_) {
+    const QkNormRopeArgs a = *reinterpret_cast<const QkNormRopeArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_qk_norm_rope_utile(ins, a, smem_u_); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int warps_per_block = blockDim.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int gw   = (blockIdx.x - ins.block_lo) * warps_per_block + threadIdx.x / 32;
+    const int gw_n = (ins.block_hi - ins.block_lo) * warps_per_block;
+
+    // Positions are per-token, shared by every head: compute the lane's
+    // cos/sin once. Lane l owns elements {l, l+32, l+64, ..., l+224}; the
+    // NEOX split-half pair for rotary pair p = l is (elem l, elem l+32) =
+    // (v[0], v[1]), so no cross-lane exchange is needed.
+    const int p0 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 0);
+    const int p1 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 1);
+    const int p2 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 2);
+    const int p3 = (int) ld_cg(reinterpret_cast<const unsigned *>(a.pos) + 3);
+
+    // is_imrope sector chain, rope.cu:231-240, evaluated in source order
+    // (h, w, t, else e). sect_dims = 11+11+10+0 = 32 = n_dims/2, so
+    // sector == pair index == lane. 3*sections = {33, 33, 30}.
+    const int sector = lane;
+    int pos_sel;
+    if (sector % 3 == 1 && sector < 3 * 11) {
+        pos_sel = p1; // h
+    } else if (sector % 3 == 2 && sector < 3 * 10) {
+        pos_sel = p2; // w
+    } else if (sector % 3 == 0 && sector < 3 * 11) {
+        pos_sel = p0; // t
+    } else {
+        pos_sel = p3; // e (never taken with sections [11,11,10,0])
+    }
+    // theta_base = pos * theta_scale^p (rope.cu:233-239); rope_yarn with
+    // ext_factor=0, freq_scale=1, attn_factor=1 is plain cos/sin (:22-41).
+    const float theta = (float) pos_sel * powf(MK_IMROPE_THETA_SCALE, (float) sector);
+    const float cos_t = cosf(theta);
+    const float sin_t = sinf(theta);
+
+    for (uint32_t h = gw; h < a.n_heads; h += gw_n) {
+        const float *x = a.src + (size_t) h * a.src_stride;
+        float v[MK_ATTN_HD / 32];
+        float ss = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MK_ATTN_HD / 32; i++) {
+            v[i] = ld_cg(x + i * 32 + lane);
+            ss += v[i] * v[i];
+        }
+        ss = warp_sum_f32(ss);
+        // norm.cu:136-146: scale = rsqrtf(sum/ncols + eps); dst = scale*x*w.
+        const float scale = rsqrtf(ss / (float) MK_ATTN_HD + MK_ATTN_EPS);
+#pragma unroll
+        for (int i = 0; i < MK_ATTN_HD / 32; i++) {
+            v[i] = scale * v[i] * a.norm_w[i * 32 + lane];
+        }
+        // NEOX split-half rotation on dims [0, 64): rope.cu:260-264.
+        const float x0 = v[0], x1 = v[1];
+        v[0] = x0 * cos_t - x1 * sin_t;
+        v[1] = x0 * sin_t + x1 * cos_t;
+        // dims >= n_dims pass through (rope.cu:219-224).
+        float *d = a.dst + (size_t) h * MK_ATTN_HD;
+#pragma unroll
+        for (int i = 0; i < MK_ATTN_HD / 32; i++) {
+            d[i * 32 + lane] = v[i];
+        }
+    }
+}
+
 // --------------------------------------------------------------- OP_KV_APPEND
 //
 // SET_ROWS: one f32 row (this GPU's kv heads' halves, contiguous) -> f16
@@ -238,8 +304,7 @@ struct KvAppendArgs {
 };
 static_assert(sizeof(KvAppendArgs) <= 112, "payload overflow");
 
-__device__ MK_OPFN void op_kv_append(const Instr &ins, char *) {
-    const KvAppendArgs a = *reinterpret_cast<const KvAppendArgs *>(ins.payload);
+static __device__ __noinline__ void op_kv_append_utile(const Instr &ins, const KvAppendArgs &a, char *) {
     const long long row = ld_cg_i64(a.row_idx);
     const uint32_t nthr = (ins.block_hi - ins.block_lo) * blockDim.x;
     const uint32_t t0   = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
@@ -253,6 +318,22 @@ __device__ MK_OPFN void op_kv_append(const Instr &ins, char *) {
             d2[0] = __floats2half2_rn(v.x, v.y);
             d2[1] = __floats2half2_rn(v.z, v.w);
         }
+    }
+}
+
+__device__ MK_OPFN void op_kv_append(const Instr &ins, char *smem_u_) {
+    const KvAppendArgs a = *reinterpret_cast<const KvAppendArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_kv_append_utile(ins, a, smem_u_); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const long long row = ld_cg_i64(a.row_idx);
+    half *d = a.cache + (size_t) row * a.row_width;
+    const uint32_t nthr = (ins.block_hi - ins.block_lo) * blockDim.x;
+    const uint32_t t0   = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    for (uint32_t i4 = t0; i4 < a.row_width / 4; i4 += nthr) {
+        const float4 v = ld_cg(reinterpret_cast<const float4 *>(a.src) + i4);
+        half2 *d2 = reinterpret_cast<half2 *>(d) + 2 * i4;
+        d2[0] = __floats2half2_rn(v.x, v.y);
+        d2[1] = __floats2half2_rn(v.z, v.w);
     }
 }
 
@@ -970,12 +1051,9 @@ __device__ MK_OPFN void fattn_decode_one(const Instr &ins, const FattnDecodeArgs
 // The op entry: the U-loop over per-token views of the one-token body above.
 // Each token's q slice, causal-mask row, and partial records are disjoint, so
 // the columns fold independently (bit-exact to U per-token decode passes).
-__device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
-    const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
-    if (a.n_tokens == 1) { // decode: no view arithmetic
-        fattn_decode_one(ins, a, smem);
-        return;
-    }
+static __device__ __noinline__ void op_fattn_decode_utile(const Instr &ins,
+                                                          const FattnDecodeArgs &a,
+                                                          char *smem) {
     const uint32_t n_kv = ld_cg(reinterpret_cast<const unsigned *>(a.n_kv_cell));
     const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
     for (uint32_t t = 0; t < nt; t++) {
@@ -990,6 +1068,13 @@ __device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
         // next token's staging overwrites it.
         __syncthreads();
     }
+}
+
+__device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
+    const FattnDecodeArgs a = *reinterpret_cast<const FattnDecodeArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_fattn_decode_utile(ins, a, smem); return; }
+    // decode fast path: the one-token body inlines here as it always did
+    fattn_decode_one(ins, a, smem);
 }
 
 // ------------------------------------------------------------ OP_FATTN_REDUCE
@@ -1017,8 +1102,7 @@ struct FattnReduceArgs {
 };
 static_assert(sizeof(FattnReduceArgs) <= 112, "payload overflow");
 
-__device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *) {
-    const FattnReduceArgs a = *reinterpret_cast<const FattnReduceArgs *>(ins.payload);
+static __device__ __noinline__ void op_fattn_reduce_utile(const Instr &ins, const FattnReduceArgs &a, char *) {
     const int nb  = ins.block_hi - ins.block_lo;
     const int rel = blockIdx.x - ins.block_lo;
     const int d   = threadIdx.x;
@@ -1056,6 +1140,44 @@ __device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *) {
     }
 }
 
+__device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *smem_u_) {
+    const FattnReduceArgs a = *reinterpret_cast<const FattnReduceArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_fattn_reduce_utile(ins, a, smem_u_); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const int nb  = ins.block_hi - ins.block_lo;
+    const int rel = blockIdx.x - ins.block_lo;
+    const int d   = threadIdx.x;
+    if (d >= MK_ATTN_HD) return;
+
+    for (uint32_t h = rel; h < a.n_q; h += nb) {
+        float max_val = -INFINITY, rowsum = 0.0f, acc = 0.0f;
+        for (uint32_t c = 0; c < a.n_chunks; c++) {
+            const float *rec = a.partials + ((size_t) h * a.n_chunks + c) * MK_FATTN_PSTRIDE;
+            const float m_c = ld_cg(rec + MK_ATTN_HD);
+            if (m_c == MK_FATTN_SENTINEL) { // never-written partial (Y03)
+                if (d == 0) atomicAdd(a.error, 1u);
+                continue;
+            }
+            const float s_c = ld_cg(rec + MK_ATTN_HD + 1);
+            const float v_c = ld_cg(rec + d);
+            // fattn-common.cuh:737-748 with ascending chunk order; the FTZ
+            // guard also makes the -inf running start exact (first live
+            // chunk contributes with weight 1, the start with weight 0).
+            const float max_new   = fmaxf(max_val, m_c);
+            const float diff_val  = max_val - max_new;
+            const float diff_add  = m_c - max_new;
+            const float scale_val = diff_val >= -20.0f ? expf(diff_val) : 0.0f;
+            const float scale_add = diff_add >= -20.0f ? expf(diff_add) : 0.0f;
+            acc    = scale_val * acc    + scale_add * v_c;
+            rowsum = scale_val * rowsum + scale_add * s_c;
+            max_val = max_new;
+        }
+        // Final normalize (fattn-common.cuh:752). rowsum > 0 at decode: the
+        // current token's own position is always unmasked.
+        a.dst[(size_t) h * MK_ATTN_HD + d] = acc / rowsum;
+    }
+}
+
 // --------------------------------------------------------------- OP_ATTN_GATE
 //
 // dst = attn * sigmoid(gate) (graph MUL(attn, sigmoid(gate slice)), the
@@ -1076,8 +1198,7 @@ struct AttnGateArgs {
 };
 static_assert(sizeof(AttnGateArgs) <= 112, "payload overflow");
 
-__device__ MK_OPFN void op_attn_gate(const Instr &ins, char *) {
-    const AttnGateArgs a = *reinterpret_cast<const AttnGateArgs *>(ins.payload);
+static __device__ __noinline__ void op_attn_gate_utile(const Instr &ins, const AttnGateArgs &a, char *) {
     const uint32_t total = a.n_q * MK_ATTN_HD;
     const uint32_t nthr  = (ins.block_hi - ins.block_lo) * blockDim.x;
     const uint32_t t0    = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
@@ -1093,6 +1214,22 @@ __device__ MK_OPFN void op_attn_gate(const Instr &ins, char *) {
         // op_sigmoid, unary.cu:48-50; MUL order attn * sigmoid per the graph.
         dst[i] = av * (1.0f / (1.0f + expf(-gv)));
     }
+    }
+}
+
+__device__ MK_OPFN void op_attn_gate(const Instr &ins, char *smem_u_) {
+    const AttnGateArgs a = *reinterpret_cast<const AttnGateArgs *>(ins.payload);
+    if (a.n_tokens != 1) { op_attn_gate_utile(ins, a, smem_u_); return; }
+    // decode fast path: the pre-U-loop body VERBATIM (codegen-identical)
+    const uint32_t total = a.n_q * MK_ATTN_HD;
+    const uint32_t nthr  = (ins.block_hi - ins.block_lo) * blockDim.x;
+    const uint32_t t0    = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
+    for (uint32_t i = t0; i < total; i += nthr) {
+        const uint32_t h = i / MK_ATTN_HD, d = i % MK_ATTN_HD;
+        const float gv = ld_cg(a.gate + (size_t) h * a.gate_stride + d);
+        const float av = ld_cg(a.attn + i);
+        // op_sigmoid, unary.cu:48-50; MUL order attn * sigmoid per the graph.
+        a.dst[i] = av * (1.0f / (1.0f + expf(-gv)));
     }
 }
 
