@@ -743,18 +743,14 @@ static void pack_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
             r.dbg = mid + (size_t) N_LAYER * N_EMBD;   // = the embedding (no add)
     }
     r.n_tokens = arg_ntok(a);
-    // Epilogue row-select with a literal row (prefill: U-1, the last prompt
-    // token): fold it as a pack-time source offset and run the norm ONCE (its
-    // dst is the single epilogue row). The decode form is "sym:$out_row",
-    // always row 0 of a 1-row trunk, which the offsetless pack realizes.
-    if (arg_has(a, "row_select") && !is_sym(a, "row_select")) {
-        const int64_t rs = arg_i(a, "row_select");
-        r.x = r.x + rs * (int64_t) r.ncols;
-        if (r.add) r.add = r.add + rs * (int64_t) r.ncols;
-        if (r.sum) r.sum = r.sum + rs * (int64_t) r.ncols;
-        r.n_tokens = 1;
-    }
-    r.ntok_cell = r.n_tokens == 1 ? nullptr : ntok_cell(c);
+    // Epilogue row select is RUNTIME (row nt-1 from the n_tok cell): a
+    // pack-time literal cannot know the live width, and a per-token pass
+    // through a prefill program (the parity reference leg) or a remainder
+    // tile would norm an unwritten residual row. Both the decode "sym:
+    // $out_row" form (nt=1 -> row 0) and the prefill literal U-1 (a full
+    // tile's nt-1 = U-1) are realized by the same runtime select.
+    r.row_select_last = arg_has(a, "row_select") ? 1u : 0u;
+    r.ntok_cell = (r.n_tokens == 1 && !r.row_select_last) ? nullptr : ntok_cell(c);
     emit(out, c.proto, r);
 }
 
@@ -2439,6 +2435,7 @@ static int prefill_parity_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
             gpu_set_inputs_tile(g2[1], base, n_tok);
             ++pass;
             if (!dual_run_pass(g2, toks + base, n_tok, pass, 60000.0)) return false;
+            fprintf(stderr, "  tile +%lld done (base %lld)\n", (long long) n_tok, (long long) base);
         }
         return true;
     };
@@ -2460,6 +2457,8 @@ static int prefill_parity_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
         ++pass;
         int32_t tk = PROMPT[i];
         if (!dual_run_pass(g2, &tk, 1, pass, 60000.0)) return 3;
+        if ((i & 15) == 15)   // unbuffered heartbeat: a killed run localizes itself
+            fprintf(stderr, "  ref pass %lld/%lld\n", (long long)(i + 1), (long long) P);
     }
     std::vector<float> ref_logits, ref_kv, ref_rs;
     gather_logits(ref_logits);
@@ -2826,6 +2825,11 @@ void mk_dual_shutdown() {
 
 #ifndef MK_NO_MAIN
 int main(int argc, char **argv) {
+    // Line-buffer stdout even when redirected to a file: a leased run killed
+    // by a watchdog or outer timeout must not take its progress to the grave
+    // (block-buffered stdio never flushes on SIGKILL; one silent 10-minute
+    // window run was unattributable for exactly this reason).
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string model = "/opt/models/Qwen3.6-27B-AR16asF16-probe.gguf";  // F16-ssm_out base (call/0020)
     std::string program_path;
     std::string parity_ref, out_dir, diag_out;

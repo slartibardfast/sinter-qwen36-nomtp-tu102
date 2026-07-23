@@ -59,6 +59,13 @@ struct RmsnormArgs {
     // n_kv-cell pattern): a 1-token pass through a U=128 program runs 1.
     uint32_t n_tokens;
     const uint32_t *ntok_cell;
+    // Epilogue row select: the single-row norm of the LAST LIVE token. The
+    // selected row is (nt-1), a RUNTIME value: a pack-time literal cannot know
+    // the live width (a per-token reference pass or a remainder tile runs
+    // nt < capacity and would read an unwritten residual row). x/add/sum
+    // offset by (nt-1)*nrows*ncols; y (and dbg) stay at row 0; one iteration.
+    // Decode (nt = 1) selects row 0, identical to the offsetless pack.
+    uint32_t row_select_last;
 };
 static_assert(sizeof(RmsnormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -79,13 +86,15 @@ __device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
 
     const size_t tsz = (size_t)a.nrows * a.ncols; // per-token slot (U-loop)
     const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
-    for (uint32_t t = 0; t < nt; ++t)
+    const uint32_t t0 = a.row_select_last ? nt - 1 : 0; // epilogue: last live row only
+    for (uint32_t t = t0; t < nt; ++t)
     for (uint32_t row = blockIdx.x - in.block_lo; row < a.nrows; row += nblk) {
+        const size_t ty = a.row_select_last ? 0 : t * tsz; // epilogue dst is row 0
         const float *x = a.x + t * tsz + (size_t)row * a.ncols;
         const float *add = a.add ? a.add + t * tsz + (size_t)row * a.ncols : nullptr;
-        float *y = a.y + t * tsz + (size_t)row * a.ncols;
+        float *y = a.y + ty + (size_t)row * a.ncols;
         float *sum = a.sum ? a.sum + t * tsz + (size_t)row * a.ncols : nullptr;
-        float *dbg = a.dbg ? a.dbg + t * tsz + (size_t)row * a.ncols : nullptr;
+        float *dbg = a.dbg ? a.dbg + ty + (size_t)row * a.ncols : nullptr;
 
         float acc = 0.0f;
         const bool vec = (a.ncols % 4u == 0) && aligned16(x) &&
