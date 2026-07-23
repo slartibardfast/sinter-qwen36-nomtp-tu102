@@ -123,6 +123,26 @@ static bool is_state_write(const struct ggml_tensor * t, char * base, size_t cap
     return false;
 }
 
+// Attention KV SET_ROWS writes (cache_k_l*/cache_v_l*). The node is the
+// WRITTEN rows only (batch rows), so a prefill dump is prompt-sized, never
+// the whole 262144-row cache; still opt-in (--dump-kv) to keep the deep
+// decode oracle's tree unchanged.
+static bool g_dump_kv = false;
+static bool is_kv_write(const struct ggml_tensor * t, char * base, size_t cap) {
+    if (!g_dump_kv || ggml_nelements(t) <= 0 || strstr(t->name, "(copy") == NULL) {
+        return false;
+    }
+    if (strncmp(t->name, "cache_k_l", 9) == 0 || strncmp(t->name, "cache_v_l", 9) == 0) {
+        size_t j = 0;
+        for (const char * p = t->name; *p && *p != ' ' && j + 1 < cap; p++) {
+            base[j++] = *p;
+        }
+        base[j] = '\0';
+        return true;
+    }
+    return false;
+}
+
 static void csv_safe(const char * in, char * out, size_t cap) {
     size_t j = 0;
     for (size_t i = 0; in[i] && j + 1 < cap; i++) {
@@ -175,7 +195,8 @@ static bool is_family(const struct ggml_tensor * t, char * base, size_t cap) {
     return is_l_out(t->name) ||
            strncmp(t->name, "result_norm",  11) == 0 ||
            strncmp(t->name, "result_output", 13) == 0 ||
-           is_state_write(t, base, cap);
+           is_state_write(t, base, cap) ||
+           is_kv_write(t, base, cap);
 }
 
 // ggml_backend_sched_eval_callback. Fetch policy:
@@ -193,7 +214,13 @@ static bool oracle_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (ask) {
         if (d->step < 0) {
-            return false;
+            // --dump-kv prefill capture: fetch only the state/KV cache writes
+            // of the prompt chunks (the post-prompt state and the prompt KV
+            // rows); no node rows, no full/ dumps at prefill.
+            char base[128];
+            return g_dump_kv &&
+                   (is_state_write(t, base, sizeof(base)) ||
+                    is_kv_write(t, base, sizeof(base)));
         }
         const int64_t nelem  = ggml_nelements(t);
         const size_t  nbytes = ggml_nbytes(t);
@@ -212,7 +239,7 @@ static bool oracle_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         write_node_row(d, t, d->idx++, status, NULL, NULL, 0);
         return false;
     }
-    if (d->step < 0) {
+    if (d->step < 0 && !g_dump_kv) {
         return true;
     }
 
@@ -260,7 +287,9 @@ static bool oracle_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     const double stats[4] = { rms, mean, vmin, vmax };
-    write_node_row(d, t, idx, "ok", stats, first8, n8);
+    if (d->step >= 0) {
+        write_node_row(d, t, idx, "ok", stats, first8, n8);
+    }
 
     // full-data dumps: residual stream + DeltaNet state writes
     char base[128];
@@ -270,6 +299,8 @@ static bool oracle_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         snprintf(base, sizeof(base), "%s", t->name);
     } else if (is_state_write(t, base, sizeof(base))) {
         kind = "state";
+    } else if (is_kv_write(t, base, sizeof(base))) {
+        kind = "kv";
     }
     if (kind != NULL) {
 
@@ -283,7 +314,11 @@ static bool oracle_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         }
 
         char rel[256];
-        snprintf(rel, sizeof(rel), "%s/s%d/%s", kind, d->step, fname);
+        if (d->step < 0) {
+            snprintf(rel, sizeof(rel), "%s/pre/%s", kind, fname);
+        } else {
+            snprintf(rel, sizeof(rel), "%s/s%d/%s", kind, d->step, fname);
+        }
         const std::string path = d->dir + "/" + rel;
         FILE * f = fopen(path.c_str(), "wb");
         if (f == NULL) {
@@ -343,6 +378,8 @@ int main(int argc, char ** argv) {
             ctx_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             n_steps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--dump-kv") == 0) {
+            g_dump_kv = true;
         } else if (strcmp(argv[i], "--tag") == 0 && i + 1 < argc) {
             tag = argv[++i];
         } else {
@@ -441,7 +478,18 @@ int main(int argc, char ** argv) {
     fprintf(d.nodes, "step,idx,name,op,type,ne0,ne1,ne2,ne3,summary,rms,mean,min,max,v0,v1,v2,v3,v4,v5,v6,v7\n");
     fprintf(d.files, "step,kind,name,path,op,type,ne0,ne1,ne2,ne3,nbytes\n");
 
-    // prefill in n_batch-sized chunks (capture off: d.step == -1)
+    if (g_dump_kv) {   // prefill capture: state/pre + kv/pre trees
+        char sub[512];
+        snprintf(sub, sizeof(sub), "%s/state", out_dir.c_str());
+        mkdir_or_die(sub);
+        snprintf(sub, sizeof(sub), "%s/state/pre", out_dir.c_str());
+        mkdir_or_die(sub);
+        snprintf(sub, sizeof(sub), "%s/kv", out_dir.c_str());
+        mkdir_or_die(sub);
+        snprintf(sub, sizeof(sub), "%s/kv/pre", out_dir.c_str());
+        mkdir_or_die(sub);
+    }
+    // prefill in n_batch-sized chunks (capture off unless --dump-kv: d.step == -1)
     const int n_batch = 2048; // llama_context_default_params().n_batch
     for (int i = 0; i < (int) prompt.size(); i += n_batch) {
         const int n = std::min(n_batch, (int) prompt.size() - i);
@@ -487,6 +535,8 @@ int main(int argc, char ** argv) {
         snprintf(sub, sizeof(sub), "%s/full/s%d", out_dir.c_str(), step);
         mkdir_or_die(sub);
         snprintf(sub, sizeof(sub), "%s/state/s%d", out_dir.c_str(), step);
+        mkdir_or_die(sub);
+        snprintf(sub, sizeof(sub), "%s/kv/s%d", out_dir.c_str(), step);
         mkdir_or_die(sub);
 
         d.step = step;

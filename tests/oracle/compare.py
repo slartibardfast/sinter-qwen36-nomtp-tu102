@@ -76,6 +76,58 @@ def load_nodes_rms(d):
     return out
 
 
+def load_pre_files(d, kind):
+    """kind/pre writes (prefill capture, step < 0) in files.csv order:
+    name -> [path, ...] in chunk order. Duplicates are the CHUNKS."""
+    out = {}
+    with open(os.path.join(d, "files.csv")) as f:
+        for row in csv.DictReader(f):
+            if row["kind"] == kind and int(row["step"]) < 0:
+                out.setdefault(row["name"], []).append(row["path"])
+    return out
+
+
+def prefill_compare(args, idx_r, idx_c):
+    """--prefill: the vs-stock batched-prefill arbiter (gate-manifest-prefill
+    row "Batched prefill (U=128)"): row-0 logits (the prefill output row) KL
+    both directions <= --kl-tol AND greedy argmax match; state/pre (the LAST
+    write per cache = the post-prompt state) and kv/pre (chunk-concatenated
+    prompt rows) byte-identical. Decode steps are ignored."""
+    log_r = load_logits(args.ref, idx_r)[0:1]   # row 0, kept 2-D for kl_nats
+    log_c = load_logits(args.cand, idx_c)[0:1]
+    kl = float(max(kl_nats(log_r, log_c)[0], kl_nats(log_c, log_r)[0]))
+    greedy_ok = int(np.argmax(log_r)) == int(np.argmax(log_c))
+    failures = []
+    if kl > args.kl_tol:
+        failures.append(f"prefill logits KL {kl:.6g} > {args.kl_tol}")
+    if not greedy_ok:
+        failures.append("prefill greedy argmax differs")
+    detail = {"prefill_logits_kl": kl, "greedy_match": greedy_ok}
+    for kind, rule in (("state", "last"), ("kv", "concat")):
+        fr, fc = load_pre_files(args.ref, kind), load_pre_files(args.cand, kind)
+        if set(fr) != set(fc):
+            failures.append(f"{kind}/pre inventory differs: {sorted(set(fr) ^ set(fc))}")
+            continue
+        for name in sorted(fr):
+            def blob(d, paths):
+                use = paths[-1:] if rule == "last" else paths
+                return b"".join(open(os.path.join(d, p), "rb").read() for p in use)
+            br, bc = blob(args.ref, fr[name]), blob(args.cand, fc[name])
+            detail.setdefault(kind, {})[name] = {"bytes": len(br), "bit_exact": br == bc}
+            if br != bc:
+                failures.append(f"{kind}/pre {name} not byte-identical")
+    ok = not failures
+    print(f"PREFILL-ORACLE: logits row0 KL {kl:.6g} (tol {args.kl_tol}), "
+          f"greedy {'match' if greedy_ok else 'DIFF'} "
+          f"-> RESULT: {'PASS' if ok else 'FAIL'}")
+    for m in failures:
+        print("  FAIL: " + m, file=sys.stderr)
+    if args.report:
+        with open(args.report, "w") as f:
+            json.dump({"mode": "prefill", "pass": ok, "failures": failures, **detail}, f, indent=1)
+    sys.exit(0 if ok else 1)
+
+
 def load_files(d, kind):
     """(step, name) -> (path, nbytes) for files.csv rows of the given kind."""
     out = {}
@@ -108,6 +160,10 @@ def main():
     ap.add_argument("--kl-tol", type=float, default=0.02)
     ap.add_argument("--rms-tol", type=float, default=0.02)
     ap.add_argument("--report", default=None)
+    ap.add_argument("--prefill", action="store_true",
+                    help="prefill-oracle mode: row-0 logits KL + greedy, "
+                         "state/pre last-write + kv/pre chunk-concat "
+                         "byte-identical (trees from oracle --dump-kv)")
     ap.add_argument("--allow-config-mismatch", action="store_true",
                     help="tolerate split/n_ctx differences (cross-check trees); "
                          "prompt, steps and n_vocab must still match")
@@ -123,6 +179,9 @@ def main():
             fail_structural(f"config.{k}: ref {cfg_r[k]} != cand {cfg_c[k]}")
     if idx_r["prompt_tokens"] != idx_c["prompt_tokens"]:
         fail_structural("prompt_tokens differ")
+
+    if args.prefill:
+        prefill_compare(args, idx_r, idx_c)
     # soft: serving config may legitimately differ for the fp32-order cross-check
     for k in ("split", "n_ctx"):
         if cfg_r[k] != cfg_c[k]:
