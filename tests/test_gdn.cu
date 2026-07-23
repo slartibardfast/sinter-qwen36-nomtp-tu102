@@ -418,6 +418,58 @@ static void test_conv_ops() {
     down(out_got.data(), d_out, C);
     check_close("ssm_conv_silu", out_got.data(), out_want.data(), C, 1e-5f);
 
+    // U-tile utile path at nt=2 (the branch the U-loop added; capacity ==
+    // live width, so ntok_cell stays null and n_tokens drives the loop).
+    // Window per channel: [h0 h1 h2 x0 x1], capacity stride HIST+2; token t
+    // taps window[t..t+3]; commit = the last HIST entries = (h2, x0, x1).
+    {
+        const int NT = 2;
+        std::vector<float> x2((size_t) NT * C);
+        fill_rand(x2, -1.0f, 1.0f);
+        float *d_x2 = dalloc(x2.size());
+        float *d_win2 = dalloc((size_t) C * (HIST + NT));
+        float *d_out2 = dalloc((size_t) NT * C);
+        up(d_x2, x2.data(), x2.size());
+        CUDA_CHECK(cudaMemset(d_state, 0, 3 * (size_t) C * HIST * 4));
+        mk::ConvShiftConcatArgs ca2 = {d_hist, d_x2, d_win2, d_state, d_row,
+                                       (int64_t) C * HIST, C};
+        ca2.n_tokens = NT; ca2.xnew_tstride = C;
+        mk::SsmConvSiluArgs va2 = {d_win2, d_weight, d_out2, C};
+        va2.n_tokens = NT; va2.dst_tstride = C;
+        run_program({make_instr(mk::OP_CONV_SHIFT_CONCAT, 0, 8, ca2), make_boundary(),
+                     make_instr(mk::OP_SSM_CONV_SILU, 2, 8, va2)});
+
+        const int W2 = HIST + NT;
+        std::vector<float> win2_want((size_t) C * W2), commit2_want((size_t) C * HIST);
+        for (int c = 0; c < C; c++) {
+            for (int j = 0; j < HIST; j++) win2_want[(size_t) c * W2 + j] = hist[c * HIST + j];
+            for (int t = 0; t < NT; t++) win2_want[(size_t) c * W2 + HIST + t] = x2[(size_t) t * C + c];
+            commit2_want[c * HIST + 0] = hist[c * HIST + 2];
+            commit2_want[c * HIST + 1] = x2[c];
+            commit2_want[c * HIST + 2] = x2[(size_t) C + c];
+        }
+        std::vector<float> win2_got(win2_want.size()), commit2_got(commit2_want.size());
+        down(win2_got.data(), d_win2, win2_got.size());
+        down(commit2_got.data(), d_state + (size_t) row * C * HIST, commit2_got.size());
+        check_bitwise("conv window nt=2", win2_got.data(), win2_want.data(), win2_got.size());
+        check_bitwise("conv history commit nt=2", commit2_got.data(), commit2_want.data(),
+                      commit2_got.size());
+
+        // per-token sliding conv: token t's taps are window[t..t+3] per channel.
+        std::vector<float> tapwin((size_t) C * mk::GDN_DCONV), sums2(C), out2_want((size_t) NT * C),
+            out2_got((size_t) NT * C);
+        for (int t = 0; t < NT; t++) {
+            for (int c = 0; c < C; c++)
+                for (int j = 0; j < mk::GDN_DCONV; j++)
+                    tapwin[(size_t) c * mk::GDN_DCONV + j] = win2_want[(size_t) c * W2 + t + j];
+            ref_conv_sums(tapwin.data(), weight.data(), sums2.data(), C);
+            for (int c = 0; c < C; c++) out2_want[(size_t) t * C + c] = silu_ref(sums2[c]);
+        }
+        down(out2_got.data(), d_out2, out2_got.size());
+        check_close("ssm_conv_silu nt=2", out2_got.data(), out2_want.data(), out2_got.size(), 1e-5f);
+        CUDA_CHECK(cudaFree(d_x2)); CUDA_CHECK(cudaFree(d_win2)); CUDA_CHECK(cudaFree(d_out2));
+    }
+
     CUDA_CHECK(cudaFree(d_hist)); CUDA_CHECK(cudaFree(d_xnew));
     CUDA_CHECK(cudaFree(d_weight)); CUDA_CHECK(cudaFree(d_win));
     CUDA_CHECK(cudaFree(d_state)); CUDA_CHECK(cudaFree(d_out));
@@ -508,6 +560,50 @@ static void test_gdn_step(int HV, int HK, uint16_t lo, uint16_t hi) {
     check_bitwise(name, s_got.data(), s_ref.data(), s_got.size());
     snprintf(name, sizeof(name), "gdn_step output (H=%d)", HV);
     check_bitwise(name, attn_got.data(), attn_ref.data(), attn_got.size());
+
+    // U-tile utile path at nt=2: the register-carried token loop must equal
+    // TWO sequential reference steps (state carried through both). Dense
+    // per-token slots: qkv stride = its own width, g/beta stride = HV.
+    {
+        const int NT = 2;
+        std::vector<float> q2((size_t) NT * HK * S), k2((size_t) NT * HK * S),
+            v2((size_t) NT * HV * S), g2v((size_t) NT * HV), b2((size_t) NT * HV);
+        fill_rand(q2, -1.0f, 1.0f); fill_rand(k2, -1.0f, 1.0f); fill_rand(v2, -1.0f, 1.0f);
+        fill_rand(g2v, 0.01f, 0.99f); fill_rand(b2, 0.01f, 0.99f);
+        float *d_q2 = dalloc(q2.size()), *d_k2 = dalloc(k2.size()), *d_v2 = dalloc(v2.size());
+        float *d_g2 = dalloc(g2v.size()), *d_b2 = dalloc(b2.size());
+        float *d_attn2 = dalloc(v2.size());
+        up(d_q2, q2.data(), q2.size()); up(d_k2, k2.data(), k2.size());
+        up(d_v2, v2.data(), v2.size());
+        up(d_g2, g2v.data(), g2v.size()); up(d_b2, b2.data(), b2.size());
+        up(d_sin, state.data(), state.size());   // reset the carried state
+
+        mk::GdnStepArgs a2 = {d_q2, d_k2, d_v2, d_g2, d_b2, d_sin, d_sout, d_attn2,
+                              HV, HK, scale};
+        a2.n_tokens = NT;
+        a2.qkv_tstride = (int32_t)(HK * S);      // q,k share the stride; v uses
+        a2.out_tstride = (int32_t)(HV * S);      // its own HV*S slot via toff
+        // NOTE: q,k,v advance by the SAME qkv_tstride in the op (one mixer
+        // slot); give v its own dense layout by matching strides: pack v at
+        // HK*S stride only if HV==HK. For HV != HK exercise via out stride.
+        run_program({make_instr(mk::OP_GDN_STEP, lo, hi, a2)});
+
+        std::vector<float> s2_ref(state), attn2_ref((size_t) NT * HV * S);
+        for (int t = 0; t < NT; t++)
+            ref_gdn_step(q2.data() + (size_t) t * HK * S, k2.data() + (size_t) t * HK * S,
+                         v2.data() + (size_t) t * a2.qkv_tstride, g2v.data() + (size_t) t * HV,
+                         b2.data() + (size_t) t * HV, s2_ref.data(),
+                         attn2_ref.data() + (size_t) t * HV * S, HV, HK, scale);
+        std::vector<float> s2_got(state.size()), attn2_got(attn2_ref.size());
+        down(s2_got.data(), d_sout, s2_got.size());
+        down(attn2_got.data(), d_attn2, attn2_got.size());
+        snprintf(name, sizeof(name), "gdn_step nt=2 state (H=%d)", HV);
+        check_bitwise(name, s2_got.data(), s2_ref.data(), s2_got.size());
+        snprintf(name, sizeof(name), "gdn_step nt=2 output (H=%d)", HV);
+        check_bitwise(name, attn2_got.data(), attn2_ref.data(), attn2_got.size());
+        CUDA_CHECK(cudaFree(d_q2)); CUDA_CHECK(cudaFree(d_k2)); CUDA_CHECK(cudaFree(d_v2));
+        CUDA_CHECK(cudaFree(d_g2)); CUDA_CHECK(cudaFree(d_b2)); CUDA_CHECK(cudaFree(d_attn2));
+    }
 
     CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_k)); CUDA_CHECK(cudaFree(d_v));
     CUDA_CHECK(cudaFree(d_g)); CUDA_CHECK(cudaFree(d_beta));
