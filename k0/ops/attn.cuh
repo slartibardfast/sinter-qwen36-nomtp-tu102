@@ -144,6 +144,7 @@ struct QkNormRopeArgs {
     uint32_t       n_tokens;
     uint32_t       src_tstride;
     uint32_t       dst_tstride;
+    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(QkNormRopeArgs) <= 112, "payload overflow");
 
@@ -153,8 +154,9 @@ __device__ MK_OPFN void op_qk_norm_rope(const Instr &ins, char *) {
     const int lane = threadIdx.x % 32;
     const int gw   = (blockIdx.x - ins.block_lo) * warps_per_block + threadIdx.x / 32;
     const int gw_n = (ins.block_hi - ins.block_lo) * warps_per_block;
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
 
-    for (uint32_t t = 0; t < a.n_tokens; t++) {
+    for (uint32_t t = 0; t < nt; t++) {
     const float *src_t = a.src + (size_t) t * a.src_tstride;
     float       *dst_t = a.dst + (size_t) t * a.dst_tstride;
     // Positions are per-token, shared by every head: compute the lane's
@@ -232,6 +234,7 @@ struct KvAppendArgs {
     // row + t (contiguous fresh slots) from src + t*src_tstride. Decode: 1.
     uint32_t         n_tokens;
     uint32_t         src_tstride;
+    const uint32_t  *ntok_cell; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(KvAppendArgs) <= 112, "payload overflow");
 
@@ -240,7 +243,8 @@ __device__ MK_OPFN void op_kv_append(const Instr &ins, char *) {
     const long long row = ld_cg_i64(a.row_idx);
     const uint32_t nthr = (ins.block_hi - ins.block_lo) * blockDim.x;
     const uint32_t t0   = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
-    for (uint32_t t = 0; t < a.n_tokens; t++) {
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; t++) {
         const float *src = a.src + (size_t) t * a.src_tstride;
         half *d = a.cache + (size_t) (row + t) * a.row_width;
         for (uint32_t i4 = t0; i4 < a.row_width / 4; i4 += nthr) {
@@ -304,6 +308,7 @@ struct FattnDecodeArgs {
     uint32_t        n_tokens;
     uint32_t        q_tstride;
     uint32_t        partial_tstride;
+    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(FattnDecodeArgs) <= 112, "payload overflow");
 
@@ -972,12 +977,18 @@ __device__ MK_OPFN void op_fattn_decode(const Instr &ins, char *smem) {
         return;
     }
     const uint32_t n_kv = ld_cg(reinterpret_cast<const unsigned *>(a.n_kv_cell));
-    for (uint32_t t = 0; t < a.n_tokens; t++) {
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; t++) {
         FattnDecodeArgs at = a;
         at.q        = a.q + (size_t) t * a.q_tstride;
         at.mask     = a.mask + (size_t) t * n_kv;      // causal row t
         at.partials = a.partials + (size_t) t * a.partial_tstride;
         fattn_decode_one(ins, at, smem);
+        // The one-token body was only ever invoked once per pass (the pass
+        // epilogue boundary covered its tail); back-to-back invocations need
+        // an explicit barrier so no straggler still reads the slab while the
+        // next token's staging overwrites it.
+        __syncthreads();
     }
 }
 
@@ -999,9 +1010,10 @@ struct FattnReduceArgs {
     unsigned    *error;     // sentinel detections (host-checked; zeroed per pass)
     uint32_t     n_q;
     uint32_t     n_chunks;
-    uint32_t     n_tokens;        // U-loop; decode packs 1
+    uint32_t     n_tokens;        // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     uint32_t     partial_tstride; // per-token slots (buffer table)
     uint32_t     dst_tstride;
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(FattnReduceArgs) <= 112, "payload overflow");
 
@@ -1012,7 +1024,8 @@ __device__ MK_OPFN void op_fattn_reduce(const Instr &ins, char *) {
     const int d   = threadIdx.x;
     if (d >= MK_ATTN_HD) return;
 
-    for (uint32_t t = 0; t < a.n_tokens; t++)
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; t++)
     for (uint32_t h = rel; h < a.n_q; h += nb) {
         float max_val = -INFINITY, rowsum = 0.0f, acc = 0.0f;
         for (uint32_t c = 0; c < a.n_chunks; c++) {
@@ -1056,9 +1069,10 @@ struct AttnGateArgs {
     float       *dst;         // [n_q*256] contiguous
     uint32_t     n_q;
     uint32_t     gate_stride; // f32 elems between heads (512)
-    uint32_t     n_tokens;     // U-loop; decode packs 1
+    uint32_t     n_tokens;     // U-loop capacity; live bound min(n_tokens, *ntok_cell)
     uint32_t     attn_tstride; // attn AND dst per-token slot (gated in place)
     uint32_t     gate_tstride; // gate source buffer per-token slot
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(AttnGateArgs) <= 112, "payload overflow");
 
@@ -1067,7 +1081,8 @@ __device__ MK_OPFN void op_attn_gate(const Instr &ins, char *) {
     const uint32_t total = a.n_q * MK_ATTN_HD;
     const uint32_t nthr  = (ins.block_hi - ins.block_lo) * blockDim.x;
     const uint32_t t0    = (blockIdx.x - ins.block_lo) * blockDim.x + threadIdx.x;
-    for (uint32_t t = 0; t < a.n_tokens; t++) {
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; t++) {
     const float *attn = a.attn + (size_t) t * a.attn_tstride;
     const float *gate = a.gate + (size_t) t * a.gate_tstride;
     float       *dst  = a.dst + (size_t) t * a.attn_tstride;

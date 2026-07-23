@@ -54,7 +54,11 @@ struct RmsnormArgs {
     // once per column, all five pointers advancing by nrows*ncols per token.
     // Decode packs 1 (byte-identical numerics); the epilogue row-select norm
     // also packs 1 (its source offset selects row U-1 at pack time).
+    // n_tokens is the CAPACITY (buffer slots); the live loop bound is
+    // min(n_tokens, *ntok_cell), the host-written per-pass tile width (the
+    // n_kv-cell pattern): a 1-token pass through a U=128 program runs 1.
     uint32_t n_tokens;
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(RmsnormArgs) <= sizeof(Instr::payload), "payload");
 
@@ -74,7 +78,8 @@ __device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
     const bool can_stage = (size_t)a.ncols * 4 + 64 <= SMEM_BYTES;
 
     const size_t tsz = (size_t)a.nrows * a.ncols; // per-token slot (U-loop)
-    for (uint32_t t = 0; t < a.n_tokens; ++t)
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; ++t)
     for (uint32_t row = blockIdx.x - in.block_lo; row < a.nrows; row += nblk) {
         const float *x = a.x + t * tsz + (size_t)row * a.ncols;
         const float *add = a.add ? a.add + t * tsz + (size_t)row * a.ncols : nullptr;
@@ -155,6 +160,11 @@ __device__ MK_OPFN void op_rmsnorm(const Instr &in, char *smem) {
                 y[i] = scale * v * a.w[i];
             }
         }
+        // The write phase above reads stage[] from smem; the next iteration's
+        // reduction overwrites red[]/stage. One row per instruction hid this
+        // (nrows = 1 for every trunk norm); the U-loop iterates the body, so
+        // the straggler-read/fast-warp-overwrite race is live without this.
+        __syncthreads();
     }
 }
 
@@ -167,7 +177,8 @@ struct ResidualAddArgs {
     const float *b; // mutable -> strong reads
     float *y;
     uint32_t n;
-    uint32_t n_tokens; // U-loop: a/b/y advance by n per token; decode packs 1
+    uint32_t n_tokens; // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(ResidualAddArgs) <= sizeof(Instr::payload), "payload");
 
@@ -178,7 +189,8 @@ __device__ MK_OPFN void op_residual_add(const Instr &in, char *) {
     const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
     const unsigned stride = nblk * blockDim.x;
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; ++t) {
     const float *pa = a.a + (size_t)t * a.n;
     const float *pb = a.b + (size_t)t * a.n;
     float *py = a.y + (size_t)t * a.n;
@@ -209,7 +221,8 @@ struct EmbedLookupArgs {
     float *y;             // f32 out row(s) [n_tokens x ncols]
     uint32_t ncols;       // 5120
     uint32_t row_stride;  // elements between consecutive rows (5120)
-    uint32_t n_tokens;    // U-loop: token[t] -> y + t*ncols; decode packs 1
+    uint32_t n_tokens;    // U-loop capacity; live bound min(n_tokens, *ntok_cell)
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(EmbedLookupArgs) <= sizeof(Instr::payload), "payload");
 
@@ -221,7 +234,8 @@ __device__ MK_OPFN void op_embed_lookup(const Instr &in, char *smem) {
     const unsigned tid = (blockIdx.x - in.block_lo) * blockDim.x + threadIdx.x;
     const unsigned stride = nblk * blockDim.x;
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; ++t) {
     if (threadIdx.x == 0)
         *bc = (int)ld_cg(reinterpret_cast<const unsigned *>(a.token) + t);
     __syncthreads();

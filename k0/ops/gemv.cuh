@@ -82,6 +82,7 @@ struct QuantQ8_1Args {
     // token (dense per width; every scheduled width is a 512 multiple, so the
     // consumer MMVQ derives the same block stride from its ncols). Decode: 1.
     uint32_t n_tokens;
+    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(QuantQ8_1Args) <= 112, "payload overflow");
 
@@ -104,6 +105,7 @@ struct MmvqQ40Args {
     // Weights are token-invariant. Decode packs n_tokens=1.
     uint32_t n_tokens;
     uint32_t dst_tstride;
+    const uint32_t *ntok_cell; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(MmvqQ40Args) <= 112, "payload overflow");
 
@@ -120,6 +122,7 @@ struct MmvqQ40FusedArgs {
     uint32_t row_hi;
     uint32_t n_tokens;    // U-loop strides as MmvqQ40Args
     uint32_t dst_tstride;
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(MmvqQ40FusedArgs) <= 112, "payload overflow");
 
@@ -135,6 +138,7 @@ struct MmvqAr16Args {
     uint32_t row_hi;
     uint32_t n_tokens;    // U-loop: y advances (ncols/32) q8_1 blocks per token
     uint32_t dst_tstride; // dst per-token slot (buffer table), f32 elements
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(MmvqAr16Args) <= 112, "payload overflow");
 
@@ -149,6 +153,7 @@ struct GemvF16Args {
     uint32_t row_hi;
     uint32_t n_tokens;    // U-loop: x advances by ncols per token
     uint32_t dst_tstride; // dst per-token slot (buffer table), f32 elements
+    const uint32_t *ntok_cell;
 };
 static_assert(sizeof(GemvF16Args) <= 112, "payload overflow");
 
@@ -233,7 +238,8 @@ static __device__ MK_OPFN void op_quant_q8_1(const Instr &I, char *smem) {
     const WarpSlice ws = warp_slice(I);
     const uint32_t nblk = a.ne0_padded / 32u;
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
+    for (uint32_t t = 0; t < nt; ++t) {
     const float *x = a.x + (size_t)t * a.ne00;
     int8_t *yt = reinterpret_cast<int8_t *>(a.y) + (size_t)t * nblk * 36u;
     for (uint32_t b = (uint32_t)ws.gw; b < nblk; b += (uint32_t)ws.nwarps) {
@@ -331,8 +337,9 @@ static __device__ MK_OPFN void op_mmvq_q4_0(const Instr &I, char *smem) {
     uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
     const WarpSlice ws = warp_slice(I);
     const size_t row_words = (size_t)npair * 9u;   // 18 B/block as u32
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    for (uint32_t t = 0; t < nt; ++t) {
     stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y) + (size_t)t * nblk * 9u,
                    (uint32_t)nblk * 9u);
     float *dst = a.dst + (size_t)t * a.dst_tstride;
@@ -357,8 +364,9 @@ static __device__ MK_OPFN void op_mmvq_q4_0_fused(const Instr &I, char *smem) {
     uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
     const WarpSlice ws = warp_slice(I);
     const size_t row_words = (size_t)npair * 9u;
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    for (uint32_t t = 0; t < nt; ++t) {
     stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y) + (size_t)t * nblk * 9u,
                    (uint32_t)nblk * 9u);
     float *dst = a.dst + (size_t)t * a.dst_tstride;
@@ -448,8 +456,9 @@ static __device__ MK_OPFN void op_mmvq_ar16(const Instr &I, char *smem) {
     uint32_t *ys = reinterpret_cast<uint32_t *>(smem);
     const WarpSlice ws = warp_slice(I);
     const size_t row_words = (size_t)npair * 5u;   // 10 B/block as u32
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    for (uint32_t t = 0; t < nt; ++t) {
     stage_words_cg(ys, reinterpret_cast<const uint32_t *>(a.y)
                            + (size_t)t * (a.ncols / 32u) * 9u,
                    (uint32_t)(a.ncols / 32u) * 9u);
@@ -500,8 +509,9 @@ static __device__ __forceinline__ void gemv_f16_common(const Instr &I, char *sme
     float *xs = reinterpret_cast<float *>(smem);
     const WarpSlice ws = warp_slice(I);
     const int ngrp = (int)(a.ncols / 8u);
+    const uint32_t nt = mk_live_ntok(a.n_tokens, a.ntok_cell);
 
-    for (uint32_t t = 0; t < a.n_tokens; ++t) {
+    for (uint32_t t = 0; t < nt; ++t) {
     stage_words_cg(reinterpret_cast<uint32_t *>(xs),
                    reinterpret_cast<const uint32_t *>(a.x + (size_t)t * a.ncols),
                    a.ncols);

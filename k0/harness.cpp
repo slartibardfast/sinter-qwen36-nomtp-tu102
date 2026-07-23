@@ -520,6 +520,9 @@ struct Runtime {
         alloc(R, "kv_row", 8);              // i64[1] KV append row = position
         alloc(R, "rs_row", 8);              // i64[1] = 0 (single-seq ring slot 0)
         alloc(R, "n_kv", 4);               // u32[1] padded KV window, read strong by FATTN
+        alloc(R, "n_tok", 4);              // u32[1] per-pass tile width (U-loop live bound)
+        { uint32_t one = 1;
+          CUDA_CHECK(cudaMemcpy(R.resolve("n_tok"), &one, 4, cudaMemcpyHostToDevice)); }
         mask_cap = pad_up(n_ctx, 256);
         alloc(R, "mask_f16", (size_t) mask_cap * 2);
         // Output cells the ops write but the harness reads via buf:logits /
@@ -564,6 +567,8 @@ struct Runtime {
         if (n_kv > mask_cap) throw std::runtime_error("mask: n_kv past n_ctx padding cap");
         uint32_t nkv32 = (uint32_t) n_kv;
         CUDA_CHECK(cudaMemcpyAsync(bufs["n_kv"].ptr, &nkv32, 4, cudaMemcpyHostToDevice, pstream));
+        static const uint32_t one_tok = 1;
+        CUDA_CHECK(cudaMemcpyAsync(bufs["n_tok"].ptr, &one_tok, 4, cudaMemcpyHostToDevice, pstream));
         static std::vector<uint16_t> mask;
         mask.resize((size_t) n_kv);
         for (int64_t j = 0; j < n_kv; j++)
@@ -663,6 +668,12 @@ static uint32_t slot_elems(const PackCtx &c, const Jv &a, const char *k) {
     return (uint32_t) (it->second.bytes / 4 / c.prog_u);
 }
 
+// The per-pass tile-width cell every U-looping op's live bound reads
+// (min(payload capacity, cell); the n_kv-cell pattern).
+static const uint32_t *ntok_cell(const PackCtx &c) {
+    return reinterpret_cast<const uint32_t *>(c.R.resolve("n_tok"));
+}
+
 template <class Args>
 static mk::Instr with_payload(const mk::Instr &proto, const Args &args) {
     static_assert(sizeof(Args) <= sizeof(proto.payload), "payload overflow");
@@ -702,6 +713,7 @@ static void pack_EMBED_LOOKUP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     e.ncols      = (uint32_t) arg_i(a, "n_embd");
     e.row_stride = e.ncols;
     e.n_tokens   = arg_ntok(a);
+    e.ntok_cell  = ntok_cell(c);
     emit(out, c.proto, e);
 }
 
@@ -742,6 +754,7 @@ static void pack_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
         if (r.sum) r.sum = r.sum + rs * (int64_t) r.ncols;
         r.n_tokens = 1;
     }
+    r.ntok_cell = r.n_tokens == 1 ? nullptr : ntok_cell(c);
     emit(out, c.proto, r);
 }
 
@@ -752,6 +765,7 @@ static void pack_QUANT_Q8_1(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out
     q.ne00       = (uint32_t) arg_i(a, "elems");
     q.ne0_padded = (uint32_t) pad_up(q.ne00, 512);  // MATRIX_ROW_PADDING
     q.n_tokens   = arg_ntok(a);
+    q.ntok_cell  = ntok_cell(c);
     emit(out, c.proto, q);
 }
 
@@ -766,6 +780,7 @@ static void pack_gemv_f16_common(const Jv &a, PackCtx &c, std::vector<mk::Instr>
     g.row_hi = (uint32_t) arg_i(a, "row_hi");
     g.n_tokens    = single_row ? 1 : arg_ntok(a);
     g.dst_tstride = single_row ? 0 : slot_elems(c, a, "dst");
+    g.ntok_cell   = single_row ? nullptr : ntok_cell(c);
     emit(out, c.proto, g);
 }
 static void pack_GEMV_F16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -787,6 +802,7 @@ static void pack_MMVQ_Q4_0(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     m.row_hi = (uint32_t) arg_i(a, "row_hi");
     m.n_tokens    = arg_ntok(a);
     m.dst_tstride = slot_elems(c, a, "dst");
+    m.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, m);
 }
 static void pack_MMVQ_Q4_0_FUSED(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -800,6 +816,7 @@ static void pack_MMVQ_Q4_0_FUSED(const Jv &a, PackCtx &c, std::vector<mk::Instr>
     m.row_hi = (uint32_t) arg_i(a, "row_hi");
     m.n_tokens    = arg_ntok(a);
     m.dst_tstride = slot_elems(c, a, "dst");
+    m.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, m);
 }
 static void pack_MMVQ_AR16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -812,6 +829,7 @@ static void pack_MMVQ_AR16(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     m.row_hi = (uint32_t) arg_i(a, "row_hi");
     m.n_tokens    = arg_ntok(a);
     m.dst_tstride = slot_elems(c, a, "dst");
+    m.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, m);
 }
 
@@ -827,6 +845,7 @@ static void pack_CONV_SHIFT_CONCAT(const Jv &a, PackCtx &c, std::vector<mk::Inst
     s.row_stride = (int64_t) CONV_STATE_N;          // one conv-cache row
     s.n_tokens     = (int32_t) arg_ntok(a);
     s.xnew_tstride = (int32_t) slot_elems(c, a, "token_col");
+    s.ntok_cell    = ntok_cell(c);
     emit(out, c.proto, s);
 }
 static void pack_SSM_CONV_SILU(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -837,6 +856,7 @@ static void pack_SSM_CONV_SILU(const Jv &a, PackCtx &c, std::vector<mk::Instr> &
     s.channels = (int32_t) arg_i(a, "channels");
     s.n_tokens    = (int32_t) arg_ntok(a);
     s.dst_tstride = (int32_t) slot_elems(c, a, "dst");
+    s.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, s);
 }
 static void pack_QK_L2NORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -854,6 +874,7 @@ static void pack_QK_L2NORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     n.n_tokens    = (int32_t) arg_ntok(a);
     n.src_tstride = (int32_t) slot_elems(c, a, "buf");
     n.dst_tstride = n.src_tstride;               // in place
+    n.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, n);
 }
 static void pack_GDN_GATES(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -867,6 +888,7 @@ static void pack_GDN_GATES(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     g.n_heads   = (int32_t) arg_i(a, "heads");
     g.n_tokens  = (int32_t) arg_ntok(a);
     g.tstride   = (int32_t) slot_elems(c, a, "alpha");
+    g.ntok_cell = ntok_cell(c);
     emit(out, c.proto, g);
 }
 static void pack_GDN_STEP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -885,6 +907,7 @@ static void pack_GDN_STEP(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) 
     s.n_tokens    = (int32_t) arg_ntok(a);
     s.qkv_tstride = (int32_t) slot_elems(c, a, "qkv");
     s.out_tstride = (int32_t) slot_elems(c, a, "dst");
+    s.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, s);
 }
 static void pack_GATED_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -899,6 +922,7 @@ static void pack_GATED_RMSNORM(const Jv &a, PackCtx &c, std::vector<mk::Instr> &
     g.x_tstride   = (int32_t) slot_elems(c, a, "src");
     g.z_tstride   = (int32_t) slot_elems(c, a, "gate");
     g.dst_tstride = (int32_t) slot_elems(c, a, "dst");
+    g.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, g);
 }
 static void pack_STATE_LOAD(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -937,6 +961,7 @@ static void pack_QK_NORM_ROPE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     q.n_tokens    = arg_ntok(a);
     q.src_tstride = slot_elems(c, a, "q_src");
     q.dst_tstride = slot_elems(c, a, "q_dst");
+    q.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, q);
 
     mk::QkNormRopeArgs k{};
@@ -949,6 +974,7 @@ static void pack_QK_NORM_ROPE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     k.n_tokens    = arg_ntok(a);
     k.src_tstride = slot_elems(c, a, "k_src");
     k.dst_tstride = slot_elems(c, a, "k_dst");
+    k.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, k);
 }
 static void pack_KV_APPEND(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -961,6 +987,7 @@ static void pack_KV_APPEND(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     kk.row_width = rw;
     kk.n_tokens = arg_ntok(a);
     kk.src_tstride = slot_elems(c, a, "k_src");
+    kk.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, kk);
     mk::KvAppendArgs vv{};
     vv.src = dev_f32(c.R, a, "v_src"); vv.row_idx = row;
@@ -968,6 +995,7 @@ static void pack_KV_APPEND(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     vv.row_width = rw;
     vv.n_tokens = arg_ntok(a);
     vv.src_tstride = slot_elems(c, a, "v_src");
+    vv.ntok_cell   = ntok_cell(c);
     emit(out, c.proto, vv);
 }
 static void pack_FATTN_DECODE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -984,6 +1012,7 @@ static void pack_FATTN_DECODE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     f.n_tokens        = arg_ntok(a);
     f.q_tstride       = slot_elems(c, a, "q");
     f.partial_tstride = slot_elems(c, a, "partials");
+    f.ntok_cell       = ntok_cell(c);
     c.out_idx_fattn.push_back(out.size());             // record for reporting count
     emit(out, c.proto, f);
 }
@@ -997,6 +1026,7 @@ static void pack_FATTN_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &o
     f.n_tokens        = arg_ntok(a);
     f.partial_tstride = slot_elems(c, a, "partials");
     f.dst_tstride     = slot_elems(c, a, "dst");
+    f.ntok_cell       = ntok_cell(c);
     emit(out, c.proto, f);
 }
 static void pack_ATTN_GATE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -1009,6 +1039,7 @@ static void pack_ATTN_GATE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     g.n_tokens     = arg_ntok(a);
     g.attn_tstride = slot_elems(c, a, "attn");
     g.gate_tstride = slot_elems(c, a, "gate_src");
+    g.ntok_cell    = ntok_cell(c);
     emit(out, c.proto, g);
 }
 static void pack_LOGITS_EMIT(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -1036,6 +1067,7 @@ static void pack_XCHG_PUSH(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out)
     x.n_elems       = (int) arg_i(a, "n_elems");
     x.n_tokens      = (int) arg_ntok(a);
     x.lp_tstride    = (int) slot_elems(c, a, "local_partial");
+    x.ntok_cell     = ntok_cell(c);
     emit(out, c.proto, x);
 }
 static void pack_XCHG_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &out) {
@@ -1052,6 +1084,7 @@ static void pack_XCHG_REDUCE(const Jv &a, PackCtx &c, std::vector<mk::Instr> &ou
     x.lp_tstride    = (int) slot_elems(c, a, "local_partial");
     if (x.lp_tstride != (int) slot_elems(c, a, "out"))
         throw std::runtime_error("XCHG_REDUCE: local_partial/out slot mismatch");
+    x.ntok_cell = ntok_cell(c);
     if (c.out_idx_xchg) c.out_idx_xchg->push_back(out.size());
     emit(out, c.proto, x);
 }
@@ -1662,6 +1695,9 @@ static void gpu_alloc_buffers(GpuCtx &c, const Jv &program, bool skip_kv = false
     alloc("kv_row", 8 * (size_t) u_max);                  // i64 KV append row per token
     alloc("rs_row", 8);
     alloc("n_kv", 4);                                     // u32 padded KV window (strong read)
+    { void *p = alloc("n_tok", 4);                        // u32 per-pass tile width (U-loop live bound)
+      uint32_t one = 1;
+      CUDA_CHECK(cudaMemcpy(p, &one, 4, cudaMemcpyHostToDevice)); }
     c.mask_cap = pad_up(c.n_ctx, 256);
     alloc("mask_f16", (size_t) c.mask_cap * 2 * (size_t) u_max);   // u_max causal rows
     alloc("result_output", (size_t)(c.n_vocab_full / 2) * 4);  // this GPU's vocab half
@@ -1709,6 +1745,8 @@ static int64_t gpu_set_inputs(GpuCtx &c, int64_t pos) {
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["positions"].ptr, p4, 16, cudaMemcpyHostToDevice, c.pstream));
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["kv_row"].ptr, &row, 8, cudaMemcpyHostToDevice, c.pstream));
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["n_kv"].ptr, &nkv32, 4, cudaMemcpyHostToDevice, c.pstream));
+    static const uint32_t one_tok = 1;
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["n_tok"].ptr, &one_tok, 4, cudaMemcpyHostToDevice, c.pstream));
     static std::vector<uint16_t> mask;
     mask.resize((size_t) n_kv);
     for (int64_t j = 0; j < n_kv; j++) mask[(size_t) j] = j <= n_past ? F16_ZERO : F16_NEG_INF;
@@ -1754,6 +1792,9 @@ static int64_t gpu_set_inputs_tile(GpuCtx &c, int64_t pos0, int64_t U) {
             mrow[j] = j <= pos0 + t ? F16_ZERO : F16_NEG_INF;
     }
     uint32_t nkv32 = (uint32_t) n_kv;
+    static uint32_t u32_tok;   // stable source for the async copy
+    u32_tok = (uint32_t) U;
+    CUDA_CHECK(cudaMemcpyAsync(c.bufs["n_tok"].ptr, &u32_tok, 4, cudaMemcpyHostToDevice, c.pstream));
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["positions"].ptr, p4.data(), (size_t) U * 16,
                                cudaMemcpyHostToDevice, c.pstream));
     CUDA_CHECK(cudaMemcpyAsync(c.bufs["kv_row"].ptr, rows.data(), (size_t) U * 8,

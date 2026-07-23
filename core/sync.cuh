@@ -77,6 +77,18 @@ __device__ __forceinline__ float4 ld_cg(const float4 *p) {
     return v;
 }
 
+// Live prefill U-loop bound: min(the payload's n_tokens CAPACITY, the
+// host-written per-pass tile-width cell "n_tok", strong-read like n_kv). A
+// decode program packs capacity 1, so the cell never binds there; a pass
+// narrower than the program's U (the tile remainder, or a per-token pass
+// through a prefill program) runs exactly its own width. Null cell (an
+// unpacked payload) degrades to the capacity.
+__device__ __forceinline__ unsigned mk_live_ntok(unsigned cap, const unsigned *cell) {
+    if (cell == nullptr) return cap;
+    const unsigned w = ld_cg(cell);
+    return w < cap ? w : cap;
+}
+
 // The Y02 interpreter instruction boundary. Monotonic arrival counter,
 // wrap-safe target compare, no reset (sense lives in the target): each
 // crossing, every block release-arrives then a single elected thread spins

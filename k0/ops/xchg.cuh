@@ -50,6 +50,7 @@ struct XchgPushArgs {
     // dense at t*n_elems (the mailbox is sized n_elems*U). Decode packs 1.
     int n_tokens;
     int lp_tstride;
+    const unsigned *ntok_cell; // live bound min(n_tokens, *ntok_cell)
 };
 static_assert(sizeof(XchgPushArgs) <= sizeof(((Instr *)0)->payload),
               "XchgPushArgs exceeds Instr payload");
@@ -65,6 +66,7 @@ struct XchgReduceArgs {
     int gpu_index;              // 0 or 1 — selects the fixed fold order
     int n_tokens;               // U-loop: as XchgPushArgs; one seqno per site
     int lp_tstride;             // local_partial AND out per-token slot
+    const unsigned *ntok_cell;
 };
 static_assert(sizeof(XchgReduceArgs) <= sizeof(((Instr *)0)->payload),
               "XchgReduceArgs exceeds Instr payload");
@@ -82,7 +84,8 @@ static __device__ MK_OPFN void op_xchg_push(const Instr &in, char *) {
     const int nthr  = lanes * (int)blockDim.x;
 
     const int n4 = a.n_elems >> 2;
-    for (int t = 0; t < a.n_tokens; t++) {
+    const int nt = (int) mk_live_ntok((unsigned) a.n_tokens, a.ntok_cell);
+    for (int t = 0; t < nt; t++) {
         const float *lp = a.local_partial + (int64_t) t * a.lp_tstride;
         float *pp       = a.peer_payload + (int64_t) t * a.n_elems;
         const float4 *src4 = reinterpret_cast<const float4 *>(lp);
@@ -127,7 +130,8 @@ static __device__ MK_OPFN void op_xchg_reduce(const Instr &in, char *) {
     // where p0 is GPU0's partial and p1 is GPU1's. This GPU owns
     // local_partial; the peer's slice is in my_payload. gpu_index picks which
     // is the left addend so the summation order matches bit-for-bit.
-    for (int t = 0; t < a.n_tokens; t++) {
+    const int nt = (int) mk_live_ntok((unsigned) a.n_tokens, a.ntok_cell);
+    for (int t = 0; t < nt; t++) {
         const float *lp = a.local_partial + (int64_t) t * a.lp_tstride;
         const float *mp = a.my_payload + (int64_t) t * a.n_elems;
         float *out      = a.out + (int64_t) t * a.lp_tstride;
