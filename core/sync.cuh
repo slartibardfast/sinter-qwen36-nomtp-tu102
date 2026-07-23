@@ -83,6 +83,11 @@ __device__ __forceinline__ float4 ld_cg(const float4 *p) {
 // narrower than the program's U (the tile remainder, or a per-token pass
 // through a prefill program) runs exactly its own width. Null cell (an
 // unpacked payload) degrades to the capacity.
+// A zero width (host bug or unpacked payload) yields ZERO iterations in every
+// consumer, including the epilogue's t0 = nt-1 underflow (t0 = UINT32_MAX
+// never satisfies t < 0): a silent no-op, deliberately preferred over running
+// one iteration on garbage strides. Adjudicated in the 2026-07-23 minors
+// triage (ledger).
 __device__ __forceinline__ unsigned mk_live_ntok(unsigned cap, const unsigned *cell) {
     if (cell == nullptr) return cap;
     const unsigned w = ld_cg(cell);

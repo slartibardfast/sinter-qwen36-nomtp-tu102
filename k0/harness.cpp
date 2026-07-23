@@ -2653,6 +2653,10 @@ void mk_dual_setup(const MkPtrMap &pm, const char *program_path,
                 if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled)
                     throw std::runtime_error("mk enable peer access");
             }
+        if (program_prefill_u(program) > 1)
+        throw std::runtime_error("mk backend: prefill programs are not servable through "
+                                 "the .so path (its mailboxes/staging are u_max=1); "
+                                 "decode program only");
     int n_sites = 0;
     for (auto &I : program.at("instructions").arr)
         if (I.at("kind").str == "OP_XCHG_REDUCE") n_sites++;
