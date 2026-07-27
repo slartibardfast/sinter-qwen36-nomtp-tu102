@@ -43,6 +43,7 @@ struct Host {
     unsigned *d_cells = nullptr;         // y02 counter | doorbell_dev | err_dev
     int32_t *d_token = nullptr;          // per-pass token-id input cell
     long long *d_pass_cycles = nullptr;  // G15 ring (block-0 clock64 deltas)
+    long long *d_pass_ns = nullptr;      // paired [start,end] %globaltimer ns ring
     unsigned pass_cycles_cap = 0;
     long long *d_op_cycles = nullptr;    // REDLINE: per-kind cycles (OP_KIND_COUNT)
     long long *d_op_tele = nullptr;      // plan/0144: per-op-instance {gs,ge,cyc}*n_instr
@@ -82,6 +83,20 @@ void host_destroy(Host &h);
 // Read back up to `count` device-recorded per-pass cycle deltas, oldest slot
 // first (ring order; caller indexes by (pass-1) % cap).
 bool host_read_pass_cycles(Host &h, long long *out, unsigned count);
+// Read back the paired %globaltimer ns ring: 2*count longs, slot i at
+// out[2*i]=start, out[2*i+1]=end (same ring indexing as pass_cycles).
+bool host_read_pass_ns(Host &h, long long *out, unsigned count);
+
+// Per-pass on-device stats over the newest n_samples ring slots. mean/min/max
+// come from the globaltimer ns ring (authoritative wall time); ghz is the
+// run's measured SM clock (clock64 cycles / ns), reported so every number
+// carries its clock domain instead of assuming a conversion constant.
+struct PassStats {
+    double mean_ms = 0, min_ms = 0, max_ms = 0, ghz = 0;
+    unsigned cnt = 0;
+    bool ok = false;
+};
+PassStats read_pass_stats(Host &h, long long n_samples);
 
 // REDLINE itemization: zero the per-kind cycle accumulator (call between the
 // warmup and timed regions), and read back OP_KIND_COUNT accumulated totals.

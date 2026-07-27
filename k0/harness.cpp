@@ -1455,23 +1455,12 @@ static int bench_run(Runtime &rt, Launcher &ln, int gpu, int64_t n_tokens) {
     printf("bench: %lld tokens in %.3f s = %.2f tok/s [%s]\n",
            (long long) n_tokens, sec, n_tokens / sec,
            idle ? "GPU otherwise idle" : "CONTENDED/INDICATIVE: GPU not idle at start");
-    // On-device per-pass cycle deltas (block-0 clock64) from the G15 ring.
-    unsigned cap = ln.h.pass_cycles_cap;
-    if (cap && n_tokens > 0) {
-        std::vector<long long> cyc(cap);
-        if (mk::host_read_pass_cycles(ln.h, cyc.data(), cap)) {
-            unsigned cnt = (unsigned) std::min<int64_t>(n_tokens, cap);
-            double sum = 0; long long mn = cyc[0], mx = cyc[0];
-            for (unsigned k = 0; k < cnt; k++) {
-                long long v = cyc[(ln.h.pass - 1 - k) % cap];
-                sum += (double) v; if (v < mn) mn = v; if (v > mx) mx = v;
-            }
-            // TU102 boost 1455 MHz; cycles -> ms.
-            const double gHz = 1.455;
-            printf("bench: per-pass on-device clock64: mean %.3f ms, min %.3f, max %.3f (%u samples)\n",
-                   sum / cnt / gHz / 1e6, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
-        }
-    }
+    // On-device per-pass time from the paired G15 rings (globaltimer-derived).
+    mk::PassStats ps = mk::read_pass_stats(ln.h, n_tokens);
+    if (ps.ok)
+        printf("bench: per-pass on-device globaltimer: mean %.3f ms, min %.3f, max %.3f "
+               "(%u samples; measured SM %.0f MHz)\n",
+               ps.mean_ms, ps.min_ms, ps.max_ms, ps.cnt, ps.ghz * 1e3);
     return 0;
 }
 
@@ -2105,8 +2094,9 @@ static void watermark(GpuCtx g2[2], const char *tag, int64_t pos) {
 // REDLINE itemization: per-op-kind clock64 breakdown from block 0. Only an
 // MK_PROFILE-built kernel fills op_cycles (otherwise all zero -> no print). The
 // caller resets after warmup; here we read back, convert cycles->ms per pass at
-// 1.455 GHz, and print ms + %-of-pass per kind, the boundary total, the reduce
-// total, and the on-device sum cross-checked against the pass_cycles wall.
+// the run's MEASURED clock (ghz from the paired pass rings, never an assumed
+// constant), and print ms + %-of-pass per kind, the boundary total, the reduce
+// total, and the on-device sum cross-checked against the per-pass mean.
 static const char *KIND_NAME[mk::OP_KIND_COUNT] = {
     "NOP", "BOUNDARY", "EMBED_LOOKUP", "RMSNORM", "QUANT_Q8_1",
     "HEAD_GEMV_F16", "LOGITS_EMIT", "MMVQ_Q4_0", "MMVQ_Q4_0_FUSED",
@@ -2119,14 +2109,18 @@ static const char *FATTN_PHASE_NAME[mk::MK_FATTN_NPHASE] = {
     "KLOAD", "QK_HMMA", "SOFTMAX", "VLOAD", "PV_HMMA", "SETUP+TAIL"};
 
 static void print_op_breakdown(mk::Host &h, int gpu, int64_t n_tokens,
-                               double pass_ms) {
+                               double pass_ms, double ghz) {
     long long oc[mk::MK_OP_CYCLES_LEN] = {0};
     if (!mk::host_read_op_cycles(h, oc, mk::MK_OP_CYCLES_LEN)) return;
     long long sum = 0;
     for (int k = 0; k < mk::OP_KIND_COUNT; k++) sum += oc[k];
     if (sum == 0) return;  // non-profile kernel: nothing recorded
-    const double gHz = 1.455;
-    auto ms = [&](long long c) { return (double) c / n_tokens / gHz / 1e6; };
+    if (ghz <= 0) {
+        printf("PROFILE gpu %d: op cycles recorded but no measured clock "
+               "(pass rings empty); raw cycles withheld from ms\n", gpu);
+        return;
+    }
+    auto ms = [&](long long c) { return (double) c / n_tokens / ghz / 1e6; };
     const double total_ms = ms(sum);
     printf("PROFILE gpu %d: block-0 itemization over %lld passes "
            "(on-device sum %.3f ms/pass vs pass_cycles wall %.3f ms)\n",
@@ -2317,26 +2311,14 @@ static int bench_run_tensor(gguf::File &gg, const Jv &program, int64_t n_ctx,
     printf("bench-tensor: %lld tokens in %.3f s = %.2f tok/s "
            "[contended-indicative: host-coordinated 2-GPU]\n",
            (long long) n_tokens, sec, n_tokens / sec);
-    // per-pass on-device clock64 from each GPU's block-0 G15 ring.
+    // per-pass on-device time from each GPU's paired G15 rings (globaltimer).
     for (int g = 0; g < 2; g++) {
-        unsigned cap = g2[g].ln.h.pass_cycles_cap;
-        if (!cap || n_tokens <= 0) continue;
-        std::vector<long long> cyc(cap);
-        double pass_ms = 0;
-        if (mk::host_read_pass_cycles(g2[g].ln.h, cyc.data(), cap)) {
-            unsigned cnt = (unsigned) std::min<int64_t>(n_tokens, cap);
-            double sum = 0; long long mn = cyc[0], mx = cyc[0];
-            for (unsigned k = 0; k < cnt; k++) {
-                long long v = cyc[(g2[g].ln.h.pass - 1 - k) % cap];
-                sum += (double) v; if (v < mn) mn = v; if (v > mx) mx = v;
-            }
-            const double gHz = 1.455;
-            pass_ms = sum / cnt / gHz / 1e6;
-            printf("bench-tensor: gpu %d per-pass on-device clock64: mean %.3f ms, "
-                   "min %.3f, max %.3f (%u samples)\n",
-                   g, pass_ms, mn / gHz / 1e6, mx / gHz / 1e6, cnt);
-        }
-        print_op_breakdown(g2[g].ln.h, g, n_tokens, pass_ms);
+        mk::PassStats ps = mk::read_pass_stats(g2[g].ln.h, n_tokens);
+        if (ps.ok)
+            printf("bench-tensor: gpu %d per-pass on-device globaltimer: mean %.3f ms, "
+                   "min %.3f, max %.3f (%u samples; measured SM %.0f MHz)\n",
+                   g, ps.mean_ms, ps.min_ms, ps.max_ms, ps.cnt, ps.ghz * 1e3);
+        print_op_breakdown(g2[g].ln.h, g, n_tokens, ps.mean_ms, ps.ghz);
         if (const char *tp = getenv("MK_TELE"))
             dump_telemetry(g2[g], g, tp, program, gg, pos0);  // n_kv ~= pos0 at deep decode
     }
@@ -2554,21 +2536,12 @@ static int prefill_bench_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
            (long long) n_tokens, (long long) n_tiles, sec, n_tokens / sec,
            (long long) n_tokens);
     for (int g = 0; g < 2; g++) {
-        unsigned cap = g2[g].ln.h.pass_cycles_cap;
-        double pass_ms = 0;
-        if (cap && n_tiles > 0) {
-            std::vector<long long> cyc(cap);
-            if (mk::host_read_pass_cycles(g2[g].ln.h, cyc.data(), cap)) {
-                unsigned cnt = (unsigned) std::min<int64_t>(n_tiles, cap);
-                double sum = 0;
-                for (unsigned k = 0; k < cnt; k++)
-                    sum += (double) cyc[(g2[g].ln.h.pass - 1 - k) % cap];
-                pass_ms = sum / cnt / 1.455 / 1e6;
-                printf("prefill-bench: gpu %d per-pass on-device clock64 mean %.3f ms "
-                       "(%u samples, whole ramp, no warmup cut)\n", g, pass_ms, cnt);
-            }
-        }
-        print_op_breakdown(g2[g].ln.h, g, n_tiles, pass_ms);
+        mk::PassStats ps = mk::read_pass_stats(g2[g].ln.h, n_tiles);
+        if (ps.ok)
+            printf("prefill-bench: gpu %d per-pass on-device globaltimer mean %.3f ms "
+                   "(%u samples, whole ramp, no warmup cut; measured SM %.0f MHz)\n",
+                   g, ps.mean_ms, ps.cnt, ps.ghz * 1e3);
+        print_op_breakdown(g2[g].ln.h, g, n_tiles, ps.mean_ms, ps.ghz);
         if (const char *tp = getenv("MK_TELE"))
             dump_telemetry(g2[g], g, tp, program, gg, last_n_kv);
     }

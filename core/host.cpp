@@ -2,10 +2,12 @@
 // through its stub address (mk_interp_func) so this TU stays pure C++.
 #include "host.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace mk {
 
@@ -78,8 +80,15 @@ bool host_init(Host &h, int device, unsigned pass_cycles_cap) {
             return false;
         cudaMemset(h.d_pass_cycles, 0, (size_t)pass_cycles_cap * 8);
     }
+    if (pass_cycles_cap) {
+        if (!ck(cudaMalloc(&h.d_pass_ns, (size_t)pass_cycles_cap * 16),
+                "d_pass_ns"))
+            return false;
+        cudaMemset(h.d_pass_ns, 0, (size_t)pass_cycles_cap * 16);
+    }
     h.ctl.pass_cycles = h.d_pass_cycles;
     h.ctl.pass_cycles_cap = pass_cycles_cap;
+    h.ctl.pass_ns = h.d_pass_ns;
 
     // REDLINE per-kind cycle accumulator (OP_KIND_COUNT longs) plus the FATTN
     // sub-phase slots (MK_OP_CYCLES_LEN total). Always allocated (tiny); only an
@@ -237,6 +246,7 @@ void host_destroy(Host &h) {
     cudaFree(h.d_cells);
     cudaFree(h.d_token);
     cudaFree(h.d_pass_cycles);
+    cudaFree(h.d_pass_ns);
     cudaFree(h.d_op_cycles);
     cudaFree(h.d_op_tele);
     cudaFree(h.d_smid_census);
@@ -256,6 +266,44 @@ bool host_read_pass_cycles(Host &h, long long *out, unsigned count) {
                               cudaMemcpyDeviceToHost, h.cstream),
               "pass_cycles read") &&
            ck(cudaStreamSynchronize(h.cstream), "pass_cycles sync");
+}
+
+bool host_read_pass_ns(Host &h, long long *out, unsigned count) {
+    if (!h.d_pass_ns || count > h.pass_cycles_cap)
+        return false;
+    return ck(cudaMemcpyAsync(out, h.d_pass_ns, (size_t)count * 16,
+                              cudaMemcpyDeviceToHost, h.cstream),
+              "pass_ns read") &&
+           ck(cudaStreamSynchronize(h.cstream), "pass_ns sync");
+}
+
+PassStats read_pass_stats(Host &h, long long n_samples) {
+    PassStats s;
+    const unsigned cap = h.pass_cycles_cap;
+    if (!cap || n_samples <= 0)
+        return s;
+    std::vector<long long> cyc(cap), nsp(2 * (size_t)cap);
+    if (!host_read_pass_cycles(h, cyc.data(), cap) ||
+        !host_read_pass_ns(h, nsp.data(), cap))
+        return s;
+    s.cnt = (unsigned)std::min<long long>(n_samples, cap);
+    double csum = 0, nsum = 0, mn = 0, mx = 0;
+    for (unsigned k = 0; k < s.cnt; k++) {
+        const unsigned slot = (h.pass - 1 - k) % cap;
+        const double ns = (double)(nsp[2 * slot + 1] - nsp[2 * slot]);
+        csum += (double)cyc[slot];
+        nsum += ns;
+        if (k == 0 || ns < mn) mn = ns;
+        if (k == 0 || ns > mx) mx = ns;
+    }
+    if (nsum <= 0)
+        return s;   // ns ring unwritten (pre-change kernel): no stats, no guess
+    s.mean_ms = nsum / s.cnt / 1e6;
+    s.min_ms = mn / 1e6;
+    s.max_ms = mx / 1e6;
+    s.ghz = csum / nsum;
+    s.ok = true;
+    return s;
 }
 
 bool host_reset_op_cycles(Host &h) {

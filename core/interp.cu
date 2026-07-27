@@ -88,8 +88,17 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
             return;
 
         long long t0 = 0;
-        if (blockIdx.x == 0 && threadIdx.x == 0 && ctl.pass_cycles)
+        if (blockIdx.x == 0 && threadIdx.x == 0 && ctl.pass_cycles) {
             t0 = clock64();
+            if (ctl.pass_ns) {
+                // Wall-ns twin, start stamp. Stored to the ring (not carried in
+                // a register) so the pass body's live set is untouched; `pass`
+                // names the same slot here and at the epilogue.
+                long long g0;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(g0));
+                ctl.pass_ns[2 * ((pass - 1) % ctl.pass_cycles_cap)] = g0;
+            }
+        }
 
 #ifdef MK_PROFILE
         // REDLINE itemization: block-0 thread-0 attributes clock64 cycles per
@@ -169,9 +178,15 @@ mk_interp(const mk::Instr *program, mk::Program hdr, mk::Control ctl)
         const unsigned err = *slab_word;
         __syncthreads();
         if (blockIdx.x == 0 && threadIdx.x == 0) {
-            if (ctl.pass_cycles)
+            if (ctl.pass_cycles) {
                 ctl.pass_cycles[(pass - 1) % ctl.pass_cycles_cap] =
                     clock64() - t0;
+                if (ctl.pass_ns) {
+                    long long g1;   // wall-ns twin, end stamp beside the start
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(g1));
+                    ctl.pass_ns[2 * ((pass - 1) % ctl.pass_cycles_cap) + 1] = g1;
+                }
+            }
             if (!err)
                 st_release_sys(const_cast<unsigned *>(ctl.done), pass);
         }

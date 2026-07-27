@@ -82,6 +82,14 @@ struct Control {
     long long *op_tele;       // n_instr*3 longs, nullptr disables
     unsigned  *smid_census;   // GRID_BLOCKS entries, nullptr disables
     unsigned   op_tele_cap;   // op_tele ring capacity in ops (bounds the write)
+    // Wall-ns twin of pass_cycles: paired [start,end] %globaltimer stamps per
+    // slot (pass_cycles_cap slots, 2 longs each), written by the same block-0
+    // thread-0 at the same two capture points. Per-pass time is reported from
+    // this ring in ns, and cycles/ns gives the run's measured SM clock, so no
+    // report depends on an assumed frequency (a fixed cycles->ms constant went
+    // stale at the 1455->1905 SM lock change and manufactured a phantom decode
+    // regression; plan/0143 ledger 2026-07-27). nullptr disables.
+    long long *pass_ns;
 };
 
 } // namespace mk
