@@ -171,12 +171,13 @@ static void test_glue(int dev) {
 // ---------------------------------------------------------------------------
 struct G15Result {
     double dev_ns_per_pass;
+    double meas_ghz;     // the run's measured SM clock (globaltimer-derived)
     double host_ns_per_pass;
     unsigned boundaries; // per pass, incl. the interpreter's epilogue one
 };
 
 static bool run_g15(int dev, bool with_nop, unsigned n_bound, unsigned warmup,
-                    unsigned measure, double sm_ghz, G15Result &r) {
+                    unsigned measure, G15Result &r) {
     mk::Host h;
     if (!mk::host_init(h, dev, warmup + measure))
         return false;
@@ -201,14 +202,14 @@ static bool run_g15(int dev, bool with_nop, unsigned n_bound, unsigned warmup,
             return false;
     const auto t1 = std::chrono::steady_clock::now();
 
-    std::vector<long long> cyc(warmup + measure);
-    if (!mk::host_read_pass_cycles(h, cyc.data(), warmup + measure))
+    // Globaltimer-derived per-pass ns over the newest `measure` slots (warmup
+    // excluded by ring recency); the measured clock rides along, so no assumed
+    // frequency enters the number (call/0038 — the boost attr is NOT the lock).
+    mk::PassStats ps = mk::read_pass_stats(h, measure);
+    if (!ps.ok)
         return false;
-    double sum = 0.0;
-    for (unsigned i = warmup; i < warmup + measure; i++)
-        sum += (double)cyc[i];
-
-    r.dev_ns_per_pass = sum / measure / sm_ghz;
+    r.dev_ns_per_pass = ps.mean_ms * 1e6;
+    r.meas_ghz = ps.ghz;
     r.host_ns_per_pass =
         std::chrono::duration<double, std::nano>(t1 - t0).count() / measure;
     r.boundaries = n_bound + 1; // + the interpreter's epilogue boundary
@@ -272,16 +273,15 @@ int main(int argc, char **argv) {
     cudaGetDeviceProperties(&p, dev);
     int khz = 0;
     cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev);
-    const double sm_ghz = khz / 1e6;
-    std::printf("device %d: %s, %d SMs, SM clock (attr) %.0f MHz\n", dev,
-                p.name, p.multiProcessorCount, sm_ghz * 1e3);
+    std::printf("device %d: %s, %d SMs, boost max (attr, NOT the lock) %d MHz\n",
+                dev, p.name, p.multiProcessorCount, khz / 1000);
 
     test_glue(dev);
 
     constexpr unsigned N_BOUND = 500, WARMUP = 32, MEASURE = 256;
     G15Result bare{}, nop{};
-    if (!run_g15(dev, false, N_BOUND, WARMUP, MEASURE, sm_ghz, bare) ||
-        !run_g15(dev, true, N_BOUND, WARMUP, MEASURE, sm_ghz, nop)) {
+    if (!run_g15(dev, false, N_BOUND, WARMUP, MEASURE, bare) ||
+        !run_g15(dev, true, N_BOUND, WARMUP, MEASURE, nop)) {
         CHECK(false, "G15 run");
     } else {
         const double bare_b = bare.dev_ns_per_pass / bare.boundaries;
@@ -292,14 +292,14 @@ int main(int argc, char **argv) {
         // boundary crossings.
         const double pct = nop.dev_ns_per_pass / 13.7e6 * 100.0;
         std::printf(
-            "G15 (%u boundaries+epilogue, %u passes, clock %.0f MHz):\n"
+            "G15 (%u boundaries+epilogue, %u passes, measured SM %.0f MHz):\n"
             "  boundaries only : dev %.1f us/pass host %.1f us/pass -> "
             "%.0f ns/boundary\n"
             "  nop + boundary  : dev %.1f us/pass host %.1f us/pass -> "
             "%.0f ns/boundary (fetch+dispatch adds %.0f ns/instr)\n"
             "  vs Y02 estimate 400 ns, grid.sync comparator 825 ns\n"
             "  pass overhead %.3f%% of the 13.7 ms budget -> %s (gate: 2%%)\n",
-            N_BOUND, MEASURE, sm_ghz * 1e3, bare.dev_ns_per_pass / 1e3,
+            N_BOUND, MEASURE, bare.meas_ghz * 1e3, bare.dev_ns_per_pass / 1e3,
             bare.host_ns_per_pass / 1e3, bare_b, nop.dev_ns_per_pass / 1e3,
             nop.host_ns_per_pass / 1e3, nop_b, dispatch, pct,
             pct <= 2.0 ? "PASS" : "FAIL");
