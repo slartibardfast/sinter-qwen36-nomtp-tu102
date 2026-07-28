@@ -8,8 +8,9 @@
 // estimate and the measured 825 ns grid.sync comparator
 // (reference/tu102 sync_protocol).
 //
-// Error path: a program with an unwired kind (and one with an out-of-range
-// kind) must set the error cell and EXIT the grid — never hang.
+// Error path: a program with an out-of-range kind must set the error cell
+// and EXIT the grid — never hang. (No unwired-kind probe today: every
+// MacroKind is wired; see the note at the call site.)
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -263,6 +264,13 @@ static void test_error(int dev, uint16_t kind, unsigned want_code,
     std::printf("error path (%s): status %d code %u aux %u exit %s\n", label,
                 (int)st, h.h_err[0], h.h_err[1],
                 q == cudaSuccess ? "clean" : "WEDGED");
+    // ALWAYS reap the probe kernel: a still-resident one leaks its SMs into
+    // the NEXT probe, whose cooperative launch then never runs (2026-07-28:
+    // OP_XCHG_PUSH, once the unwired stand-in, is wired now, so its probe
+    // passed RUN_OK and stayed resident; the bad-kind probe timed out behind
+    // the zombie with err 0 -- a cascade, not a guard failure).
+    if (h.launched && !mk::host_shutdown(h, 5000.0))
+        std::printf("error path (%s): shutdown incomplete\n", label);
     mk::host_destroy(h);
 }
 
@@ -306,9 +314,12 @@ int main(int argc, char **argv) {
         CHECK(pct <= 2.0, "G15 overhead %.3f%% > 2%%", pct);
     }
 
-    // OP_XCHG_PUSH: the Y06 family is deferred to the dual-GPU milestone,
-    // so it stays unwired while the other op families land in parallel.
-    test_error(dev, mk::OP_XCHG_PUSH, mk::ERR_UNWIRED_KIND, "unwired kind");
+    // Error-flag path: an out-of-range kind must set the error cell and exit
+    // the grid, never hang. (The ERR_UNWIRED_KIND branch has no probe today:
+    // every MacroKind is wired -- OP_XCHG_PUSH, once the unwired stand-in, has
+    // been live since xchg.cuh landed, and a wired probe kind runs as a no-op
+    // whose resident kernel starves the next probe. Re-add an unwired probe
+    // when a future kind lands unwired.)
     test_error(dev, (uint16_t)(mk::OP_KIND_COUNT + 5), mk::ERR_BAD_KIND,
                "bad kind");
 
