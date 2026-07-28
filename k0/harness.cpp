@@ -2463,6 +2463,69 @@ static int prefill_parity_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
     long long dkv = first_diff(ref_kv, tile_kv);
     long long drs = first_diff(ref_rs, tile_rs);
 
+    // Diagnostics on FAIL: per-(gpu, layer, surface) first diffs + the
+    // differing token-row set of the first broken KV surface. Read-only
+    // walk over the already-gathered snapshots; layout mirrors snap_kv /
+    // snap_rs exactly (per gpu: per attn layer K rows then V rows; per gdn
+    // layer ssm then conv).
+    if (dl >= 0 || dkv >= 0 || drs >= 0) {
+        const size_t row_words = (size_t)(N_EMBD_GQA / 2) / 2;
+        const size_t layer_kv = (size_t) P * row_words;   // one cache's rows
+        const size_t per_g = (size_t) 16 * 2 * layer_kv;  // 16 attn layers, K+V
+        auto walk_kv = [&](const char *what, const std::vector<float> &A,
+                           const std::vector<float> &B) {
+            for (int g = 0; g < 2; g++)
+            for (int il = 0, ia = 0; il < N_LAYER; il++) {
+                if (!is_attn_layer(il)) continue;
+                for (int kvn = 0; kvn < 2; kvn++, ia++) {
+                    size_t base = (size_t) g * per_g + (size_t) ia * layer_kv;
+                    long long d = -1;
+                    for (size_t i = 0; i < layer_kv; i++)
+                        if (memcmp(&A[base + i], &B[base + i], 4) != 0) { d = (long long) i; break; }
+                    if (d >= 0) {
+                        fprintf(stderr, "  [%s] gpu%d layer %d %s: first diff at row %lld word %lld"
+                                " (ref %08x vs tile %08x)\n", what, g, il,
+                                kvn ? "V" : "K", d / (long long) row_words,
+                                d % (long long) row_words,
+                                *(unsigned *) &A[base + d], *(unsigned *) &B[base + d]);
+                        // which token rows of this surface differ at all
+                        int shown = 0;
+                        for (size_t r = 0; r < (size_t) P && shown < 8; r++) {
+                            bool rowdiff = false;
+                            for (size_t i = r * row_words; i < (r + 1) * row_words; i++)
+                                if (memcmp(&A[base + i], &B[base + i], 4) != 0) { rowdiff = true; break; }
+                            if (rowdiff) { fprintf(stderr, "    row %zu differs\n", r); shown++; }
+                        }
+                        return; // first broken surface only
+                    }
+                }
+            }
+        };
+        walk_kv("kv-bisect", ref_kv, tile_kv);
+
+        const size_t ssm_w = (size_t) SSM_STATE_N / 2, conv_w = (size_t) CONV_STATE_N / 2;
+        const size_t layer_rs = ssm_w + conv_w;
+        const size_t per_g_rs = (size_t) 48 * layer_rs;
+        for (int g = 0; g < 2; g++)
+        for (int il = 0, id = 0; il < N_LAYER; il++) {
+            if (is_attn_layer(il)) continue;
+            size_t base = (size_t) g * per_g_rs + (size_t) id * layer_rs; id++;
+            for (int s = 0; s < 2; s++) {
+                size_t off = base + (s ? ssm_w : 0), n = s ? conv_w : ssm_w;
+                for (size_t i = 0; i < n; i++)
+                    if (memcmp(&ref_rs[off + i], &tile_rs[off + i], 4) != 0) {
+                        fprintf(stderr, "  [rs-bisect] gpu%d layer %d %s: first diff at word %zu"
+                                " (head %zu elem %zu) (ref %08x vs tile %08x)\n", g, il,
+                                s ? "conv" : "ssm", i, s ? (size_t) 0 : i / 16384,
+                                s ? i : i % 16384,
+                                *(unsigned *) &ref_rs[off + i], *(unsigned *) &tile_rs[off + i]);
+                        goto rs_done;
+                    }
+            }
+        }
+        rs_done: ;
+    }
+
     // causality micro-check (arms at U>=2): change ONLY the last prompt token
     // and rerun the tiles; the KV rows of tokens 0..P-2 must not move (token t
     // may depend on tokens 0..t ONLY). The final states and logits legitimately
