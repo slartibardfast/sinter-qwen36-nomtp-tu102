@@ -2612,6 +2612,150 @@ static int prefill_bench_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
     return 0;
 }
 
+// -- prefill dump: the MK side of the vs-stock batched-prefill arbiter
+// (gate-manifest-prefill row "Batched prefill (U=128)"). Reads the oracle
+// --dump-kv ref tree for its prompt + config, runs the SAME tokens as U-tiles
+// (one doorbell per tile), and emits the mk-oracle/v1 tree compare.py
+// --prefill adjudicates: logits.bin row 0 (post-prefill), state/pre (the
+// post-prompt state, full-tensor from both GPUs' halves -- the decode flow's
+// proven concat layout), kv/pre (the prompt KV rows, f16 raw, full 1024-half
+// rows interleaved per row from the two per-GPU 512-half halves).
+static int prefill_dump_run(gguf::File &gg, const Jv &program, int64_t n_ctx,
+                            int64_t n_vocab, const std::string &ref_dir,
+                            const std::string &out_dir, int64_t U) {
+    Jv ref_idx = json_load(ref_dir + "/index.json");
+    if (ref_idx.at("format").str != "mk-oracle/v1")
+        throw std::runtime_error("ref tree is not mk-oracle/v1");
+    const Jv &cfg = ref_idx.at("config");
+    const Jv &prompt_j = ref_idx.at("prompt_tokens");
+    if (cfg.at("n_vocab").as_i() != n_vocab)
+        throw std::runtime_error("ref n_vocab != model n_vocab");
+    const int64_t P = (int64_t) prompt_j.arr.size();
+    if (U < 1 || U > P) throw std::runtime_error("--prefill-dump: U must be in 1..prompt");
+    if (P > n_ctx) throw std::runtime_error("--prefill-dump: prompt exceeds --n-ctx");
+    if (U > 1 && program_prefill_u(program) < U)
+        throw std::runtime_error("--prefill-dump: U>1 needs a prefill program "
+                                 "(python3 k0/compile_schedule.py --prefill U --split)");
+    std::vector<int32_t> prompt(P);
+    for (int64_t i = 0; i < P; i++) prompt[i] = (int32_t) prompt_j.arr[i].as_i();
+    printf("prefill-dump: ref %s -- %lld prompt tokens as %lld-tiles\n",
+           ref_dir.c_str(), (long long) P, (long long) U);
+
+    GpuCtx g2[2];
+    dual_setup(g2, gg, program, n_ctx, n_vocab, U);
+    unsigned pass = 0;
+    for (int64_t base = 0; base < P; base += U) {
+        const int64_t n_tok = std::min(U, P - base);
+        gpu_set_inputs_tile(g2[0], base, n_tok);
+        gpu_set_inputs_tile(g2[1], base, n_tok);
+        ++pass;
+        if (!dual_run_pass(g2, prompt.data() + base, n_tok, pass, 60000.0)) return 3;
+        fprintf(stderr, "  tile +%lld done (base %lld)\n", (long long) n_tok, (long long) base);
+    }
+
+    DumpTree dump;
+    dump.open(out_dir, n_vocab);
+    const size_t HALF = (size_t) n_vocab / 2;
+    std::vector<float> lo0, lo1, logits(n_vocab), s0, s1, state;
+    gpu_read_f32(g2[0], "logits", lo0, HALF);
+    gpu_read_f32(g2[1], "logits", lo1, HALF);
+    memcpy(logits.data(), lo0.data(), HALF * 4);
+    memcpy(logits.data() + HALF, lo1.data(), HALF * 4);
+    dump.add_logits_row(logits);   // row 0 = the prefill output row
+
+    // state/pre: post-prompt state, one file per cache (the compare's "last"
+    // rule over a single write). Full tensor = gpu0 half ++ gpu1 half.
+    for (int il = 0; il < N_LAYER; il++) {
+        if (is_attn_layer(il)) continue;
+        char name[64], rel[128];
+        gpu_read_f32(g2[0], "ssm_state_l" + std::to_string(il), s0, SSM_STATE_N / 2);
+        gpu_read_f32(g2[1], "ssm_state_l" + std::to_string(il), s1, SSM_STATE_N / 2);
+        state.resize(SSM_STATE_N);
+        memcpy(state.data(), s0.data(), (SSM_STATE_N / 2) * 4);
+        memcpy(state.data() + SSM_STATE_N / 2, s1.data(), (SSM_STATE_N / 2) * 4);
+        snprintf(name, sizeof(name), "cache_s_l%d", il);
+        snprintf(rel, sizeof(rel), "state/pre/cache_s_l%d.bin", il);
+        dump.write_bin(-1, "state", name, "CPY", rel, state.data(), SSM_STATE_N);
+        gpu_read_f32(g2[0], "conv_state_l" + std::to_string(il), s0, CONV_STATE_N / 2);
+        gpu_read_f32(g2[1], "conv_state_l" + std::to_string(il), s1, CONV_STATE_N / 2);
+        state.resize(CONV_STATE_N);
+        memcpy(state.data(), s0.data(), (CONV_STATE_N / 2) * 4);
+        memcpy(state.data() + CONV_STATE_N / 2, s1.data(), (CONV_STATE_N / 2) * 4);
+        snprintf(name, sizeof(name), "cache_r_l%d", il);
+        snprintf(rel, sizeof(rel), "state/pre/cache_r_l%d.bin", il);
+        dump.write_bin(-1, "state", name, "CPY", rel, state.data(), CONV_STATE_N);
+    }
+
+    // kv/pre: the prompt rows of each attention cache, raw f16. A full stock
+    // row is N_EMBD_GQA halfs (4 kv heads x 256); each GPU holds its 2-head
+    // half (512), so the full row interleaves [gpu0 row | gpu1 row].
+    const size_t row_halfs = (size_t) N_EMBD_GQA / 2;   // 512 per GPU
+    std::vector<uint16_t> k0, k1;
+    auto read_f16 = [&](GpuCtx &c, const std::string &buf, size_t n,
+                        std::vector<uint16_t> &out) {
+        CUDA_CHECK(cudaSetDevice(c.device));
+        out.resize(n);
+        CUDA_CHECK(cudaMemcpy(out.data(), c.bufs[buf].ptr, n * 2, cudaMemcpyDeviceToHost));
+    };
+    std::vector<uint16_t> full((size_t) P * N_EMBD_GQA);
+    for (int il = 0; il < N_LAYER; il++) {
+        if (!is_attn_layer(il)) continue;
+        for (int kv = 0; kv < 2; kv++) {
+            const std::string buf = (kv ? "cache_v_l" : "cache_k_l") + std::to_string(il);
+            read_f16(g2[0], buf, (size_t) P * row_halfs, k0);
+            read_f16(g2[1], buf, (size_t) P * row_halfs, k1);
+            for (int64_t r = 0; r < P; r++) {
+                uint16_t *dst = full.data() + (size_t) r * N_EMBD_GQA;
+                memcpy(dst, k0.data() + (size_t) r * row_halfs, row_halfs * 2);
+                memcpy(dst + row_halfs, k1.data() + (size_t) r * row_halfs, row_halfs * 2);
+            }
+            char name[64], rel[128];
+            snprintf(name, sizeof(name), "%s", buf.c_str());
+            snprintf(rel, sizeof(rel), "kv/pre/%s.bin", buf.c_str());
+            const std::string path = out_dir + "/" + rel;
+            mkdir_p(path.substr(0, path.rfind('/')));
+            FILE *f = fopen(path.c_str(), "wb");
+            if (!f) throw std::runtime_error("cannot write " + path);
+            fwrite(full.data(), 2, full.size(), f);
+            fclose(f);
+            fprintf(dump.files, "-1,kv,%s,%s,SET_ROWS,f16,%zu,1,1,1,%zu\n",
+                    name, rel, (size_t) N_EMBD_GQA, full.size() * 2);
+        }
+    }
+
+    // index.json: the ref's config + prompt (compare.py's structural lane binds
+    // n_vocab/steps/ctx_tokens/prompt), one logits row, no emitted tokens.
+    {
+        FILE *f = fopen((out_dir + "/logits.bin").c_str(), "wb");
+        fwrite(dump.logits_rows.data(), 4, dump.logits_rows.size(), f);
+        fclose(f);
+        fclose(dump.nodes); dump.nodes = nullptr;
+        fclose(dump.files); dump.files = nullptr;
+        f = fopen((out_dir + "/tokens.txt").c_str(), "w"); fclose(f);
+        f = fopen((out_dir + "/index.json").c_str(), "w");
+        fprintf(f, "{\n  \"format\": \"mk-oracle/v1\",\n  \"tag\": \"mk-k0-harness-prefill\",\n");
+        fprintf(f, "  \"config\": {\n    \"split\": \"mk-k0\",\n    \"n_ctx\": %lld,\n"
+                   "    \"ctx_tokens\": %lld,\n    \"steps\": %lld,\n    \"n_vocab\": %lld,\n"
+                   "    \"flash_attn\": true,\n    \"kv_type\": \"f16\",\n"
+                   "    \"n_gpu_layers\": 999,\n    \"capture\": \"prefill\"\n  },\n",
+                (long long) n_ctx, (long long) cfg.at("ctx_tokens").as_i(),
+                (long long) cfg.at("steps").as_i(), (long long) n_vocab);
+        fprintf(f, "  \"logits\": { \"file\": \"logits.bin\", \"dtype\": \"f32\", \"rows\": 1, \"cols\": %lld,\n"
+                   "    \"note\": \"row 0 = prefill output\" },\n", (long long) n_vocab);
+        fprintf(f, "  \"nodes_csv\": \"nodes.csv\",\n  \"files_csv\": \"files.csv\",\n");
+        fprintf(f, "  \"prompt_tokens\": [");
+        for (int64_t i = 0; i < P; i++) fprintf(f, "%s%lld", i ? "," : "", (long long) prompt[i]);
+        fprintf(f, "],\n  \"emitted_tokens\": []\n}\n");
+        fclose(f);
+    }
+    dual_shutdown(g2);
+    printf("prefill-dump: tree written to %s\n", out_dir.c_str());
+    printf("compare with:\n  python3 tests/oracle/compare.py %s %s --prefill "
+           "--allow-config-mismatch --report %s/prefill-report.json\n",
+           ref_dir.c_str(), out_dir.c_str(), out_dir.c_str());
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2880,7 +3024,7 @@ int main(int argc, char **argv) {
                                        // legit different type mix. Checksums stay the
                                        // hard gate; this only downgrades inventory.
     enum { M_VALIDATE, M_PARITY, M_BENCH, M_PARITY_TENSOR, M_BENCH_TENSOR,
-           M_PREFILL_PARITY, M_PREFILL_BENCH } mode = M_VALIDATE;
+           M_PREFILL_PARITY, M_PREFILL_BENCH, M_PREFILL_DUMP } mode = M_VALIDATE;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -2898,6 +3042,9 @@ int main(int argc, char **argv) {
         else if (a == "--prefill-bench")  { mode = M_PREFILL_BENCH;
                                             prefill_u = strtoll(need("tile width U"), nullptr, 10);
                                             bench_n = strtoll(need("token count"), nullptr, 10); }
+        else if (a == "--prefill-dump")   { mode = M_PREFILL_DUMP;
+                                            prefill_u = strtoll(need("tile width U"), nullptr, 10);
+                                            parity_ref = need("oracle ref dir"); }
         else if (a == "--model")   model = need("gguf path");
         else if (a == "--program") program_path = need("program.json path");
         else if (a == "--out")     out_dir = need("dump dir");
@@ -2908,7 +3055,8 @@ int main(int argc, char **argv) {
         else if (a == "--allow-inventory-mismatch") allow_inv_mismatch = true;
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    const bool prefill_mode = (mode == M_PREFILL_PARITY || mode == M_PREFILL_BENCH);
+    const bool prefill_mode = (mode == M_PREFILL_PARITY || mode == M_PREFILL_BENCH ||
+                               mode == M_PREFILL_DUMP);
     const bool tensor_mode = (mode == M_PARITY_TENSOR || mode == M_BENCH_TENSOR || prefill_mode);
     if (program_path.empty())
         program_path = (prefill_mode && prefill_u > 1) ? "k0/program-split-prefill.json"
@@ -2993,6 +3141,10 @@ int main(int argc, char **argv) {
                 rc = prefill_parity_run(res.gg, program, n_ctx, res.n_vocab, prefill_u);
             } else if (mode == M_PREFILL_BENCH) {
                 rc = prefill_bench_run(res.gg, program, n_ctx, res.n_vocab, prefill_u, bench_n);
+            } else if (mode == M_PREFILL_DUMP) {
+                if (out_dir.empty())
+                    out_dir = "/var/tmp/mk-harness/cand-prefill-" + basename_of(parity_ref);
+                rc = prefill_dump_run(res.gg, program, n_ctx, res.n_vocab, parity_ref, out_dir, prefill_u);
             } else {
                 rc = bench_run_tensor(res.gg, program, n_ctx, res.n_vocab, bench_n, bench_pos0);
             }
