@@ -93,7 +93,14 @@ static __device__ __noinline__ void op_rmsnorm_utile(const Instr &in, const Rmsn
         const float *add = a.add ? a.add + t * tsz + (size_t)row * a.ncols : nullptr;
         float *y = a.y + ty + (size_t)row * a.ncols;
         float *sum = a.sum ? a.sum + t * tsz + (size_t)row * a.ncols : nullptr;
-        float *dbg = a.dbg ? a.dbg + ty + (size_t)row * a.ncols : nullptr;
+        // dbg is a per-LAYER single-row snapshot (harness-owned dbg_lout /
+        // dbg_mid, sized one row per layer, NOT per token): only the last live
+        // token's row lands, at offset 0 -- the same end state a per-token
+        // sequence leaves (its final pass). The former a.dbg + ty form wrote
+        // token t at t*tsz and overran the snapshot buffers into whatever
+        // cudaMalloc neighbors followed at any nt >= 2 (the U=128 parity FAIL:
+        // deterministic multi-surface corruption, causality-violating).
+        float *dbg = (a.dbg && t == nt - 1) ? a.dbg + (size_t)row * a.ncols : nullptr;
 
         float acc = 0.0f;
         const bool vec = (a.ncols % 4u == 0) && aligned16(x) &&
