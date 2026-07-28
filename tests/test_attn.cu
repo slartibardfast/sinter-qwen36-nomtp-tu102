@@ -444,6 +444,20 @@ static void test_fattn_case(int n_q, int n_kv_heads, int real_kv, int n_kv,
                             int nchunks, const char *name) {
     const int row_width = n_kv_heads * HD;
     const int gqa = n_q / n_kv_heads;
+    // Domain guard: the HMMA build's contiguous full-row tile sizes smem by
+    // row_width; shapes it cannot hold (24q at row 1024 -> ~88 KiB over the
+    // 64 KiB optin ceiling) are outside this build's path (they exercise the
+    // non-HMMA kv-head outer loop, where the tile is one 256-wide slice).
+    // Launching them is a guaranteed invalid-argument, not a test.
+    const unsigned smem_need = fattn_smem_bytes((uint32_t) n_q, (uint32_t) row_width);
+    static int max_optin = -1;
+    if (max_optin < 0)
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if ((int) smem_need > max_optin) {
+        printf("skip [smem %u B > %d B optin] %s: shape outside this build's fattn path\n",
+               smem_need, max_optin, name);
+        return;
+    }
 
     std::vector<__half> kc((size_t) n_kv * row_width), vc((size_t) n_kv * row_width);
     std::vector<__half> mask(n_kv);
