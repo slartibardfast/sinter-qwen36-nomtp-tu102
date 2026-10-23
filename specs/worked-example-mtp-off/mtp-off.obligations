@@ -1,0 +1,4 @@
+# specs/worked-example-mtp-off/mtp-off.obligations — the instantiation is
+# deliberately thin: it binds the playbook's parameters and adds no entities,
+# contracts, or config-local properties, so `allium plan` derives zero
+# obligations for it. This manifest records that state; it is not a pass.

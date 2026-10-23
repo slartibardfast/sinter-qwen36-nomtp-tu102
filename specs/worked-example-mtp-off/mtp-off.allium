@@ -1,0 +1,126 @@
+-- allium: 3
+-- mtp-off.allium — the worked-example instantiation of the megakernel
+-- playbook: plain batch-1 decode, no speculation, tensor split.
+--
+-- This file is deliberately thin. An instantiation BINDS the playbook's
+-- parameters and may add config-local properties; it never forks or
+-- restates the shared contracts (playbook.allium owns them). Everything
+-- an implementer needs beyond this binding is the playbook walkthrough
+-- in WORKED.md (fusion set, DRAM budget, gate instantiation) — all of it
+-- derived from the real capture of this configuration
+-- (plan/0135 capture/tensor-plain-*).
+--
+-- Degeneracy notes, stated once so the reader does not hunt for them:
+--   - BankedStateEquivalence at spec_depth = 0 quantifies over the single
+--     outcome (drafted = 0, accepted = 0): a plain decode step must leave
+--     exactly the state sequential decode leaves — satisfied by
+--     construction, which is the playbook's anti-overfit tripwire.
+--   - The sync protocol is the SAME module at k = 0
+--     (../MegakernelSync.tla, instance MegakernelSync_k0.cfg): drafting
+--     and rollback are unreachable (invariant DegenerateAtZero), checked,
+--     not assumed.
+
+use "../playbook.allium" as playbook
+
+-- ============================================================
+-- Defaults — the binding
+-- ============================================================
+
+-- The one configuration this instantiation serves. The fingerprint's
+-- DERIVATION is pinned in playbook.allium ("cgraph/v1"); its VALUE is
+-- a measurement, recorded 2026-07-11 from the first shim hash of the
+-- decode cgraph on the landed engine (llama.cpp autoround @ 546eca8dc):
+-- 32 graphs across four n_kv padding classes (prefill depths 64 to
+-- 33000), every one normalizing to this digest through the 67-field
+-- mask committed as capture/lg0-fingerprint/template.json. Measured
+-- facts bound in: the cgraph is split-mode-invariant (none and tensor
+-- serialize byte-identically, so the megakernel's one-logical-device
+-- view sees this same graph), and n_ctx enters through the KV-cache
+-- leaf extents and is deliberately NOT masked — serving configuration
+-- is not sequence position. The value therefore binds the production
+-- 256k context (n_ctx 262144, the operator's full-agentic-flows
+-- directive); a server at any other n_ctx must fingerprint-miss and
+-- degrade to stock. Every other parameter is bound here and final.
+-- Settled 2026-07-11; evidence in capture/lg0-fingerprint/NOTES.md.
+default playbook/DecodeConfiguration mtp_off = {
+    fingerprint: "cgraph/v1:dd907a1b5a22b40340c3225de5735be13dcf06c4fdad5130f0a756edf838cb43",
+    spec_depth: 0,
+    drafter: no_drafter,
+    split_mode: tensor,
+    sequence_state: hybrid_recurrent,
+    substrate: "tu102-sm75-2gpu-nvlink"
+}
+
+-- ============================================================
+-- The served graph set — totality, no fallback (call/0024)
+-- ============================================================
+--
+-- Iteration zero is not a decode accelerator with a stock prefill fallback;
+-- it is total over the graph surface an unmodified llama-server submits in the
+-- served configuration. The surface was ENUMERATED from the fork at the pin
+-- (autoround @ 546eca8dc), not assumed: exactly two graph_compute sites —
+-- process_ubatch (llama-context.cpp:1296) and the K-shift (llama-kv-cache.cpp
+-- :800). Model qwen35 (block_count 65): 16 softmax-attn blocks (FLASH_ATTN_EXT
+-- at i%4==3) + 48 GDN blocks (GATED_DELTA_NET), 24 q / 4 kv
+-- heads, head_dim 256, n_ctx 262144. Evidence and reasoning: call/0024.
+--
+-- The four preconditions below CLOSE the surface to {decode, prefill, K-shift}.
+-- Each is a runtime-checkable guard asserted at context init; a violation
+-- refuses to serve (the kernel does not claim graphs outside its closed set),
+-- never a silent degrade. Operator-confirmed 2026-07-13: K-shift CAN fire in
+-- the served config (so it is IN the set, not excludable) and np=1 holds.
+default playbook/ServedConfiguration mtp_off_served = {
+    decoder_only: true,      -- qwen35 has no encoder graph (model arch; static)
+    speculation_off: true,   -- k=0: ctx_type DEFAULT, no DECODER_MTP graph
+    single_stream: true,     -- np=1: n_stream == 1, no cross-stream KV copy
+    pooling_none: true       -- generative serving: pooling_type NONE
+                             -- (llama-context.cpp:159-161)
+}
+
+-- The resident program set. TotalCoverage requires every fingerprint the
+-- served runtime can emit to be one of these. Decode and prefill(U=128) are
+-- MEASURED (LG0 sweep, capture/lg0-fingerprint/PREFILL-NOTES.md, 2026-07-13);
+-- K-shift is pending its dump. Measured: the prefill fingerprint is depth-
+-- INVARIANT (U=128 collapses across depths 64..33000 through the same 67-field
+-- mask as decode), and each chunk size U is a DISTINCT fingerprint (the token
+-- count is unmasked; it is what tells prefill from decode). The decode value is
+-- byte-identical on the served -rust file (measured on b9222; the fingerprint
+-- hashes graph structure, not quant tags).
+--
+-- RAGGED-TAIL GAP (obligation): with n_ubatch=128 a prompt's tail chunk is
+-- U<128, a different fingerprint, which would MISS this U=128 program (a
+-- TotalCoverage failure). Resolution owed (PREFILL-NOTES.md): cgraph/v2
+-- count-class dispatch, masking the batch count so every U>1 shares one prefill
+-- fingerprint and dispatch keys on (masked-shape-hash, batch_class in {1 decode,
+-- >1 prefill}), with a U-variable prefill kernel, so totality holds over every
+-- chunk size. The U=128 value below is the cgraph/v1 measured reference and the
+-- perf-optimal chunk; it is not yet total over the tail.
+
+default playbook/ResidentProgram decode_program = {
+    fingerprint: "cgraph/v1:dd907a1b5a22b40340c3225de5735be13dcf06c4fdad5130f0a756edf838cb43",
+    kind: decode,
+    ubatch: 0
+}
+
+-- Chunked prefill, fixed micro-batch U = 128 (DERIVED, call/0024): at 256k the
+-- fixed per-chunk DRAM read (~28.8 ms/GPU: weights 13.71 + KV 14.11 + state
+-- 0.99) is hidden once compute/chunk reaches it (crossover U ~ 100-130 at full
+-- depth), and 128 is the DeltaNet kernel's native scan chunk
+-- (gated_delta_net_cuda<128>), so one ubatch = one chunk with no stitching.
+-- ~7 GiB/GPU headroom makes the activation cost free; larger U buys nothing at
+-- full depth (already compute-bound). One ubatch = one fingerprint.
+default playbook/ResidentProgram prefill_program = {
+    fingerprint: "cgraph/v1:97894a98c81710a517e70f4758d553f0d4407b347afd96dee889fa9605aa8d15",
+    kind: prefill,
+    ubatch: 128
+}
+
+-- K-shift: rope over the 16 attention layers' K cache (build_graph_shift =
+-- ggml_view_3d + build_rope_shift; the 48 GDN layers have no rotary K).
+-- Reuses OP_ROPE; its own fingerprint.
+default playbook/ResidentProgram kshift_program = {
+    fingerprint: "cgraph/v1:pending-kshift-shim-hash",
+    kind: k_shift,
+    ubatch: 0
+}
+

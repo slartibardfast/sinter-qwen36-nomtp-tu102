@@ -1,0 +1,23 @@
+# specs/prefill.obligations — every `allium plan` obligation dispositioned.
+# The megakernel is spec-led: the contracts bind the vs-stock
+# arbiters and the integration boundary, and their discharge
+# rides the plan/0139 ladder (litmus tests, oracle, the .so
+# integration). Structural items are the spec's own check/
+# analyse lane.
+
+entity-fields.StockEngine => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.PrefillBatch => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.ModelState => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.LogitsBlock => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+enum-comparable.LayerClass => structural
+config-default.prefill_ubatch => structural
+config-default.prefill_logits_kl_tol => structural
+config-default.kv_state_bit_exact_tol => structural
+config-default.deltanet_chunk_logits_kl_tol => structural
+invariant.PrefillConfiguration.BindsNativeChunk => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.PrefillConfiguration => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+contract-signature.PrefillLogitsParity.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+contract-signature.PostPrefillStateEquivalence.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+contract-signature.HandoverStateCarry.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+surface-actor.PrefillComputeBoundary => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+surface-exposure.PrefillComputeBoundary => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)

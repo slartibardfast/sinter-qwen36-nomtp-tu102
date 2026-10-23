@@ -1,0 +1,38 @@
+# specs/playbook.obligations — every `allium plan` obligation dispositioned.
+# The megakernel is spec-led: the contracts bind the vs-stock
+# arbiters and the integration boundary, and their discharge
+# rides the plan/0139 ladder (litmus tests, oracle, the .so
+# integration). Structural items are the spec's own check/
+# analyse lane.
+
+entity-fields.StockEngine => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.ModelState => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.LogitsRow => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+value-equality.AcceptanceOutcome => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.AcceptanceOutcome => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+enum-comparable.SplitMode => structural
+enum-comparable.DrafterKind => structural
+enum-comparable.SequenceStateKind => structural
+enum-comparable.ServedGraphKind => structural
+invariant.DecodeConfiguration.DrafterRequiresDepth => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+invariant.DecodeConfiguration.DepthRequiresDrafter => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+invariant.DecodeConfiguration.DepthBounds => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.DecodeConfiguration => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+derived.DecodeConfiguration.is_speculative => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+invariant.ResidentProgram.PrefillBindsUbatch => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+invariant.ResidentProgram.NonPrefillNoUbatch => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.ResidentProgram => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+entity-fields.ServedConfiguration => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+derived.ServedConfiguration.is_closed => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+config-default.max_spec_depth => structural
+config-default.logits_kl_tol => structural
+config-default.activation_rms_rel_tol => structural
+config-default.state_bit_exact_tol => structural
+contract-signature.DecodeStepEquivalence.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+contract-signature.BankedStateEquivalence.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+contract-signature.FingerprintDegrade.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+contract-signature.ServedGraphTotality.invoke => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+invariant.UniqueFingerprints => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+invariant.ResidentProgramFingerprintsUnique => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+surface-actor.GraphComputeBoundary => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)
+surface-exposure.GraphComputeBoundary => waived: implementation pending (the plan/0139 ladder; the litmus .cu tests are not named per obligation yet)

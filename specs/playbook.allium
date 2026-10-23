@@ -1,0 +1,518 @@
+-- allium: 3
+-- playbook.allium — the megakernel playbook's config-invariant contracts.
+--
+-- Scope: the contracts EVERY megakernel instantiation must satisfy,
+-- parameterized over a DecodeConfiguration. The plan (plan/0135 README,
+-- "A playbook, not one kernel") expects different serving configurations
+-- (MTP on/off, ngram-assisted, future ladders) to be entirely different
+-- kernel implementations sharing these contracts and the config-invariant
+-- core. An instantiation BINDS the configuration (a config block and a
+-- DecodeConfiguration instance) and may add config-local properties; it
+-- never forks or weakens the contracts in this file. The k = 0 degenerate
+-- case (no speculation) is deliberately first-class: a contract that
+-- cannot express it is itself overfitted — that is the anti-overfit
+-- tripwire this file exists to provide.
+--
+-- Gate bindings (reference/megakernel/gate_manifest.csv):
+--   DecodeStepEquivalence  — G13 (numerical parity vs reference decode)
+--   BankedStateEquivalence — G21 (banked-state equivalence, the single
+--                            most load-bearing correctness gate) and its
+--                            rejection fuzzer G22
+--   FingerprintDegrade     — LG0/graph-fingerprint discipline (the
+--                            integration stage: mismatch means the stock
+--                            path runs, never wrong answers)
+--   ServedGraphTotality    — LG-totality (call/0024): a served configuration's
+--                            graph surface is CLOSED and fully covered by
+--                            resident programs, so FingerprintDegrade's
+--                            passthrough is unreachable in the served config —
+--                            the net is retained as the floor, proven never
+--                            exercised. "The megakernel IS the engine."
+-- The sync protocol's timing/concurrency obligations live in the sibling
+-- sync-protocol.tla (parametric; model-checked per instantiation binding).
+--
+-- Includes:
+--   - DecodeConfiguration (the parameter object every contract takes).
+--   - Decode-step equivalence vs the stock engine, with the tolerance
+--     classes G13 prescribes.
+--   - Banked-state equivalence quantified over acceptance length 0..k,
+--     bit-exact, with k = 0 as the degenerate (MTP-off) case.
+--   - Fingerprint-degrade passthrough (unknown graph -> stock path,
+--     bit-identical, no state perturbation).
+--   - The integration surface the runtime sees.
+--
+-- Excludes:
+--   - Kernel-internal structure (SM partitioning, smem carveout,
+--     interpreter schedule): reference/megakernel/ design tables.
+--   - Performance obligations (G12 bandwidth floors, budgets): the gate
+--     manifest and latency_budget.csv own those; this file is
+--     correctness only.
+--   - The drafting policy itself (which tokens a drafter proposes is
+--     config-local behaviour; only its state discipline binds here).
+
+-- ============================================================
+-- External Entities — owned by the stock engine, not this spec
+-- ============================================================
+
+-- The reference implementation: the llama.cpp fork at the recorded
+-- .host-software pin, running the same GGUF weights, stock CUDA path.
+-- Every equivalence in this file is stated against it.
+entity StockEngine {
+    build_commit: String
+}
+
+-- The model state a decode pass reads and writes: the recurrent
+-- (DeltaNet) state, the KV cache for the full-attention layers, and
+-- the position counter. Layout is engine-owned; the contracts treat
+-- it as comparable-by-value at bank granularity.
+entity ModelState {
+    n_past: Integer
+}
+
+-- One decode step's observable output: the next-token logits row
+-- (and, for a speculative pass, one logits row per verified position).
+entity LogitsRow {
+    n_vocab: Integer
+}
+
+-- ============================================================
+-- Value Types
+-- ============================================================
+
+-- A candidate continuation under verification: the accepted count is
+-- how many drafted tokens survived; the emitted token count is
+-- accepted + 1 (the verify pass's own sample).
+value AcceptanceOutcome {
+    drafted: Integer
+    accepted: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+enum SplitMode { none | layer | row | tensor }
+
+-- Settled 2026-07-11: the ngram drafter reuses spec_depth as its
+-- lookahead; drafter-internal richness (order, table size, hit
+-- policy) is config-local to that instantiation, never a playbook
+-- parameter. Contracts only quantify over what affects banking,
+-- rollback and acceptance, and that is depth alone. Lookup drafting
+-- yields variable-length drafts, so AcceptanceRange bounds drafted
+-- by spec_depth rather than pinning it; fixed-length drafters
+-- (mtp_self_draft) bind drafted = spec_depth in their instantiation.
+enum DrafterKind { no_drafter | mtp_self_draft | ngram }
+
+-- The model axis of the playbook. kv_only is the dense degenerate case:
+-- sequence state is KV rows alone and bank rollback collapses to the KV
+-- truncation stock engines already perform. A contract that cannot
+-- express kv_only was overfitted to the hybrid — the model-axis twin of
+-- the k = 0 tripwire.
+--
+-- Settled 2026-07-11: MoE needs no third value. Expert routing is a
+-- pure per-token function of activations (no cross-token carry), and
+-- batch-1 decode has no cross-batch capacity coupling, so routing is
+-- not sequence state; an MoE or MoE-hybrid model takes kv_only or
+-- hybrid_recurrent from its attention/recurrence structure alone.
+-- What MoE actually stresses is the weight-residency budget (which
+-- expert streams cannot be pre-scheduled — the dynamism class the
+-- Event Tensor line treats as first-class; see PRIOR-ART.md), and
+-- that lives in the playbook's budget-derivation step, not in these
+-- contracts. If a genuinely router-stateful architecture appears,
+-- extend the enum then.
+enum SequenceStateKind { kv_only | hybrid_recurrent }
+
+-- The graph kinds a served configuration submits to the backend. Enumerated
+-- from the fork's two graph_compute sites (call/0024): process_ubatch emits
+-- decode (n_tokens = 1) and prefill (n_tokens > 1); the KV cache emits the
+-- K-shift (rope over the attention layers' K). Every other llm_graph_type
+-- (encoder, MTP) and the multi-stream / pooling graphs are excluded by a
+-- served-configuration precondition, not left to degrade (ServedConfiguration).
+enum ServedGraphKind { decode | prefill | k_shift }
+
+-- ============================================================
+-- Entities and Variants
+-- ============================================================
+
+-- The parameter object. An instantiation is a binding of this entity
+-- (plus the module config below). Contracts quantify over it; kernels
+-- implement exactly one binding and refuse the rest (FingerprintDegrade).
+-- THREE parameter axes, all first-class: the serving configuration
+-- (spec_depth/drafter/split_mode), the MODEL (sequence_state — the
+-- playbook is not Qwen-hybrid-specific), and the SUBSTRATE (an
+-- identifier; the contracts themselves are substrate-neutral, see
+-- SubstrateNeutrality on the surface, and everything substrate-NUMERIC
+-- — occupancy ceilings, granularities, budgets — enters through the
+-- calx-mill Substrate the instantiation cites, never through these
+-- contracts).
+entity DecodeConfiguration {
+    -- The decode cgraph fingerprint this instantiation matches.
+    -- Derivation (settled 2026-07-11, version tag "cgraph/v1"):
+    -- SHA-256 over the canonical serialization of the decode cgraph —
+    -- nodes in graph order, per node its op id, op_params bytes,
+    -- tensor type, extents and src edges as node indices; no
+    -- pointers, buffer ids or tensor names. Extents that derive from
+    -- the sequence position (n_past / n_kv views) are replaced by a
+    -- symbolic marker so the whole decode-shape class maps to ONE
+    -- fingerprint; LG0's stability check (one fingerprint across a
+    -- full context sweep) is the measured validation of that
+    -- normalization, hit early in iteration zero's shim bring-up.
+    fingerprint: String
+
+    -- Speculation depth k: drafted tokens per pass. 0 = no speculation
+    -- (the MTP-off instantiation; the worked example).
+    spec_depth: Integer
+
+    drafter: DrafterKind
+    split_mode: SplitMode
+
+    -- Model axis: what "sequence state" means for the bound model.
+    sequence_state: SequenceStateKind
+
+    -- Substrate axis: the calx-mill substrate identifier the
+    -- instantiation's budgets and feasibility gates are derived from
+    -- (e.g. "tu102-sm75-2gpu-nvlink"). The identifier is a citation,
+    -- not behaviour: no contract in this file may branch on it.
+    substrate: String
+
+    -- Derived
+    is_speculative: spec_depth > 0
+
+    invariant DrafterRequiresDepth {
+        drafter != no_drafter implies spec_depth >= 1
+    }
+
+    invariant DepthRequiresDrafter {
+        spec_depth >= 1 implies drafter != no_drafter
+    }
+
+    invariant DepthBounds {
+        spec_depth >= 0 and spec_depth <= config.max_spec_depth
+    }
+}
+
+-- A graph the resident kernel executes in a served configuration: one
+-- fingerprint, one kind, sharing the config-invariant core with every other
+-- resident program (FingerprintDegrade.SiblingCoexistence; call/0023's
+-- per-fingerprint model). The decode program's parameters are the
+-- DecodeConfiguration above; prefill and K-shift are sibling programs. A
+-- served configuration is total over its RESIDENT PROGRAM SET, not over a
+-- single fingerprint (ServedGraphTotality).
+entity ResidentProgram {
+    fingerprint: String
+    kind: ServedGraphKind
+
+    -- Prefill only: the fixed micro-batch this chunked-prefill program binds.
+    -- One ubatch = one fingerprint = one DeltaNet scan chunk. DERIVED, not
+    -- tuned (call/0024): at n_ctx 262144 the fixed per-chunk DRAM read is
+    -- ~28.8 ms/GPU (weights 13.71 + KV 14.11 + state 0.99), hidden once
+    -- compute/chunk reaches it (crossover U ~ 100-130 at full depth), and 128
+    -- is the DeltaNet kernel's native chunk (gated_delta_net_cuda<128>). 0 for
+    -- non-prefill kinds.
+    ubatch: Integer
+
+    invariant PrefillBindsUbatch {
+        kind = prefill implies ubatch >= 1
+    }
+
+    invariant NonPrefillNoUbatch {
+        kind != prefill implies ubatch = 0
+    }
+}
+
+-- The served-configuration axis: the preconditions under which the graph
+-- surface an unmodified llama-server submits is CLOSED to {decode, prefill,
+-- K-shift}. Each is a runtime-checkable guard (call/0024), asserted at context
+-- init; a violation refuses to serve rather than degrading silently, because
+-- the served kernel does not CLAIM graphs outside its closed set. This is the
+-- k = 0 base's closure; a different serving configuration (MTP on) declares its
+-- own ServedConfiguration and resident set.
+entity ServedConfiguration {
+    decoder_only: Boolean       -- no LLM_GRAPH_TYPE_ENCODER (model arch; static)
+    speculation_off: Boolean    -- no DECODER_MTP graph (ctx_type != MTP)
+    single_stream: Boolean      -- no cross-stream KV copy (n_stream == 1, np=1)
+    pooling_none: Boolean       -- no pooling/cls graph (pooling_type == NONE)
+
+    -- All four hold: the surface is closed to the resident program set.
+    is_closed: decoder_only and speculation_off and single_stream and pooling_none
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Ceiling on speculation depth any instantiation may bind. The
+    -- fallback ladder (num_spec 3 -> 2 -> 1 -> off) lives inside one
+    -- instantiation's binding, not here.
+    max_spec_depth: Integer = 3
+
+    -- G13 tolerance classes. The gate says "thresholds set per layer
+    -- class; DeltaNet fp32 fold exact-order sensitive". Two classes
+    -- suffice at contract level. Tolerances are SUBSTRATE-CLASS
+    -- bindings, not universal constants (the q4_0_ar16 spec's
+    -- twin-tolerance precedent): the defaults below bind the
+    -- fp32-accumulator class; an instantiation on a weaker-accumulator
+    -- substrate binds the documented looser class for that substrate
+    -- and RECORDS which class it bound — what it may never do is
+    -- invent an undocumented tolerance.
+    --
+    -- Final-logits comparison vs the stock engine's fp32-accumulator
+    -- reference, per verified position (KL divergence over the vocab).
+    -- CALIBRATED 2026-07-11 (settling the former open question) against
+    -- the legitimate-reordering class measured on this rig: the stock
+    -- production tensor split vs the single-GPU fp32-order reference
+    -- reaches KL 1.546e-2 nats per position (64/64 greedy agreement
+    -- held; the run-to-run envelope is exactly zero; layer split is
+    -- bit-identical to single-GPU). Value = class max x 1.25 margin,
+    -- rounded up. The draft 1e-4 would have rejected the stock
+    -- engine's own production split against its own reference. Method
+    -- and evidence: capture/g13-envelope/NOTES.md.
+    logits_kl_tol: Decimal = 0.02
+
+    -- Per-layer activation RMS relative difference vs the reference
+    -- decode, dense/attention layer class. Metric pinned by the same
+    -- calibration: |rms_impl - rms_ref| / rms_ref of the per-node RMS
+    -- summary (residual stream l_out-*, result_norm, result_output).
+    -- Measured class max 1.453e-2 (residual stream 1.292e-2, final
+    -- norm 9.4e-4); value = class max x 1.25, rounded up.
+    activation_rms_rel_tol: Decimal = 0.02
+
+    -- Recurrent-state comparisons are BIT-EXACT (G21: "bit-exact state
+    -- banks + logits" for the all-accept case). No budget.
+    state_bit_exact_tol: Decimal = 0.0
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- G13. One decode pass through the megakernel produces what the stock
+-- engine produces, within the declared tolerance classes. Quantified
+-- over the configuration: the SAME contract binds the k = 3 production
+-- kernel and the k = 0 worked example; only the pass shape differs.
+contract DecodeStepEquivalence {
+    invoke: (cfg: DecodeConfiguration, state: ModelState, tokens: Any, stock: LogitsRow) -> LogitsRow
+
+    @invariant LogitsParity
+        -- For every verified position in the pass (1 position when
+        -- cfg.spec_depth = 0; up to cfg.spec_depth + 1 positions
+        -- otherwise): KL(megakernel_logits || stock_fp32_ref_logits)
+        -- <= config.logits_kl_tol. The stock reference is StockEngine
+        -- at its recorded build_commit on identical weights, state and
+        -- token input.
+
+    @invariant ActivationParity
+        -- Per-layer activation RMS relative difference vs the stock
+        -- reference <= config.activation_rms_rel_tol for the dense and
+        -- attention layer classes. The DeltaNet fold is fold-order
+        -- sensitive (G13 note): its comparison is bit-exact against
+        -- the instantiation's DECLARED fold order, which must be
+        -- recorded in the instantiation spec, not left implicit.
+
+    @invariant GreedyTokenAgreement
+        -- Under greedy sampling the emitted token sequence is identical
+        -- to the stock engine's for the same inputs whenever no logits
+        -- tie sits within the tolerance band. Ties within the band are
+        -- recorded, not scored (the plan/0134 determinism lesson:
+        -- speculative batch shape changes numerics; goldens must pin
+        -- the config).
+
+    @guidance
+        -- The propagated obligations should drive the megakernel
+        -- through the integration surface (the real dispatch), never a
+        -- test-only entry point; G10's SASS-parity discipline exists so
+        -- the tested artifact is the shipped one.
+}
+
+-- G21 + G22. The recurrence must not know it was speculated. For every
+-- acceptance outcome a pass can produce, the post-pass model state is
+-- what sequential (non-speculative) decode of exactly the accepted
+-- tokens would have produced. At cfg.spec_depth = 0 the quantification
+-- collapses to accepted = 0 and the contract degenerates to "a plain
+-- decode step leaves exactly sequential-decode state" — the MTP-off
+-- instantiation satisfies it by construction, which is the point: a
+-- contract that could not degenerate this way would be overfitted to
+-- speculation.
+contract BankedStateEquivalence {
+    invoke: (cfg: DecodeConfiguration, state: ModelState, outcome: AcceptanceOutcome) -> ModelState
+
+    @invariant AcceptanceRange
+        -- 0 <= outcome.drafted <= cfg.spec_depth and
+        -- 0 <= outcome.accepted <= outcome.drafted. Fixed-length
+        -- drafters bind drafted = spec_depth in their instantiation
+        -- (mtp_self_draft always drafts exactly spec_depth); variable-
+        -- length drafters (ngram table hits) legally draft short. The
+        -- obligation set covers EVERY (drafted, accepted) pair the
+        -- bound instantiation can reach (G22's rejection fuzzer:
+        -- forced accept lengths at random positions), not just the
+        -- all-accept case.
+
+    @invariant StateEquivalence
+        -- Post-pass SEQUENCE STATE and n_past are BIT-EXACT
+        -- (config.state_bit_exact_tol = 0.0) equal to the state
+        -- produced by sequential decode of the same outcome.accepted
+        -- + 1 emitted tokens from the same pre-pass state. Sequence
+        -- state is what cfg.sequence_state says it is: recurrent banks
+        -- AND KV rows for hybrid_recurrent; KV rows alone for kv_only,
+        -- where rollback degenerates to the KV truncation stock engines
+        -- already perform — the model-axis degeneracy tripwire.
+        -- Sampler state (including any RNG stream position) is
+        -- host-owned by the stock engine and OUTSIDE this surface
+        -- (settled 2026-07-11 by architecture): every instantiation
+        -- returns logits, and both sampling and speculative acceptance
+        -- run in stock host code, so no kernel can touch it; the
+        -- refusal path's non-perturbation is already bound by
+        -- BitIdenticalPassthrough. In-kernel draft-token selection is
+        -- deterministic pass-internal work, not sampler state. Contest
+        -- scoring additionally pins greedy sampling (FACEOFF.md) — a
+        -- scoring choice, not a spec dependency.
+
+    @invariant NoResidue
+        -- Rolled-back bank contents are unobservable afterwards: no
+        -- subsequent pass may read state written by a rejected
+        -- position. (The concurrency half of this obligation — that no
+        -- in-flight reader observes a bank mid-rollback — is the
+        -- sync-protocol.tla invariant RollbackSafe; this clause binds
+        -- the end-state only.)
+}
+
+-- LG0 / integration stage. The kernel serves exactly its bound
+-- fingerprint; everything else degrades to stock, bit-identically.
+contract FingerprintDegrade {
+    invoke: (cfg: DecodeConfiguration, submitted_fingerprint: String) -> Boolean
+
+    @invariant ExactMatchOnly
+        -- The megakernel path is taken if and only if
+        -- submitted_fingerprint = cfg.fingerprint. No fuzzy matching,
+        -- no partial acceleration of an unknown graph.
+
+    @invariant BitIdenticalPassthrough
+        -- When the fingerprint does not match, the engine's outputs
+        -- and post-step state are bit-identical to a run WITHOUT the
+        -- megakernel backend loaded: refusal must not perturb state,
+        -- allocate from engine pools, or reorder the stock schedule.
+        -- Degrade means ordinary llama.cpp, never wrong answers.
+
+    @invariant SiblingCoexistence
+        -- Multiple instantiations may be resident together, each
+        -- matching its own fingerprint. Two instantiations never claim
+        -- the same fingerprint (see UniqueFingerprints).
+}
+
+-- LG-totality (call/0024). A served configuration is TOTAL over its resident
+-- program set: every graph the runtime can submit matches a resident program's
+-- fingerprint, so FingerprintDegrade's passthrough is unreachable in the served
+-- config. This does NOT remove the degrade path (call/0021's
+-- BitIdenticalPassthrough, call/0023's interpreter fallback are the retained
+-- correctness floor) — it PROVES the floor is never reached while serving. The
+-- point is the thesis of plan/0135: the persistent kernel is the engine, not a
+-- decode accelerator that hands prefill and maintenance back to stock.
+contract ServedGraphTotality {
+    invoke: (served: ServedConfiguration, submitted_fingerprint: String) -> Boolean
+
+    @invariant ClosedSurface
+        -- When served.is_closed, the set of graph fingerprints the runtime can
+        -- submit is exactly the resident program set {decode, prefill,
+        -- K-shift}. The surface was enumerated from the fork's two
+        -- graph_compute sites (call/0024); the four preconditions in
+        -- ServedConfiguration are what close it.
+
+    @invariant TotalCoverage
+        -- For every submitted_fingerprint a served (is_closed) runtime can
+        -- produce, some ResidentProgram r has r.fingerprint =
+        -- submitted_fingerprint. Equivalently: no served graph reaches
+        -- FingerprintDegrade.BitIdenticalPassthrough. A MISS under is_closed is
+        -- a totality FAILURE — a gap in the closed set to be closed with a
+        -- program — never a silent fallback. (The gate: replay every graph a
+        -- server session emits and assert each fingerprint has a program.)
+
+    @invariant ExactDispatch
+        -- Dispatch is by exact fingerprint match, per
+        -- FingerprintDegrade.ExactMatchOnly — never a structural heuristic
+        -- (node count, token count). A heuristic is both under-inclusive (a
+        -- served graph whose extents shift misses) and over-inclusive (a
+        -- non-member graph wrongly dispatches and runs a wrong program); under
+        -- ClosedSurface, over-inclusion is a correctness bug the retained net
+        -- no longer hides.
+
+    @invariant PreconditionsAreGuards
+        -- Each ServedConfiguration precondition is a runtime-checkable guard,
+        -- not an assumption: decoder_only is static (model arch); the other
+        -- three are asserted from cparams at context init (ctx_type != MTP,
+        -- n_stream == 1, pooling_type == NONE). A violated precondition refuses
+        -- to serve (the config is outside what this kernel claims), rather than
+        -- degrading silently into stock and re-introducing the split brain.
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+invariant UniqueFingerprints {
+    for a in DecodeConfigurations:
+        for b in DecodeConfigurations:
+            a != b implies a.fingerprint != b.fingerprint
+}
+
+-- Resident programs in one served configuration never collide: dispatch is a
+-- function from fingerprint to program, so two programs claiming one
+-- fingerprint would make ExactDispatch ill-defined.
+invariant ResidentProgramFingerprintsUnique {
+    for a in ResidentPrograms:
+        for b in ResidentPrograms:
+            a != b implies a.fingerprint != b.fingerprint
+}
+
+-- ============================================================
+-- Actor Declarations
+-- ============================================================
+
+-- The ggml runtime hosting the out-of-tree backend (llama-server's
+-- scheduler): code, not a person.
+actor GgmlRuntime {
+    identified_by: StockEngine where build_commit != null
+}
+
+-- ============================================================
+-- Surfaces
+-- ============================================================
+
+-- The integration boundary: what an unmodified llama-server sees of
+-- any instantiation. One surface instance per bound configuration.
+surface GraphComputeBoundary {
+    facing runtime: GgmlRuntime
+    context cfg: DecodeConfiguration
+    context program: ResidentProgram
+
+    exposes:
+        cfg.fingerprint
+        cfg.spec_depth
+        cfg.split_mode
+        program.fingerprint
+
+    contracts:
+        fulfils DecodeStepEquivalence
+        fulfils BankedStateEquivalence
+        fulfils FingerprintDegrade
+        fulfils ServedGraphTotality
+
+    @guarantee StockPathAlwaysAvailable
+        -- The stock engine path remains loaded and correct regardless
+        -- of this backend's state; any internal failure downgrades to
+        -- it.
+
+    @guarantee SubstrateNeutrality
+        -- Nothing this surface fulfils names a substrate: no CUDA,
+        -- Vulkan, warp, SM or register term appears in the contracts.
+        -- The integration seam is the engine's backend abstraction
+        -- (which already spans CUDA/Vulkan/Metal); the numeric seam is
+        -- the calx-mill Substrate cited by cfg.substrate. A new
+        -- substrate re-derives budgets and feasibility mechanically
+        -- and re-binds the tolerance class; it changes no contract.
+
+    @guidance
+        -- The obligations propagated from this surface are the shared
+        -- correctness harness of the face-off (FACEOFF.md): identical
+        -- for every contestant, generated, never hand-edited.
+}
+

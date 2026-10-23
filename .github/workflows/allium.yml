@@ -1,0 +1,38 @@
+# The allium lane for sinter (the TLC lane lives in specula.yml): check,
+# analyse and plan over the spec corpus. The worked example is checked as
+# a set with its playbook (its `use` path resolves within the set). Pin:
+# allium-cli 3.4.2.
+name: Allium lane
+
+on:
+  push:
+    branches: [main, r3-integration-wip]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  allium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install allium-cli (pinned)
+        run: cargo install allium-cli@3.4.2 --locked
+      - name: allium check (prefill)
+        run: allium check specs/prefill.allium
+      - name: allium check (playbook)
+        run: allium check specs/playbook.allium
+      - name: allium check (worked example, as a set with the playbook)
+        run: allium check specs/worked-example-mtp-off/mtp-off.allium specs/playbook.allium
+      - name: allium analyse (each)
+        run: |
+          allium analyse specs/prefill.allium
+          allium analyse specs/playbook.allium
+          allium analyse specs/worked-example-mtp-off/mtp-off.allium
+      - name: allium plan (the obligations the manifests disposition)
+        run: |
+          allium plan specs/prefill.allium
+          allium plan specs/playbook.allium
+          allium plan specs/worked-example-mtp-off/mtp-off.allium

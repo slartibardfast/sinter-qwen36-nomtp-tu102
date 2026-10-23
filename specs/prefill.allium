@@ -45,7 +45,7 @@
 -- The reference implementation: the llama.cpp fork at the recorded
 -- .host-software pin, running the same GGUF weights, stock CUDA path.
 -- Every equivalence in this file is stated against its prefill.
-external entity StockEngine {
+entity StockEngine {
     build_commit: String
 }
 
@@ -53,7 +53,7 @@ external entity StockEngine {
 -- prefill program binds U = 128 (the DeltaNet kernel's native chunk,
 -- gated_delta_net_cuda<128>); projections run as GEMM (M = 1 -> U),
 -- attention is causal-masked.
-external entity PrefillBatch {
+entity PrefillBatch {
     n_tokens: Integer
 }
 
@@ -61,15 +61,16 @@ external entity PrefillBatch {
 -- the recurrent DeltaNet banks, the KV cache rows for the full-attention
 -- layers, and the position counter. Layout is engine-owned; the
 -- contracts treat it as comparable by value, per layer class.
-external entity ModelState {
+entity ModelState {
     n_past: Integer
+    layers: Set<LayerClass>
 }
 
 -- The prefill pass's observable logits: the FINAL live position's
 -- next-token row only, matching the stock engine's prefill semantics
 -- (logits_all = false: intermediate positions' rows are never emitted)
 -- and the built program's runtime row select (row nt-1, meta.prefill).
-external entity LogitsBlock {
+entity LogitsBlock {
     n_vocab: Integer
 }
 
@@ -158,7 +159,7 @@ entity PrefillConfiguration {
 -- batched (GEMM) projection is numerically the stock per-position result
 -- up to the FA-causal softmax fold reorder — bounded by the KL class.
 contract PrefillLogitsParity {
-    invoke: (cfg: PrefillConfiguration, state: ModelState, batch: PrefillBatch) -> LogitsBlock
+    invoke: (cfg: PrefillConfiguration, state: ModelState, batch: PrefillBatch, stock: LogitsBlock) -> LogitsBlock
 
     @invariant LogitsKLBound
         -- For the FINAL live position's emitted logits row (the only row
